@@ -1,7 +1,0 @@
-{
-  "functions": {
-    "api/enrich.js": {
-      "maxDuration": 30
-    }
-  }
-}
