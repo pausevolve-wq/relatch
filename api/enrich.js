@@ -1,4 +1,4 @@
-export default async function handler(req, res) {
+module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -9,8 +9,8 @@ export default async function handler(req, res) {
   const { rawText, category, fileName } = req.body;
   if (!rawText || !category || !fileName) return res.status(400).json({ error: 'Missing required fields' });
   if (rawText.length > 12000) return res.status(400).json({ error: 'Content too large' });
-  const prompt = `
-You are an expert system that converts raw content into a fully structured Claude Skill File.
+
+  const prompt = `You are an expert system that converts raw content into a fully structured Claude Skill File.
 
 CRITICAL RULES:
 - Output ONLY markdown
@@ -45,12 +45,13 @@ use_cases: [<list>]
 INPUT:
 ${rawText.slice(0, 8000)}
 `;
-try {
+
+  try {
     const response = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.NVIDIA_API_KEY}`,
+        'Authorization': \`Bearer \${process.env.NVIDIA_API_KEY}\`,
       },
       body: JSON.stringify({
         model: 'meta/llama-3.1-70b-instruct',
@@ -71,4 +72,4 @@ try {
   } catch (err) {
     return res.status(500).json({ error: 'Proxy error', detail: err.message });
   }
-}
+};
