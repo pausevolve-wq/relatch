@@ -67,7 +67,7 @@ try {
 
     const data = await response.json();
     const enriched = data.choices?.[0]?.message?.content || '';
-    return res.status(200).json({ content: enriched });
+    return res.status(200).json({ enriched });
   } catch (err) {
     return res.status(500).json({ error: 'Proxy error', detail: err.message });
   }
