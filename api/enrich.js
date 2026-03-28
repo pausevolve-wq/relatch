@@ -1,5 +1,5 @@
 export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', 'https://claudly-mvp.netlify.app');
+  res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
@@ -19,20 +19,43 @@ export default async function handler(req, res) {
     preferences: 'Extract user preferences, settings, and configuration choices. Format as a clean structured list.',
   };
 
-  const prompt = `You are building a Claude skill file section from raw extracted document content.
-Category: ${category}
-File: ${fileName}
-Task: ${categoryPrompts[category] || categoryPrompts.knowledge}
-Rules:
-- Remove all PDF artifacts, symbols, encoding noise
-- Keep only content useful for Claude to act on
-- Output clean markdown only, no preamble, no explanation
-- Max 800 words
+  const prompt = `
+You are an expert system that converts raw content into a fully structured Claude Skill File.
 
-Raw content:
-${rawText.slice(0, 8000)}`;
+CRITICAL RULES:
+- Output ONLY markdown
+- Do NOT include explanations
+- Do NOT wrap in code blocks
+- ALWAYS follow exact format below
 
-  try {
+FORMAT:
+
+---
+domain: <auto-detected>
+content_type: <auto-detected>
+use_cases: [<list>]
+---
+
+## Instructions
+
+## When to Use
+
+## Knowledge
+
+## Key Concepts
+
+## How to Respond
+
+## Output Style
+
+## Extended Content
+
+---
+
+INPUT:
+${rawText.slice(0, 8000)}
+`;
+try {
     const response = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -54,7 +77,7 @@ ${rawText.slice(0, 8000)}`;
 
     const data = await response.json();
     const enriched = data.choices?.[0]?.message?.content || '';
-    return res.status(200).json({ enriched });
+    return res.status(200).json({ content: enriched });
   } catch (err) {
     return res.status(500).json({ error: 'Proxy error', detail: err.message });
   }
