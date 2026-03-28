@@ -1,101 +1,78 @@
 module.exports = async function handler(req, res) {
-  // CORS — set these first, before anything else
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
-
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
-  }
+  if (req.method === 'OPTIONS') return res.status(200).end();
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   const { rawText, category, fileName } = req.body;
+  if (!rawText || !category || !fileName) return res.status(400).json({ error: 'Missing required fields' });
 
-  if (!rawText || !category || !fileName) {
-    return res.status(400).json({ error: 'Missing required fields' });
-  }
+  const input = rawText.slice(0, 4000);
 
-  if (rawText.length > 12000) {
-    return res.status(400).json({ error: 'Content too large' });
-  }
+  const prompt = `Convert this raw content into a Claude Skill File.
 
-  const prompt = `You are an expert system that converts raw content into a fully structured Claude Skill File.
-
-CRITICAL RULES:
-- Output ONLY markdown
-- Do NOT include explanations
-- Do NOT wrap in code blocks
-- ALWAYS follow exact format below
-
-FORMAT:
+Return ONLY this markdown format, nothing else:
 
 ---
-domain: <auto-detected>
-content_type: <auto-detected>
+domain: <detected>
+content_type: <detected>
 use_cases: [<list>]
 ---
 
 ## Instructions
+<key rules and directives>
 
 ## When to Use
+<when to activate this skill>
 
 ## Knowledge
+<key facts and information>
 
 ## Key Concepts
+<important terms and ideas>
 
 ## How to Respond
+<tone and approach>
 
 ## Output Style
+<formatting preferences>
 
 ## Extended Content
+<additional context>
 
----
-
-INPUT:
-${rawText.slice(0, 6000)}
-`;
+RAW INPUT:
+${input}`;
 
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 25000);
-
-    const response = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
+    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.NVIDIA_API_KEY}`,
+        'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+        'HTTP-Referer': 'https://relatch-fe.vercel.app',
+        'X-Title': 'Relatch',
       },
       body: JSON.stringify({
-        model: 'meta/llama-3.1-70b-instruct',
+        model: 'mistralai/mistral-7b-instruct:free',
         messages: [{ role: 'user', content: prompt }],
-        max_tokens: 800,
+        max_tokens: 1000,
         temperature: 0.3,
       }),
-      signal: controller.signal,
     });
-
-    clearTimeout(timeout);
 
     if (!response.ok) {
       const err = await response.text();
-      return res.status(502).json({ error: 'Upstream API error', detail: err });
+      return res.status(502).json({ error: 'AI API error', detail: err });
     }
 
     const data = await response.json();
     const enriched = data.choices?.[0]?.message?.content || '';
-
-    if (!enriched) {
-      return res.status(502).json({ error: 'Empty response from AI' });
-    }
-
+    if (!enriched) return res.status(502).json({ error: 'Empty response from AI' });
     return res.status(200).json({ enriched });
+
   } catch (err) {
-    if (err.name === 'AbortError') {
-      return res.status(504).json({ error: 'AI request timed out. Try a smaller file.' });
-    }
     return res.status(500).json({ error: 'Proxy error', detail: err.message });
   }
 };
