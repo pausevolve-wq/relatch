@@ -1,20 +1,32 @@
 module.exports = async function handler(req, res) {
+  // CORS — set these first, before anything else
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  if (req.method === 'OPTIONS') return res.status(200).end();
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
 
   const { rawText, category, fileName } = req.body;
-  if (!rawText || !category || !fileName) return res.status(400).json({ error: 'Missing required fields' });
-  if (rawText.length > 12000) return res.status(400).json({ error: 'Content too large' });
+
+  if (!rawText || !category || !fileName) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+
+  if (rawText.length > 12000) {
+    return res.status(400).json({ error: 'Content too large' });
+  }
 
   const prompt = `You are an expert system that converts raw content into a fully structured Claude Skill File.
 
 CRITICAL RULES:
 - Output ONLY markdown
-- Do NOT include explanations  
+- Do NOT include explanations
 - Do NOT wrap in code blocks
 - ALWAYS follow exact format below
 
@@ -43,10 +55,13 @@ use_cases: [<list>]
 ---
 
 INPUT:
-${rawText.slice(0, 8000)}
+${rawText.slice(0, 6000)}
 `;
 
   try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 25000);
+
     const response = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -56,10 +71,13 @@ ${rawText.slice(0, 8000)}
       body: JSON.stringify({
         model: 'meta/llama-3.1-70b-instruct',
         messages: [{ role: 'user', content: prompt }],
-        max_tokens: 1024,
+        max_tokens: 800,
         temperature: 0.3,
       }),
+      signal: controller.signal,
     });
+
+    clearTimeout(timeout);
 
     if (!response.ok) {
       const err = await response.text();
@@ -68,8 +86,16 @@ ${rawText.slice(0, 8000)}
 
     const data = await response.json();
     const enriched = data.choices?.[0]?.message?.content || '';
+
+    if (!enriched) {
+      return res.status(502).json({ error: 'Empty response from AI' });
+    }
+
     return res.status(200).json({ enriched });
   } catch (err) {
+    if (err.name === 'AbortError') {
+      return res.status(504).json({ error: 'AI request timed out. Try a smaller file.' });
+    }
     return res.status(500).json({ error: 'Proxy error', detail: err.message });
   }
 };
