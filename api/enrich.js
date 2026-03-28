@@ -9,16 +9,6 @@ export default async function handler(req, res) {
   const { rawText, category, fileName } = req.body;
   if (!rawText || !category || !fileName) return res.status(400).json({ error: 'Missing required fields' });
   if (rawText.length > 12000) return res.status(400).json({ error: 'Content too large' });
-
-  const categoryPrompts = {
-    instructions: 'Extract all rules, guidelines, and behavioral instructions. Format as clear bullet points. Remove noise and artifacts.',
-    personality: 'Extract tone, voice, style traits, and communication preferences. Format as structured descriptors Claude can adopt.',
-    knowledge: 'Summarize the key knowledge, facts, and domain information. Structure with headings and bullet points. Remove artifacts.',
-    examples: 'Extract and clean up examples, templates, and sample outputs. Preserve structure and format them clearly.',
-    context: 'Extract background context, domain information, and situational details. Format as clear structured paragraphs.',
-    preferences: 'Extract user preferences, settings, and configuration choices. Format as a clean structured list.',
-  };
-
   const prompt = `
 You are an expert system that converts raw content into a fully structured Claude Skill File.
 
