@@ -73,19 +73,24 @@ use_cases: [2-4 specific use cases this skill enables]
 RAW CONTENT TO ANALYZE:
 ${rawText.slice(0, 7000)}`;
 
+  // IMPORTANT: Vercel Hobby plan hard caps serverless functions at 10 seconds.
+  // Previous timeouts (18-28s) caused every request to hit the Vercel limit
+  // and return a 504/404 before any model could respond.
+  // Each model now gets a fast 7s window. Total cascade stays under 9s.
   const cascade = [
-    { model: 'arcee-ai/trinity-large-preview:free', timeout: 28000 },
-    { model: 'meta-llama/llama-3.3-70b-instruct:free', timeout: 22000 },
-    { model: 'qwen/qwen3-next-80b-a3b-instruct:free', timeout: 25000 },
-    { model: 'openai/gpt-oss-120b:free', timeout: 20000 },
-    { model: 'mistralai/mistral-small-3.1-24b-instruct:free', timeout: 18000 },
-    { model: 'openrouter/free', timeout: 25000 },
+    { model: 'meta-llama/llama-3.3-70b-instruct:free', timeout: 7000 },
+    { model: 'qwen/qwen3-next-80b-a3b-instruct:free', timeout: 7000 },
+    { model: 'arcee-ai/trinity-large-preview:free', timeout: 7000 },
+    { model: 'mistralai/mistral-small-3.1-24b-instruct:free', timeout: 6000 },
+    { model: 'openrouter/free', timeout: 6000 },
   ];
 
   for (const { model, timeout } of cascade) {
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeout);
+
+      console.log(`[enrich] trying: ${model}`);
 
       const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
         method: 'POST',
@@ -106,24 +111,32 @@ ${rawText.slice(0, 7000)}`;
 
       clearTimeout(timer);
 
-      // 429 = rate limited, 503 = unavailable — try next model
-      if (response.status === 429 || response.status === 503) continue;
-      if (!response.ok) continue;
+      if (response.status === 429 || response.status === 503) {
+        console.log(`[enrich] ${model} rate limited (${response.status})`);
+        continue;
+      }
+      if (!response.ok) {
+        console.log(`[enrich] ${model} failed status ${response.status}`);
+        continue;
+      }
 
       const data = await response.json();
       const enriched = data.choices?.[0]?.message?.content?.trim() || '';
 
-      // Reject if response is too short to be a real skill file
-      if (enriched.length < 150) continue;
+      if (enriched.length < 150) {
+        console.log(`[enrich] ${model} too short (${enriched.length} chars)`);
+        continue;
+      }
 
+      console.log(`[enrich] success: ${model} (${enriched.length} chars)`);
       return res.status(200).json({ enriched, model });
 
-    } catch {
-      // Timeout or network error — try next model
+    } catch (err) {
+      console.log(`[enrich] ${model} threw: ${err?.message || 'unknown'}`);
       continue;
     }
   }
 
-  // All models failed — signal frontend to use rule-based fallback
+  console.log('[enrich] all models failed — frontend will use rule-based fallback');
   return res.status(503).json({ error: 'All AI models unavailable. Using local fallback.' });
 };
