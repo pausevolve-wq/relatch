@@ -3,6 +3,9 @@
   "functions": {
     "api/enrich.js": {
       "maxDuration": 10
+    },
+    "api/ocr.js": {
+      "maxDuration": 10
     }
   },
   "headers": [
