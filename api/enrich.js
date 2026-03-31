@@ -10,7 +10,6 @@ module.exports = async function handler(req, res) {
   if (!rawText || !category || !fileName) return res.status(400).json({ error: 'Missing required fields' });
   if (rawText.length > 12000) return res.status(400).json({ error: 'Content too large' });
 
-  // ── INPUT QUALITY CHECK ───────────────────────────────────────────
   const hasEnoughLength = rawText.trim().length > 150;
   const hasRealWords = /[a-zA-Z]{3,}/.test(rawText);
   const isRepetitiveNoise = (() => {
@@ -20,14 +19,12 @@ module.exports = async function handler(req, res) {
   })();
 
   if (!hasEnoughLength || !hasRealWords || isRepetitiveNoise) {
-    console.log(`[enrich] INSUFFICIENT_SIGNAL for ${fileName}: len=${rawText.trim().length} words=${hasRealWords} noise=${isRepetitiveNoise}`);
     return res.status(422).json({
       error: 'INSUFFICIENT_SIGNAL',
-      message: 'Not enough content to generate a skill file. The document may be image-based, too short, or corrupted.',
+      message: 'Not enough content to generate a skill file.',
     });
   }
 
-  // ── SIGNAL EXTRACTION ────────────────────────────────────────────
   const allLines = rawText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
   const signalLines = allLines.filter(line =>
     line.length > 20 && (
@@ -41,82 +38,72 @@ module.exports = async function handler(req, res) {
   );
 
   const filteredText = signalLines.length >= 5 ? signalLines.join('\n') : rawText;
-  const textToSend = filteredText.slice(0, signalLines.length >= 5 ? 5000 : 7000);
-  console.log(`[enrich] signal: ${allLines.length} lines → ${signalLines.length} signal → ${textToSend.length} chars`);
+  // Reduced from 5000/7000 to 2500/3500 — smaller input = faster response = beats 10s limit
+  const textToSend = filteredText.slice(0, signalLines.length >= 5 ? 2500 : 3500);
 
   const categoryContext = {
-    personality: 'communication style, tone, voice patterns, how they phrase things, what they emphasize, their relationship with their audience',
-    instructions: 'rules, constraints, decision criteria, what to always do, what to never do, how to handle edge cases',
-    knowledge: 'domain expertise, mental models, frameworks they use, how they think about problems in this field',
-    examples: 'the patterns in these examples — structure, style, what makes them work, the formula behind them',
-    context: 'the situation, constraints, goals, audience, and environment that shapes all decisions here',
-    preferences: 'specific choices, standards, non-negotiables, defaults, and pet peeves that define their work',
+    personality: 'communication style, tone, voice patterns, how they phrase things, what they emphasize',
+    instructions: 'rules, constraints, decision criteria, what to always do, what to never do',
+    knowledge: 'domain expertise, mental models, frameworks they use, how they think about problems',
+    examples: 'the patterns in these examples — structure, style, what makes them work',
+    context: 'the situation, constraints, goals, audience, and environment that shapes decisions',
+    preferences: 'specific choices, standards, non-negotiables, defaults, and pet peeves',
   };
 
   const focus = categoryContext[category] || categoryContext.knowledge;
 
-  const prompt = `You are an expert at extracting working style, mental models, and behavioral DNA from raw content.
+  // Shorter prompt = fewer tokens to generate = faster response
+  const prompt = `Extract behavioral patterns from this content and write a Claude skill file.
+Focus on: ${focus}
 
-Your job: Read the content below like an anthropologist studying how this person thinks and works. Then write a Claude skill file that lets Claude BECOME this person's thinking partner — not just reference their content, but actually reason, create, and decide the way they do.
+RULES:
+- Extract PATTERNS and WHY behind decisions, not just content
+- NEVER copy-paste raw lines, subject lines, or literal text from the document
+- Turn observations into actionable instructions for Claude
+- Output only the markdown skill file, no preamble, no code fences
 
-The skill file must be immediately useful WITHOUT the original document. Claude should be able to use this skill file alone and produce work in this person's exact style and thinking pattern.
-
-Focus specifically on: ${focus}
-
-EXTRACTION RULES:
-- Find the PATTERNS, not just the content
-- Extract the WHY behind decisions, not just the WHAT
-- Identify what this person would NEVER do (boundaries reveal character)
-- Find repeating structures, formulas, and frameworks they use
-- Extract specific language, phrases, and vocabulary they favor
-- Turn observations into ACTIONABLE INSTRUCTIONS for Claude
-- Do NOT summarize the content — extract the behavior
-
-OUTPUT FORMAT — return exactly this markdown, no preamble, no explanation, no code fences:
-
+FORMAT:
 ---
 domain: [detected domain]
 content_type: [detected type]
-use_cases: [2-4 specific use cases this skill enables]
+use_cases: [2-3 specific use cases]
 ---
 
 ## Identity & Role
-[Who Claude becomes when using this skill. 2-3 sentences. Specific, not generic.]
+[2 sentences. Who Claude becomes. Specific.]
 
 ## Core Principles
-[4-6 fundamental beliefs or values extracted from the content that drive ALL decisions. Not rules — beliefs. What this person would defend in an argument.]
+[4-5 fundamental beliefs extracted from content. Not rules — beliefs.]
 
 ## How to Think
-[The mental process. How to approach problems. What to consider first, second, third. The reasoning pattern extracted from the content.]
+[The mental process and reasoning pattern extracted from content.]
 
 ## How to Create
-[Specific craft instructions. Structure, format, style, length, vocabulary. Concrete enough that two people following this produce similar outputs.]
+[Specific craft instructions. Structure, format, style, vocabulary.]
 
 ## What to Always Do
-[5-8 specific, non-negotiable behaviors extracted from patterns in the content. Start each with a verb.]
+[5 specific behaviors. Start each with a verb.]
 
 ## What to Never Do
-[4-6 things this person clearly avoids, finds wrong, or would reject. Start each with "Never".]
+[4 things clearly avoided. Start each with "Never".]
 
 ## Voice & Language
-[Specific words, phrases, sentence patterns they use. How they open, transition, close. Their signature moves.]
+[Specific words, phrases, sentence patterns. Signature moves.]
 
 ## Quality Bar
-[How to know when the output is good enough. What "done right" looks like in this domain.]
+[How to know when output is done right.]
 
-RAW CONTENT TO ANALYZE:
+CONTENT:
 ${textToSend}`;
 
-  // IMPORTANT: Vercel Hobby plan hard caps serverless functions at 10 seconds.
-  // Previous timeouts (18-28s) caused every request to hit the Vercel limit
-  // and return a 504/404 before any model could respond.
-  // Each model now gets a fast 7s window. Total cascade stays under 9s.
+  // Fastest models first — small/fast beats the 10s Vercel limit reliably
+  // Each gets max 7s. Two attempts = 14s theoretical max but first hit exits early.
   const cascade = [
-    { model: 'meta-llama/llama-3.3-70b-instruct:free', timeout: 7000 },
-    { model: 'qwen/qwen3-next-80b-a3b-instruct:free', timeout: 7000 },
-    { model: 'arcee-ai/trinity-large-preview:free', timeout: 7000 },
-    { model: 'mistralai/mistral-small-3.1-24b-instruct:free', timeout: 6000 },
-    { model: 'openrouter/free', timeout: 6000 },
+    { model: 'meta-llama/llama-3.1-8b-instruct:free',        timeout: 7000 },
+    { model: 'mistralai/mistral-7b-instruct:free',            timeout: 7000 },
+    { model: 'google/gemma-3-12b-it:free',                    timeout: 7000 },
+    { model: 'qwen/qwen3-8b:free',                            timeout: 6000 },
+    { model: 'openrouter/free',                               timeout: 5000 },
   ];
 
   for (const { model, timeout } of cascade) {
@@ -137,7 +124,7 @@ ${textToSend}`;
         body: JSON.stringify({
           model,
           messages: [{ role: 'user', content: prompt }],
-          max_tokens: 1200,
+          max_tokens: 900,
           temperature: 0.4,
         }),
         signal: controller.signal,
@@ -146,7 +133,7 @@ ${textToSend}`;
       clearTimeout(timer);
 
       if (response.status === 429 || response.status === 503) {
-        console.log(`[enrich] ${model} rate limited (${response.status})`);
+        console.log(`[enrich] ${model} rate limited (${response.status}), trying next`);
         continue;
       }
       if (!response.ok) {
@@ -162,16 +149,13 @@ ${textToSend}`;
         continue;
       }
 
-      // Low-confidence detection: reject if missing core sections
       const hasCoreStructure = enriched.includes('## Identity') || enriched.includes('## Core Principles');
       if (!hasCoreStructure) {
-        console.log(`[enrich] ${model} missing core sections, trying next`);
+        console.log(`[enrich] ${model} missing core sections`);
         continue;
       }
 
-      // Reject if model returned INSUFFICIENT_SIGNAL instead of a skill file
-      if (enriched.trim().startsWith('INSUFFICIENT_SIGNAL') || enriched.trim() === 'INSUFFICIENT_SIGNAL') {
-        console.log(`[enrich] ${model} signalled insufficient input`);
+      if (enriched.trim().startsWith('INSUFFICIENT_SIGNAL')) {
         continue;
       }
 
@@ -184,9 +168,8 @@ ${textToSend}`;
     }
   }
 
-  console.log('[enrich] all models failed — returning AI_FAILED');
   return res.status(503).json({
     error: 'AI_FAILED',
-    message: 'Could not generate skill from this content. All AI models are unavailable or the content signal is too weak.',
+    message: 'All models unavailable or content signal too weak.',
   });
 };
