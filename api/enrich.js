@@ -38,7 +38,6 @@ module.exports = async function handler(req, res) {
   );
 
   const filteredText = signalLines.length >= 5 ? signalLines.join('\n') : rawText;
-  // Reduced from 5000/7000 to 2500/3500 — smaller input = faster response = beats 10s limit
   const textToSend = filteredText.slice(0, signalLines.length >= 5 ? 2500 : 3500);
 
   const categoryContext = {
@@ -52,28 +51,27 @@ module.exports = async function handler(req, res) {
 
   const focus = categoryContext[category] || categoryContext.knowledge;
 
-  // Shorter prompt = fewer tokens to generate = faster response
   const prompt = `Extract behavioral patterns from this content and write a Claude skill file.
 Focus on: ${focus}
 
 RULES:
-- Extract PATTERNS and WHY behind decisions, not just content
-- NEVER copy-paste raw lines, subject lines, or literal text from the document
-- Turn observations into actionable instructions for Claude
-- Output only the markdown skill file, no preamble, no code fences
+- Extract PATTERNS and WHY behind decisions.
+- NEVER copy-paste raw lines.
+- You MUST start your response exactly with the YAML block below.
+- You MUST enclose all YAML values in double quotes.
 
 FORMAT:
 ---
-domain: [detected domain]
-content_type: [detected type]
-use_cases: [2-3 specific use cases]
+domain: "detected domain"
+content_type: "behavioral skill"
+use_cases: ["case 1", "case 2"]
 ---
 
 ## Identity & Role
 [2 sentences. Who Claude becomes. Specific.]
 
 ## Core Principles
-[4-5 fundamental beliefs extracted from content. Not rules — beliefs.]
+[4-5 fundamental beliefs extracted from content. Not rules but beliefs.]
 
 ## How to Think
 [The mental process and reasoning pattern extracted from content.]
@@ -96,80 +94,48 @@ use_cases: [2-3 specific use cases]
 CONTENT:
 ${textToSend}`;
 
-  // Fastest models first — small/fast beats the 10s Vercel limit reliably
-  // Each gets max 7s. Two attempts = 14s theoretical max but first hit exits early.
-  const cascade = [
-    { model: 'meta-llama/llama-3.1-8b-instruct:free',        timeout: 7000 },
-    { model: 'mistralai/mistral-7b-instruct:free',            timeout: 7000 },
-    { model: 'google/gemma-3-12b-it:free',                    timeout: 7000 },
-    { model: 'qwen/qwen3-8b:free',                            timeout: 6000 },
-    { model: 'openrouter/free',                               timeout: 5000 },
-  ];
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8500);
 
-  for (const { model, timeout } of cascade) {
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeout);
+    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+        'HTTP-Referer': 'https://relatch-fe.vercel.app',
+        'X-Title': 'Relatch',
+      },
+      body: JSON.stringify({
+        models: [
+          'google/gemma-3-12b-it:free',
+          'meta-llama/llama-3.1-8b-instruct:free'
+        ],
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: 900,
+        temperature: 0.4,
+      }),
+      signal: controller.signal,
+    });
 
-      console.log(`[enrich] trying: ${model}`);
+    clearTimeout(timer);
 
-      const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
-          'HTTP-Referer': 'https://relatch-fe.vercel.app',
-          'X-Title': 'Relatch',
-        },
-        body: JSON.stringify({
-          model,
-          messages: [{ role: 'user', content: prompt }],
-          max_tokens: 900,
-          temperature: 0.4,
-        }),
-        signal: controller.signal,
-      });
-
-      clearTimeout(timer);
-
-      if (response.status === 429 || response.status === 503) {
-        console.log(`[enrich] ${model} rate limited (${response.status}), trying next`);
-        continue;
-      }
-      if (!response.ok) {
-        console.log(`[enrich] ${model} failed status ${response.status}`);
-        continue;
-      }
-
-      const data = await response.json();
-      const enriched = data.choices?.[0]?.message?.content?.trim() || '';
-
-      if (enriched.length < 150) {
-        console.log(`[enrich] ${model} too short (${enriched.length} chars)`);
-        continue;
-      }
-
-      const hasCoreStructure = enriched.includes('## Identity') || enriched.includes('## Core Principles');
-      if (!hasCoreStructure) {
-        console.log(`[enrich] ${model} missing core sections`);
-        continue;
-      }
-
-      if (enriched.trim().startsWith('INSUFFICIENT_SIGNAL')) {
-        continue;
-      }
-
-      console.log(`[enrich] success: ${model} (${enriched.length} chars)`);
-      return res.status(200).json({ enriched, model });
-
-    } catch (err) {
-      console.log(`[enrich] ${model} threw: ${err?.message || 'unknown'}`);
-      continue;
+    if (!response.ok) {
+      return res.status(503).json({ error: 'AI_FAILED', message: 'Models unavailable' });
     }
-  }
 
-  return res.status(503).json({
-    error: 'AI_FAILED',
-    message: 'All models unavailable or content signal too weak.',
-  });
+    const data = await response.json();
+    const enriched = data.choices?.[0]?.message?.content?.trim() || '';
+    
+    const usedModel = data.model || 'unknown';
+
+    if (enriched.length < 150 || !enriched.includes('## Identity')) {
+      return res.status(422).json({ error: 'INSUFFICIENT_SIGNAL', message: 'Output failed checks' });
+    }
+
+    return res.status(200).json({ enriched, model: usedModel });
+
+  } catch (err) {
+    return res.status(503).json({ error: 'TIMEOUT', message: 'Request took too long' });
+  }
 };
