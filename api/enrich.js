@@ -95,47 +95,72 @@ CONTENT:
 ${textToSend}`;
 
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 8500);
+    // We fire 5 separate requests at the exact same time
+    const models = [
+      'arcee-ai/trinity-mini:free',
+      'meta-llama/llama-3.2-3b-instruct:free',
+      'google/gemma-3-4b:free',
+      'google/gemma-3-12b-it:free',
+      'openrouter/free' // Nuclear fallback
+    ];
 
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
-        'HTTP-Referer': 'https://relatch-fe.vercel.app',
-        'X-Title': 'Relatch',
-      },
-      body: JSON.stringify({
-        models: [
-          'google/gemma-3-12b-it:free',
-          'meta-llama/llama-3.1-8b-instruct:free'
-        ],
-        messages: [{ role: 'user', content: prompt }],
-        max_tokens: 900,
-        temperature: 0.4,
-      }),
-      signal: controller.signal,
+    // Create a kill switch for each individual request
+    const controllers = models.map(() => new AbortController());
+    
+    // Give the entire race 8.5 seconds before Vercel kills the function
+    const masterTimer = setTimeout(() => {
+      controllers.forEach(c => c.abort());
+    }, 8500);
+
+    // Map over our models and create 5 simultaneous fetch requests
+    const requests = models.map(async (model, index) => {
+      try {
+        const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+            'HTTP-Referer': 'https://relatch-fe.vercel.app',
+            'X-Title': 'Relatch',
+          },
+          body: JSON.stringify({
+            model: model, // Requesting ONE specific model per connection
+            messages: [{ role: 'user', content: prompt }],
+            max_tokens: 900,
+            temperature: 0.4,
+          }),
+          signal: controllers[index].signal,
+        });
+
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+        const data = await response.json();
+        const enriched = data.choices?.[0]?.message?.content?.trim() || '';
+        
+        if (enriched.length < 150 || !enriched.includes('## Identity')) {
+          throw new Error('Bad formatting');
+        }
+
+        // WE HAVE A WINNER! Kill all other ongoing requests to save resources.
+        controllers.forEach((c, i) => {
+          if (i !== index) c.abort();
+        });
+
+        return { enriched, model: data.model || model };
+      } catch (err) {
+        // If this specific model fails or gets a 503, ignore it and let the others keep racing
+        throw err; 
+      }
     });
 
-    clearTimeout(timer);
+    // Promise.any waits for the FIRST successful request and ignores the failures
+    const winner = await Promise.any(requests);
+    clearTimeout(masterTimer);
 
-    if (!response.ok) {
-      return res.status(503).json({ error: 'AI_FAILED', message: 'Models unavailable' });
-    }
-
-    const data = await response.json();
-    const enriched = data.choices?.[0]?.message?.content?.trim() || '';
-    
-    const usedModel = data.model || 'unknown';
-
-    if (enriched.length < 150 || !enriched.includes('## Identity')) {
-      return res.status(422).json({ error: 'INSUFFICIENT_SIGNAL', message: 'Output failed checks' });
-    }
-
-    return res.status(200).json({ enriched, model: usedModel });
+    return res.status(200).json(winner);
 
   } catch (err) {
-    return res.status(503).json({ error: 'TIMEOUT', message: 'Request took too long' });
+    // If ALL 5 models fail or timeout, then we finally return a 503
+    return res.status(503).json({ error: 'TIMEOUT_OR_FAILED', message: 'All models failed or timed out' });
   }
 };
