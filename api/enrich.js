@@ -10,21 +10,6 @@ module.exports = async function handler(req, res) {
   if (!rawText || !category || !fileName) return res.status(400).json({ error: 'Missing required fields' });
   if (rawText.length > 12000) return res.status(400).json({ error: 'Content too large' });
 
-  const hasEnoughLength = rawText.trim().length > 150;
-  const hasRealWords = /[a-zA-Z]{3,}/.test(rawText);
-  const isRepetitiveNoise = (() => {
-    const words = rawText.trim().split(/\s+/).slice(0, 50);
-    const unique = new Set(words.map(w => w.toLowerCase()));
-    return words.length > 10 && unique.size < words.length * 0.3;
-  })();
-
-  if (!hasEnoughLength || !hasRealWords || isRepetitiveNoise) {
-    return res.status(422).json({
-      error: 'INSUFFICIENT_SIGNAL',
-      message: 'Not enough content to generate a skill file.',
-    });
-  }
-
   const allLines = rawText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
   const signalLines = allLines.filter(line =>
     line.length > 20 && (
@@ -38,7 +23,7 @@ module.exports = async function handler(req, res) {
   );
 
   const filteredText = signalLines.length >= 5 ? signalLines.join('\n') : rawText;
-  const textToSend = filteredText.slice(0, signalLines.length >= 5 ? 2500 : 3500);
+  const textToSend = filteredText.slice(0, 2200);
 
   const categoryContext = {
     personality: 'communication style, tone, voice patterns',
@@ -51,12 +36,8 @@ module.exports = async function handler(req, res) {
 
   const focus = categoryContext[category] || categoryContext.knowledge;
 
-  const prompt = `Extract specific behavioral patterns and write a Claude skill file. Focus on: ${focus}.
-
-CRITICAL RULES:
-1. Start exactly with "---"
-2. Keep it punchy and specific. Max 1-2 short sentences per section. 
-3. DO NOT output conversational filler. Output ONLY the YAML and the headings.
+  const prompt = `Extract behavioral patterns and write a Claude skill file. Focus on: ${focus}.
+STRICT PROTOCOL: Start with "---". No yapping. Max 2 short sentences per section.
 
 FORMAT:
 ---
@@ -102,7 +83,7 @@ ${textToSend}`;
     
     const masterTimer = setTimeout(() => {
       controllers.forEach(c => c.abort());
-    }, 8500);
+    }, 9000);
 
     const requests = models.map(async (model, index) => {
       try {
@@ -117,7 +98,7 @@ ${textToSend}`;
           body: JSON.stringify({
             model: model, 
             messages: [{ role: 'user', content: prompt }],
-            max_tokens: 800,
+            max_tokens: 900,
             temperature: 0.3,
           }),
           signal: controllers[index].signal,
@@ -129,7 +110,7 @@ ${textToSend}`;
         const enriched = data.choices?.[0]?.message?.content?.trim() || '';
         
         if (enriched.length < 100 || !enriched.includes('## Identity') || !enriched.includes('---')) {
-          throw new Error('Bad formatting hallucination');
+          throw new Error('Format error');
         }
 
         controllers.forEach((c, i) => {
@@ -148,6 +129,6 @@ ${textToSend}`;
     return res.status(200).json(winner);
 
   } catch (err) {
-    return res.status(503).json({ error: 'TIMEOUT_OR_FAILED', message: 'Trigger frontend fallback' });
+    return res.status(503).json({ error: 'FAILED', message: 'All models failed or timed out' });
   }
 };
