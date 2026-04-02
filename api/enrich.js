@@ -73,11 +73,11 @@ use_cases: ["case 1", "case 2"]
 CONTENT:
 ${textToSend}`;
 
-  // PRIMARY: Gemma 3 4b — good quality, sometimes rate-limited
-  // FALLBACK: Mistral Small 3.1 24b — better structured output than LFM, still free
+  // PRIMARY:  gemma-3-4b:free        — solid quality, hits 200 req/day limit
+  // FALLBACK: step-3.5-flash:free    — confirmed active, different daily quota pool
   const MODELS = [
-    { id: 'google/gemma-3-4b:free',                      timeoutMs: 7000 },
-    { id: 'mistralai/mistral-small-3.1-24b-instruct:free', timeoutMs: 8500 },
+    { id: 'google/gemma-3-4b:free',         timeoutMs: 7000 },
+    { id: 'stepfun/step-3.5-flash:free',    timeoutMs: 8000 },
   ];
 
   function isValidSkillFile(text) {
@@ -91,6 +91,7 @@ ${textToSend}`;
   async function callModel({ id, timeoutMs }) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let httpStatus = null;
 
     try {
       const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
@@ -110,35 +111,45 @@ ${textToSend}`;
         signal: controller.signal,
       });
 
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      httpStatus = response.status;
+
+      if (!response.ok) {
+        const errBody = await response.text().catch(() => '');
+        throw new Error(`HTTP ${response.status}: ${errBody.slice(0, 120)}`);
+      }
 
       const data = await response.json();
       const enriched = data.choices?.[0]?.message?.content?.trim() || '';
 
-      if (!isValidSkillFile(enriched)) throw new Error('Format validation failed');
+      if (!isValidSkillFile(enriched)) {
+        throw new Error(`Format validation failed (length=${enriched.length})`);
+      }
 
       return { enriched, model: data.model || id };
 
+    } catch (err) {
+      const reason = err.name === 'AbortError' ? `timeout after ${timeoutMs}ms` : err.message;
+      console.error(`[enrich] ${id} failed | http=${httpStatus} | ${reason}`);
+      throw err;
     } finally {
       clearTimeout(timer);
     }
   }
 
-  // Sequential: try primary first, only hit fallback if primary fails.
-  // This means happy-path users cost 1 request, not 2.
+  const errors = [];
   for (const modelConfig of MODELS) {
     try {
       const result = await callModel(modelConfig);
       return res.status(200).json(result);
     } catch (err) {
-      // Primary failed (rate-limit, timeout, format error) — try next model
-      continue;
+      errors.push(`${modelConfig.id}: ${err.message}`);
     }
   }
 
-  // Both models failed
+  console.error('[enrich] all models failed', { errors, category, textLen: textToSend.length });
   return res.status(503).json({
     error: 'FAILED',
     message: 'All models failed or timed out',
+    debug: errors, // remove before fully public
   });
 };
