@@ -73,19 +73,8 @@ use_cases: ["case 1", "case 2"]
 CONTENT:
 ${textToSend}`;
 
-  // Total worst-case budget: 4s + 4.5s = 8.5s — safely under Vercel's 10s limit
-  // PRIMARY:  gemma-3-4b       — fast model, 4s is generous, bail early if hanging
-  // FALLBACK: step-3.5-flash   — confirmed active in OR logs, gets remaining 4.5s
-  const MODELS = [
-    { id: 'google/gemma-3-4b:free',      timeoutMs: 4000 },
-    { id: 'stepfun/step-3.5-flash:free', timeoutMs: 4500 },
-  ];
-
-  function withTimeout(promise, ms, label) {
-    const timeout = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`timeout:${label}:${ms}ms`)), ms)
-    );
-    return Promise.race([promise, timeout]);
+  function isValidSkillFile(text) {
+    return text.length >= 100 && text.includes('## Identity') && text.includes('---');
   }
 
   async function callModel(id) {
@@ -113,28 +102,34 @@ ${textToSend}`;
     const data = await response.json();
     const enriched = data.choices?.[0]?.message?.content?.trim() || '';
 
-    if (enriched.length < 100 || !enriched.includes('## Identity') || !enriched.includes('---')) {
+    if (!isValidSkillFile(enriched)) {
       throw new Error(`format-invalid(len=${enriched.length})`);
     }
 
     return { enriched, model: data.model || id };
   }
 
-  const errors = [];
-  for (const { id, timeoutMs } of MODELS) {
-    try {
-      const result = await withTimeout(callModel(id), timeoutMs, id);
-      return res.status(200).json(result);
-    } catch (err) {
-      console.error(`[enrich] ${id} failed: ${err.message}`);
-      errors.push(`${id}: ${err.message}`);
-    }
-  }
+  // Both fire at once. First valid response wins, loser is abandoned.
+  // Single 8s wall — if neither responds in 8s we 503, never hit Vercel's 10s.
+  // 2 parallel requests is fine for your scale, way below spam threshold.
+  const MODELS = ['google/gemma-3-4b:free', 'stepfun/step-3.5-flash:free'];
 
-  console.error('[enrich] all models failed', errors);
-  return res.status(503).json({
-    error: 'FAILED',
-    message: 'All models failed or timed out',
-    debug: errors, // remove before going public
-  });
+  const hardTimeout = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error('hard-timeout:8000ms')), 8000)
+  );
+
+  try {
+    const result = await Promise.race([
+      Promise.any(MODELS.map(id => callModel(id))),
+      hardTimeout,
+    ]);
+    return res.status(200).json(result);
+  } catch (err) {
+    console.error('[enrich] all models failed:', err.message);
+    return res.status(503).json({
+      error: 'FAILED',
+      message: 'All models failed or timed out',
+      debug: err.message, // remove before going public
+    });
+  }
 };
