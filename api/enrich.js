@@ -31,7 +31,7 @@ module.exports = async function handler(req, res) {
       /\d/.test(line) ||
       /\b(always|never|use|create|build|write|make|avoid|ensure|must|should|start|end|keep|focus|lead|design|follow|apply|open|close|prefer|every|each)\b/i.test(line) ||
       line.includes(':') ||
-      /^[-•*#>]/.test(line) ||
+      /^[-•*#>]/ .test(line) ||
       /^(\d+[.)]\s|#{1,3}\s)/.test(line) ||
       line.endsWith('.') || line.endsWith('!') || line.endsWith('?')
     )
@@ -95,38 +95,17 @@ CONTENT:
 ${textToSend}`;
 
   try {
-   // We fire 2 separate requests at the exact same time to save API limits
-   const models = [
-      'google/gemma-3-4b:free',
-      'meta-llama/llama-3.2-3b-instruct:free'
-    ];
-    
-    // Create a kill switch for each individual request
-    const controllers = models.map(() => new AbortController());
-    
-    // Give the entire race 8.5 seconds before Vercel kills the function
-    const masterTimer = setTimeout(() => {
-      controllers.forEach(c => c.abort());
-    }, 9200);
-
-    // Map over our models and create 5 simultaneous fetch requests
-    const requests = models.map(async (model, index) => {
-      try {
-    // We fire 2 separate requests at the exact same time to save API limits
     const models = [
       'google/gemma-3-4b:free',
       'meta-llama/llama-3.2-3b-instruct:free'
     ];
     
-    // Create a kill switch for each individual request
     const controllers = models.map(() => new AbortController());
     
-    // Give the entire race 9.2 seconds before Vercel kills the function
     const masterTimer = setTimeout(() => {
       controllers.forEach(c => c.abort());
     }, 9200);
 
-    // Map over our models and create 2 simultaneous fetch requests
     const requests = models.map(async (model, index) => {
       try {
         const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
@@ -138,7 +117,7 @@ ${textToSend}`;
             'X-Title': 'Relatch',
           },
           body: JSON.stringify({
-            model: model, // Requesting ONE specific model per connection
+            model: model, 
             messages: [{ role: 'user', content: prompt }],
             max_tokens: 500,
             temperature: 0.4,
@@ -155,25 +134,22 @@ ${textToSend}`;
           throw new Error('Bad formatting');
         }
 
-        // WE HAVE A WINNER! Kill the other ongoing request to save resources.
         controllers.forEach((c, i) => {
           if (i !== index) c.abort();
         });
 
         return { enriched, model: data.model || model };
       } catch (err) {
-        // If this specific model fails or gets a 503, ignore it and let the other keep racing
         throw err; 
       }
     });
 
-    // Promise.any waits for the FIRST successful request and ignores the failures
     const winner = await Promise.any(requests);
     clearTimeout(masterTimer);
 
     return res.status(200).json(winner);
 
   } catch (err) {
-    // If BOTH models fail or timeout, then we finally return a 503
     return res.status(503).json({ error: 'TIMEOUT_OR_FAILED', message: 'Both models failed or timed out' });
   }
+};
