@@ -73,83 +73,68 @@ use_cases: ["case 1", "case 2"]
 CONTENT:
 ${textToSend}`;
 
-  // PRIMARY:  gemma-3-4b:free        — solid quality, hits 200 req/day limit
-  // FALLBACK: step-3.5-flash:free    — confirmed active, different daily quota pool
+  // Total worst-case budget: 4s + 4.5s = 8.5s — safely under Vercel's 10s limit
+  // PRIMARY:  gemma-3-4b       — fast model, 4s is generous, bail early if hanging
+  // FALLBACK: step-3.5-flash   — confirmed active in OR logs, gets remaining 4.5s
   const MODELS = [
-    { id: 'google/gemma-3-4b:free',         timeoutMs: 7000 },
-    { id: 'stepfun/step-3.5-flash:free',    timeoutMs: 8000 },
+    { id: 'google/gemma-3-4b:free',      timeoutMs: 4000 },
+    { id: 'stepfun/step-3.5-flash:free', timeoutMs: 4500 },
   ];
 
-  function isValidSkillFile(text) {
-    return (
-      text.length >= 100 &&
-      text.includes('## Identity') &&
-      text.includes('---')
+  function withTimeout(promise, ms, label) {
+    const timeout = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`timeout:${label}:${ms}ms`)), ms)
     );
+    return Promise.race([promise, timeout]);
   }
 
-  async function callModel({ id, timeoutMs }) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    let httpStatus = null;
+  async function callModel(id) {
+    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+        'HTTP-Referer': 'https://relatch-fe.vercel.app',
+        'X-Title': 'Relatch',
+      },
+      body: JSON.stringify({
+        model: id,
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: 900,
+        temperature: 0.3,
+      }),
+    });
 
-    try {
-      const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
-          'HTTP-Referer': 'https://relatch-fe.vercel.app',
-          'X-Title': 'Relatch',
-        },
-        body: JSON.stringify({
-          model: id,
-          messages: [{ role: 'user', content: prompt }],
-          max_tokens: 900,
-          temperature: 0.3,
-        }),
-        signal: controller.signal,
-      });
-
-      httpStatus = response.status;
-
-      if (!response.ok) {
-        const errBody = await response.text().catch(() => '');
-        throw new Error(`HTTP ${response.status}: ${errBody.slice(0, 120)}`);
-      }
-
-      const data = await response.json();
-      const enriched = data.choices?.[0]?.message?.content?.trim() || '';
-
-      if (!isValidSkillFile(enriched)) {
-        throw new Error(`Format validation failed (length=${enriched.length})`);
-      }
-
-      return { enriched, model: data.model || id };
-
-    } catch (err) {
-      const reason = err.name === 'AbortError' ? `timeout after ${timeoutMs}ms` : err.message;
-      console.error(`[enrich] ${id} failed | http=${httpStatus} | ${reason}`);
-      throw err;
-    } finally {
-      clearTimeout(timer);
+    if (!response.ok) {
+      const errBody = await response.text().catch(() => '');
+      throw new Error(`HTTP ${response.status}: ${errBody.slice(0, 120)}`);
     }
+
+    const data = await response.json();
+    const enriched = data.choices?.[0]?.message?.content?.trim() || '';
+
+    if (enriched.length < 100 || !enriched.includes('## Identity') || !enriched.includes('---')) {
+      throw new Error(`format-invalid(len=${enriched.length})`);
+    }
+
+    return { enriched, model: data.model || id };
   }
 
   const errors = [];
-  for (const modelConfig of MODELS) {
+  for (const { id, timeoutMs } of MODELS) {
     try {
-      const result = await callModel(modelConfig);
+      const result = await withTimeout(callModel(id), timeoutMs, id);
       return res.status(200).json(result);
     } catch (err) {
-      errors.push(`${modelConfig.id}: ${err.message}`);
+      console.error(`[enrich] ${id} failed: ${err.message}`);
+      errors.push(`${id}: ${err.message}`);
     }
   }
 
-  console.error('[enrich] all models failed', { errors, category, textLen: textToSend.length });
+  console.error('[enrich] all models failed', errors);
   return res.status(503).json({
     error: 'FAILED',
     message: 'All models failed or timed out',
-    debug: errors, // remove before fully public
+    debug: errors, // remove before going public
   });
 };
