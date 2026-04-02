@@ -51,13 +51,12 @@ module.exports = async function handler(req, res) {
 
   const focus = categoryContext[category] || categoryContext.knowledge;
 
-  const prompt = `Extract behavioral patterns and write a Claude skill file. Focus on: ${focus}.
+  const prompt = `Extract highly specific behavioral patterns from this content and write a Claude skill file. Focus on: ${focus}.
 
 STRICT PROTOCOL:
-1. NO YAPPING. Do not say "Here is the file" or "I understand".
-2. You MUST start your response exactly with "---"
-3. You MUST include EVERY heading exactly as shown below.
-4. Keep every section extremely concise. Maximum 2 short sentences or bullet points per section. Speed is critical.
+1. NO YAPPING. Start immediately with "---"
+2. Extract EXACT tactics, phrases, and specific rules from the content. Do not use generic summaries.
+3. Keep sections deeply informative but limit to 2 or 3 sentences or bullets per section.
 
 FORMAT:
 ---
@@ -67,32 +66,32 @@ use_cases: ["case 1", "case 2"]
 ---
 
 ## Identity & Role
-[1 short sentence]
+[2 specific sentences defining the exact role and persona.]
 
 ## Core Principles
-[3 short bullet points]
+[3 detailed bullet points extracting specific core beliefs from the text.]
 
 ## How to Think
-[1 short sentence]
+[2 sentences on the exact mental models used in the text.]
 
 ## How to Create
-[1 short sentence]
+[Specific instructions on structure, length, and format based on the text.]
 
 ## What to Always Do
-[3 short bullet points starting with verbs]
+[3 to 4 specific action items extracted directly from the text. Start with verbs.]
 
 ## What to Never Do
-[3 short bullet points starting with Never]
+[3 to 4 specific things to avoid based on the text. Start with "Never".]
 
 ## Voice & Language
-[1 short sentence]
+[Specify the exact tone, pacing, and vocabulary used in the text.]
 
 ## Quality Bar
-[1 short sentence]
+[2 specific standards for how to judge the final output.]
 
 CONTENT TO ANALYZE:
 ${textToSend}`;
-
+  
   try {
     const models = [
       'google/gemma-3-4b:free',
