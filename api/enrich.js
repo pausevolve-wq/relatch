@@ -31,7 +31,7 @@ module.exports = async function handler(req, res) {
       /\d/.test(line) ||
       /\b(always|never|use|create|build|write|make|avoid|ensure|must|should|start|end|keep|focus|lead|design|follow|apply|open|close|prefer|every|each)\b/i.test(line) ||
       line.includes(':') ||
-      /^[-•*#>]/ .test(line) ||
+      /^[-•*#>]/.test(line) ||
       /^(\d+[.)]\s|#{1,3}\s)/.test(line) ||
       line.endsWith('.') || line.endsWith('!') || line.endsWith('?')
     )
@@ -44,7 +44,7 @@ module.exports = async function handler(req, res) {
     personality: 'communication style, tone, voice patterns, how they phrase things, what they emphasize',
     instructions: 'rules, constraints, decision criteria, what to always do, what to never do',
     knowledge: 'domain expertise, mental models, frameworks they use, how they think about problems',
-    examples: 'the patterns in these examples — structure, style, what makes them work',
+    examples: 'the patterns in these examples, structure, style, what makes them work',
     context: 'the situation, constraints, goals, audience, and environment that shapes decisions',
     preferences: 'specific choices, standards, non-negotiables, defaults, and pet peeves',
   };
@@ -97,7 +97,7 @@ ${textToSend}`;
   try {
     const models = [
       'google/gemma-3-4b:free',
-      'meta-llama/llama-3.2-3b-instruct:free'
+      'arcee-ai/trinity-mini:free'
     ];
     
     const controllers = models.map(() => new AbortController());
@@ -150,6 +150,6 @@ ${textToSend}`;
     return res.status(200).json(winner);
 
   } catch (err) {
-    return res.status(503).json({ error: 'TIMEOUT_OR_FAILED', message: 'Both models failed or timed out' });
+    return res.status(503).json({ error: 'TIMEOUT_OR_FAILED', message: 'All models failed or timed out' });
   }
 };
