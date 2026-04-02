@@ -51,12 +51,12 @@ module.exports = async function handler(req, res) {
 
   const focus = categoryContext[category] || categoryContext.knowledge;
 
-  const prompt = `Extract highly specific behavioral patterns from this content and write a Claude skill file. Focus on: ${focus}.
+  const prompt = `Extract specific tactics from this content for a Claude skill file. Focus on: ${focus}.
 
-STRICT PROTOCOL:
-1. NO YAPPING. Start immediately with "---"
-2. Extract EXACT tactics, phrases, and specific rules from the content. Do not use generic summaries.
-3. Keep sections deeply informative but limit to 2 or 3 sentences or bullets per section.
+CRITICAL RULES:
+1. Start exactly with "---"
+2. NO complete sentences. Use fragments and exact keywords only.
+3. Maximum 10 words per section. Be hyper-dense to save generation time.
 
 FORMAT:
 ---
@@ -66,30 +66,30 @@ use_cases: ["case 1", "case 2"]
 ---
 
 ## Identity & Role
-[2 specific sentences defining the exact role and persona.]
+[Specific persona, max 10 words]
 
 ## Core Principles
-[3 detailed bullet points extracting specific core beliefs from the text.]
+[3 exact concept keywords]
 
 ## How to Think
-[2 sentences on the exact mental models used in the text.]
+[Core mental model, max 10 words]
 
 ## How to Create
-[Specific instructions on structure, length, and format based on the text.]
+[Exact formatting rules, max 10 words]
 
 ## What to Always Do
-[3 to 4 specific action items extracted directly from the text. Start with verbs.]
+[3 specific action verbs]
 
 ## What to Never Do
-[3 to 4 specific things to avoid based on the text. Start with "Never".]
+[3 specific avoided actions]
 
 ## Voice & Language
-[Specify the exact tone, pacing, and vocabulary used in the text.]
+[Exact tone words]
 
 ## Quality Bar
-[2 specific standards for how to judge the final output.]
+[Strict success metric, max 10 words]
 
-CONTENT TO ANALYZE:
+CONTENT:
 ${textToSend}`;
   
   try {
