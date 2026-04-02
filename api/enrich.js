@@ -51,12 +51,12 @@ module.exports = async function handler(req, res) {
 
   const focus = categoryContext[category] || categoryContext.knowledge;
 
-  const prompt = `Extract specific tactics from this content for a Claude skill file. Focus on: ${focus}.
+  const prompt = `Extract specific behavioral patterns and write a Claude skill file. Focus on: ${focus}.
 
 CRITICAL RULES:
 1. Start exactly with "---"
-2. NO complete sentences. Use fragments and exact keywords only.
-3. Maximum 10 words per section. Be hyper-dense to save generation time.
+2. Keep it punchy and specific. Max 1-2 short sentences per section. 
+3. DO NOT output conversational filler. Output ONLY the YAML and the headings.
 
 FORMAT:
 ---
@@ -66,36 +66,36 @@ use_cases: ["case 1", "case 2"]
 ---
 
 ## Identity & Role
-[Specific persona, max 10 words]
+[Specific role, max 2 sentences]
 
 ## Core Principles
-[3 exact concept keywords]
+[3 exact principles from text]
 
 ## How to Think
-[Core mental model, max 10 words]
+[Core mental model, max 2 sentences]
 
 ## How to Create
-[Exact formatting rules, max 10 words]
+[Exact rules for formatting, max 2 sentences]
 
 ## What to Always Do
-[3 specific action verbs]
+[3 action verbs]
 
 ## What to Never Do
-[3 specific avoided actions]
+[3 avoided actions]
 
 ## Voice & Language
-[Exact tone words]
+[Tone and style descriptors]
 
 ## Quality Bar
-[Strict success metric, max 10 words]
+[Strict metric for success]
 
 CONTENT:
 ${textToSend}`;
-  
+
   try {
     const models = [
       'google/gemma-3-4b:free',
-      'openrouter/free'
+      'liquid/lfm-2.5-1.2b-instruct:free'
     ];
 
     const controllers = models.map(() => new AbortController());
@@ -117,7 +117,7 @@ ${textToSend}`;
           body: JSON.stringify({
             model: model, 
             messages: [{ role: 'user', content: prompt }],
-            max_tokens: 900,
+            max_tokens: 800,
             temperature: 0.3,
           }),
           signal: controllers[index].signal,
