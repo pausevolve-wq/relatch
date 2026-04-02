@@ -10,6 +10,21 @@ module.exports = async function handler(req, res) {
   if (!rawText || !category || !fileName) return res.status(400).json({ error: 'Missing required fields' });
   if (rawText.length > 12000) return res.status(400).json({ error: 'Content too large' });
 
+  const hasEnoughLength = rawText.trim().length > 150;
+  const hasRealWords = /[a-zA-Z]{3,}/.test(rawText);
+  const isRepetitiveNoise = (() => {
+    const words = rawText.trim().split(/\s+/).slice(0, 50);
+    const unique = new Set(words.map(w => w.toLowerCase()));
+    return words.length > 10 && unique.size < words.length * 0.3;
+  })();
+
+  if (!hasEnoughLength || !hasRealWords || isRepetitiveNoise) {
+    return res.status(422).json({
+      error: 'INSUFFICIENT_SIGNAL',
+      message: 'Not enough content to generate a skill file.',
+    });
+  }
+
   const allLines = rawText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
   const signalLines = allLines.filter(line =>
     line.length > 20 && (
@@ -23,21 +38,27 @@ module.exports = async function handler(req, res) {
   );
 
   const filteredText = signalLines.length >= 5 ? signalLines.join('\n') : rawText;
-  const textToSend = filteredText.slice(0, 2200);
+  const textToSend = filteredText.slice(0, signalLines.length >= 5 ? 2500 : 3500);
 
   const categoryContext = {
-    personality: 'communication style, tone, voice patterns',
-    instructions: 'rules, constraints, decision criteria',
-    knowledge: 'domain expertise, mental models, frameworks',
-    examples: 'structure, style, what makes them work',
-    context: 'the situation, constraints, goals, audience',
-    preferences: 'specific choices, standards, non-negotiables',
+    personality: 'communication style, tone, voice patterns, how they phrase things, what they emphasize',
+    instructions: 'rules, constraints, decision criteria, what to always do, what to never do',
+    knowledge: 'domain expertise, mental models, frameworks they use, how they think about problems',
+    examples: 'the patterns in these examples — structure, style, what makes them work',
+    context: 'the situation, constraints, goals, audience, and environment that shapes decisions',
+    preferences: 'specific choices, standards, non-negotiables, defaults, and pet peeves',
   };
 
   const focus = categoryContext[category] || categoryContext.knowledge;
 
-  const prompt = `Extract behavioral patterns and write a Claude skill file. Focus on: ${focus}.
-STRICT PROTOCOL: Start with "---". No yapping. Max 2 short sentences per section.
+  const prompt = `Extract behavioral patterns from this content and write a Claude skill file.
+Focus on: ${focus}
+
+RULES:
+- Extract PATTERNS and WHY behind decisions.
+- NEVER copy-paste raw lines.
+- You MUST start your response exactly with the YAML block below.
+- You MUST enclose all YAML values in double quotes.
 
 FORMAT:
 ---
@@ -47,89 +68,90 @@ use_cases: ["case 1", "case 2"]
 ---
 
 ## Identity & Role
-[Specific role, max 2 sentences]
+[2 sentences. Who Claude becomes. Specific.]
 
 ## Core Principles
-[3 exact principles from text]
+[4-5 fundamental beliefs extracted from content. Not rules but beliefs.]
 
 ## How to Think
-[Core mental model, max 2 sentences]
+[The mental process and reasoning pattern extracted from content.]
 
 ## How to Create
-[Exact rules for formatting, max 2 sentences]
+[Specific craft instructions. Structure, format, style, vocabulary.]
 
 ## What to Always Do
-[3 action verbs]
+[5 specific behaviors. Start each with a verb.]
 
 ## What to Never Do
-[3 avoided actions]
+[4 things clearly avoided. Start each with "Never".]
 
 ## Voice & Language
-[Tone and style descriptors]
+[Specific words, phrases, sentence patterns. Signature moves.]
 
 ## Quality Bar
-[Strict metric for success]
+[How to know when output is done right.]
 
 CONTENT:
 ${textToSend}`;
 
-  function isValidSkillFile(text) {
-    return text.length >= 100 && text.includes('## Identity') && text.includes('---');
-  }
-
-  async function callModel(id) {
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
-        'HTTP-Referer': 'https://relatch-fe.vercel.app',
-        'X-Title': 'Relatch',
-      },
-      body: JSON.stringify({
-        model: id,
-        messages: [{ role: 'user', content: prompt }],
-        max_tokens: 900,
-        temperature: 0.3,
-      }),
-    });
-
-    if (!response.ok) {
-      const errBody = await response.text().catch(() => '');
-      throw new Error(`HTTP ${response.status}: ${errBody.slice(0, 120)}`);
-    }
-
-    const data = await response.json();
-    const enriched = data.choices?.[0]?.message?.content?.trim() || '';
-
-    if (!isValidSkillFile(enriched)) {
-      throw new Error(`format-invalid(len=${enriched.length})`);
-    }
-
-    return { enriched, model: data.model || id };
-  }
-
-  // Both fire at once. First valid response wins, loser is abandoned.
-  // Single 8s wall — if neither responds in 8s we 503, never hit Vercel's 10s.
-  // 2 parallel requests is fine for your scale, way below spam threshold.
-  const MODELS = ['google/gemma-3-4b:free', 'stepfun/step-3.5-flash:free'];
-
-  const hardTimeout = new Promise((_, reject) =>
-    setTimeout(() => reject(new Error('hard-timeout:8000ms')), 8000)
-  );
-
   try {
-    const result = await Promise.race([
-      Promise.any(MODELS.map(id => callModel(id))),
-      hardTimeout,
-    ]);
-    return res.status(200).json(result);
-  } catch (err) {
-    console.error('[enrich] all models failed:', err.message);
-    return res.status(503).json({
-      error: 'FAILED',
-      message: 'All models failed or timed out',
-      debug: err.message, // remove before going public
+    const models = [
+      'google/gemma-3-4b:free',
+      'stepfun/step-3.5-flash:free',
+      'openrouter/auto', // nuclear fallback — OR picks fastest available free model
+    ];
+
+    const controllers = models.map(() => new AbortController());
+
+    const masterTimer = setTimeout(() => {
+      controllers.forEach(c => c.abort());
+    }, 8500);
+
+    const requests = models.map(async (model, index) => {
+      try {
+        const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+            'HTTP-Referer': 'https://relatch-fe.vercel.app',
+            'X-Title': 'Relatch',
+          },
+          body: JSON.stringify({
+            model: model,
+            messages: [{ role: 'user', content: prompt }],
+            max_tokens: 900,
+            temperature: 0.4,
+          }),
+          signal: controllers[index].signal,
+        });
+
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+        const data = await response.json();
+        const enriched = data.choices?.[0]?.message?.content?.trim() || '';
+
+        if (enriched.length < 150 || !enriched.includes('## Identity')) {
+          throw new Error('Bad formatting');
+        }
+
+        // Winner — kill the other two
+        controllers.forEach((c, i) => {
+          if (i !== index) c.abort();
+        });
+
+        return { enriched, model: data.model || model };
+      } catch (err) {
+        throw err;
+      }
     });
+
+    const winner = await Promise.any(requests);
+    clearTimeout(masterTimer);
+
+    return res.status(200).json(winner);
+
+  } catch (err) {
+    return res.status(503).json({ error: 'TIMEOUT_OR_FAILED', message: 'All models failed or timed out' });
   }
 };
