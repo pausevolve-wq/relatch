@@ -51,17 +51,29 @@ module.exports = async function handler(req, res) {
 
   const focus = categoryContext[category] || categoryContext.knowledge;
 
+  // Derive a clean skill name from the uploaded filename
+  const skillName = fileName
+    .replace(/\.[^/.]+$/, '')           // remove extension
+    .replace(/[_-]+/g, ' ')             // underscores/dashes → spaces
+    .replace(/\s+/g, ' ')               // collapse whitespace
+    .trim()
+    .split(' ')
+    .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+    .join(' ');
+
   const prompt = `Extract behavioral patterns from this content and write a Claude skill file.
 Focus on: ${focus}
 
 RULES:
 - Extract PATTERNS and WHY behind decisions.
 - NEVER copy-paste raw lines.
-- You MUST start your response exactly with the YAML block below.
+- You MUST start your response exactly with the YAML block below — no code fences, no backticks, no preamble.
 - You MUST enclose all YAML values in double quotes.
+- The "name" field MUST be exactly: "${skillName}"
 
 FORMAT:
 ---
+name: "${skillName}"
 domain: "detected domain"
 content_type: "behavioral skill"
 use_cases: ["case 1", "case 2"]
@@ -94,11 +106,92 @@ use_cases: ["case 1", "case 2"]
 CONTENT:
 ${textToSend}`;
 
+  // ─── POST-PROCESSOR ────────────────────────────────────────────────────────
+  // Runs on every winner regardless of which model produced it.
+  // Guarantees the output is a clean, drag-droppable .md skill file.
+  function sanitize(raw, skillName) {
+    let text = raw;
+
+    // 1. Strip invisible/zero-width characters
+    text = text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\uFEFF\u200B-\u200D\u2060]/g, '');
+
+    // 2. Strip markdown code fences (```yaml, ```md, ``` etc.)
+    text = text.replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/,'').trim();
+
+    // 3. Ensure the file starts with --- (YAML frontmatter open)
+    //    Some models prepend a sentence before the YAML block
+    const yamlStart = text.indexOf('---');
+    if (yamlStart > 0) text = text.slice(yamlStart);
+    if (!text.startsWith('---')) text = '---\n' + text;
+
+    // 4. Extract and rebuild frontmatter to enforce required fields
+    const fmMatch = text.match(/^---\n([\s\S]*?)\n---/);
+    if (fmMatch) {
+      let fm = fmMatch[1];
+
+      // 4a. Ensure name field exists and is correct
+      if (/^name:/m.test(fm)) {
+        fm = fm.replace(/^name:.*$/m, `name: "${skillName}"`);
+      } else {
+        fm = `name: "${skillName}"\n` + fm;
+      }
+
+      // 4b. Ensure domain field exists
+      if (!/^domain:/m.test(fm)) {
+        fm += `\ndomain: "General"`;
+      }
+
+      // 4c. Ensure content_type field exists
+      if (!/^content_type:/m.test(fm)) {
+        fm += `\ncontent_type: "behavioral skill"`;
+      }
+
+      // 4d. Ensure use_cases field exists
+      if (!/^use_cases:/m.test(fm)) {
+        fm += `\nuse_cases: ["general use"]`;
+      }
+
+      // 4e. Make sure all scalar YAML values are quoted (catch unquoted values)
+      fm = fm.replace(/^(name|domain|content_type):\s*(?!")(.+)$/gm, (_, key, val) => {
+        return `${key}: "${val.trim()}"`;
+      });
+
+      // Rebuild with clean frontmatter
+      text = `---\n${fm.trim()}\n---` + text.slice(fmMatch[0].length);
+    }
+
+    // 5. Ensure all required ## sections exist — insert empty placeholder if missing
+    const requiredSections = [
+      '## Identity & Role',
+      '## Core Principles',
+      '## How to Think',
+      '## How to Create',
+      '## What to Always Do',
+      '## What to Never Do',
+      '## Voice & Language',
+      '## Quality Bar',
+    ];
+    for (const section of requiredSections) {
+      if (!text.includes(section)) {
+        text += `\n\n${section}\n[Not extracted — review source content]`;
+      }
+    }
+
+    // 6. Normalise line endings (CRLF → LF)
+    text = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+    // 7. Collapse 3+ consecutive blank lines → max 2
+    text = text.replace(/\n{3,}/g, '\n\n');
+
+    return text.trim();
+  }
+  // ───────────────────────────────────────────────────────────────────────────
+
   try {
     const models = [
       'google/gemma-3-4b:free',
       'stepfun/step-3.5-flash:free',
-      'openrouter/auto', // nuclear fallback — OR picks fastest available free model
+      'openrouter/auto',
     ];
 
     const controllers = models.map(() => new AbortController());
@@ -129,16 +222,16 @@ ${textToSend}`;
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
         const data = await response.json();
-        const enriched = data.choices?.[0]?.message?.content?.trim() || '';
+        const raw = data.choices?.[0]?.message?.content?.trim() || '';
 
-        if (enriched.length < 150 || !enriched.includes('## Identity')) {
+        if (raw.length < 150 || !raw.includes('## Identity')) {
           throw new Error('Bad formatting');
         }
 
-        // Winner — kill the other two
-        controllers.forEach((c, i) => {
-          if (i !== index) c.abort();
-        });
+        // Run sanitizer on every winner — clean output regardless of model
+        const enriched = sanitize(raw, skillName);
+
+        controllers.forEach((c, i) => { if (i !== index) c.abort(); });
 
         return { enriched, model: data.model || model };
       } catch (err) {
