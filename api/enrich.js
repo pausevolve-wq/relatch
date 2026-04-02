@@ -51,11 +51,10 @@ module.exports = async function handler(req, res) {
 
   const focus = categoryContext[category] || categoryContext.knowledge;
 
-  // Derive a clean skill name from the uploaded filename
   const skillName = fileName
-    .replace(/\.[^/.]+$/, '')           // remove extension
-    .replace(/[_-]+/g, ' ')             // underscores/dashes → spaces
-    .replace(/\s+/g, ' ')               // collapse whitespace
+    .replace(/\.[^/.]+$/, '')
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
     .trim()
     .split(' ')
     .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
@@ -106,143 +105,139 @@ use_cases: ["case 1", "case 2"]
 CONTENT:
 ${textToSend}`;
 
-  // ─── POST-PROCESSOR ────────────────────────────────────────────────────────
-  // Runs on every winner regardless of which model produced it.
-  // Guarantees the output is a clean, drag-droppable .md skill file.
+  // ─── SANITIZER ─────────────────────────────────────────────────────────────
   function sanitize(raw, skillName) {
     let text = raw;
-
-    // 1. Strip invisible/zero-width characters
     text = text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\uFEFF\u200B-\u200D\u2060]/g, '');
-
-    // 2. Strip markdown code fences (```yaml, ```md, ``` etc.)
-    text = text.replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/,'').trim();
-
-    // 3. Ensure the file starts with --- (YAML frontmatter open)
-    //    Some models prepend a sentence before the YAML block
+    text = text.replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/, '').trim();
     const yamlStart = text.indexOf('---');
     if (yamlStart > 0) text = text.slice(yamlStart);
     if (!text.startsWith('---')) text = '---\n' + text;
-
-    // 4. Extract and rebuild frontmatter to enforce required fields
     const fmMatch = text.match(/^---\n([\s\S]*?)\n---/);
     if (fmMatch) {
       let fm = fmMatch[1];
-
-      // 4a. Ensure name field exists and is correct
       if (/^name:/m.test(fm)) {
         fm = fm.replace(/^name:.*$/m, `name: "${skillName}"`);
       } else {
         fm = `name: "${skillName}"\n` + fm;
       }
-
-      // 4b. Ensure domain field exists
-      if (!/^domain:/m.test(fm)) {
-        fm += `\ndomain: "General"`;
-      }
-
-      // 4c. Ensure content_type field exists
-      if (!/^content_type:/m.test(fm)) {
-        fm += `\ncontent_type: "behavioral skill"`;
-      }
-
-      // 4d. Ensure use_cases field exists
-      if (!/^use_cases:/m.test(fm)) {
-        fm += `\nuse_cases: ["general use"]`;
-      }
-
-      // 4e. Make sure all scalar YAML values are quoted (catch unquoted values)
-      fm = fm.replace(/^(name|domain|content_type):\s*(?!")(.+)$/gm, (_, key, val) => {
-        return `${key}: "${val.trim()}"`;
-      });
-
-      // Rebuild with clean frontmatter
+      if (!/^domain:/m.test(fm))       fm += `\ndomain: "General"`;
+      if (!/^content_type:/m.test(fm)) fm += `\ncontent_type: "behavioral skill"`;
+      if (!/^use_cases:/m.test(fm))    fm += `\nuse_cases: ["general use"]`;
+      fm = fm.replace(/^(name|domain|content_type):\s*(?!")(.+)$/gm, (_, key, val) => `${key}: "${val.trim()}"`);
       text = `---\n${fm.trim()}\n---` + text.slice(fmMatch[0].length);
     }
-
-    // 5. Ensure all required ## sections exist — insert empty placeholder if missing
     const requiredSections = [
-      '## Identity & Role',
-      '## Core Principles',
-      '## How to Think',
-      '## How to Create',
-      '## What to Always Do',
-      '## What to Never Do',
-      '## Voice & Language',
-      '## Quality Bar',
+      '## Identity & Role', '## Core Principles', '## How to Think',
+      '## How to Create', '## What to Always Do', '## What to Never Do',
+      '## Voice & Language', '## Quality Bar',
     ];
     for (const section of requiredSections) {
-      if (!text.includes(section)) {
-        text += `\n\n${section}\n[Not extracted — review source content]`;
-      }
+      if (!text.includes(section)) text += `\n\n${section}\n[Not extracted — review source content]`;
     }
-
-    // 6. Normalise line endings (CRLF → LF)
     text = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-
-    // 7. Collapse 3+ consecutive blank lines → max 2
     text = text.replace(/\n{3,}/g, '\n\n');
-
     return text.trim();
   }
   // ───────────────────────────────────────────────────────────────────────────
 
-  try {
-    const models = [
-      'google/gemma-3-4b:free',
-      'stepfun/step-3.5-flash:free',
-      'openrouter/auto',
-    ];
+  // ─── STAGGERED WAVE STRATEGY ───────────────────────────────────────────────
+  // Wave 1 (t=0ms)    — 2 requests  → fast reliable models
+  // Wave 2 (t=3000ms) — 2 requests  → only fires if wave 1 hasn't resolved
+  // Wave 3 (t=6000ms) — 1 request   → nuclear fallback, only if still nothing
+  //
+  // Happy path (most users): 2 requests total → safe at 20 concurrent users
+  // Slow path: up to 5 requests but staggered, never all at once
+  // ───────────────────────────────────────────────────────────────────────────
 
-    const controllers = models.map(() => new AbortController());
+  const WAVES = [
+    { models: ['google/gemma-3-4b:free', 'stepfun/step-3.5-flash:free'],       delay: 0    },
+    { models: ['meta-llama/llama-3.2-3b-instruct:free', 'google/gemma-3-12b-it:free'], delay: 3000 },
+    { models: ['openrouter/auto'],                                               delay: 6000 },
+  ];
 
-    const masterTimer = setTimeout(() => {
-      controllers.forEach(c => c.abort());
-    }, 8500);
+  let winner = null;
+  const allControllers = [];
 
-    const requests = models.map(async (model, index) => {
-      try {
-        const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
-            'HTTP-Referer': 'https://relatch-fe.vercel.app',
-            'X-Title': 'Relatch',
-          },
-          body: JSON.stringify({
-            model: model,
-            messages: [{ role: 'user', content: prompt }],
-            max_tokens: 900,
-            temperature: 0.4,
-          }),
-          signal: controllers[index].signal,
-        });
+  // Tracks all in-flight promises so we can let them finish/abort cleanly
+  const inFlight = [];
 
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  function callModel(model) {
+    const controller = new AbortController();
+    allControllers.push(controller);
 
-        const data = await response.json();
-        const raw = data.choices?.[0]?.message?.content?.trim() || '';
-
-        if (raw.length < 150 || !raw.includes('## Identity')) {
-          throw new Error('Bad formatting');
-        }
-
-        // Run sanitizer on every winner — clean output regardless of model
-        const enriched = sanitize(raw, skillName);
-
-        controllers.forEach((c, i) => { if (i !== index) c.abort(); });
-
-        return { enriched, model: data.model || model };
-      } catch (err) {
-        throw err;
-      }
+    const p = fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+        'HTTP-Referer': 'https://relatch-fe.vercel.app',
+        'X-Title': 'Relatch',
+      },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: 900,
+        temperature: 0.4,
+      }),
+      signal: controller.signal,
+    })
+    .then(async res => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const raw = data.choices?.[0]?.message?.content?.trim() || '';
+      if (raw.length < 150 || !raw.includes('## Identity')) throw new Error('Bad formatting');
+      return { enriched: sanitize(raw, skillName), model: data.model || model };
     });
 
-    const winner = await Promise.any(requests);
-    clearTimeout(masterTimer);
+    return { promise: p, controller };
+  }
 
-    return res.status(200).json(winner);
+  try {
+    await new Promise((resolve, reject) => {
+      let settled = false;
+      let waveTimers = [];
+
+      // Hard kill at 8.5s — abort everything and reject
+      const masterTimer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          allControllers.forEach(c => c.abort());
+          waveTimers.forEach(t => clearTimeout(t));
+          reject(new Error('master timeout'));
+        }
+      }, 8500);
+
+      function launchWave(models) {
+        if (settled) return; // a winner already found, don't fire
+        models.forEach(model => {
+          const { promise } = callModel(model);
+          inFlight.push(promise);
+          promise.then(result => {
+            if (!settled) {
+              settled = true;
+              winner = result;
+              allControllers.forEach(c => c.abort()); // kill all others
+              waveTimers.forEach(t => clearTimeout(t));
+              clearTimeout(masterTimer);
+              resolve();
+            }
+          }).catch(() => {}); // individual failures are fine, race continues
+        });
+      }
+
+      // Launch waves on schedule
+      WAVES.forEach(({ models, delay }) => {
+        if (delay === 0) {
+          launchWave(models);
+        } else {
+          waveTimers.push(setTimeout(() => launchWave(models), delay));
+        }
+      });
+    });
+
+    if (winner) return res.status(200).json(winner);
+    throw new Error('no winner');
 
   } catch (err) {
     return res.status(503).json({ error: 'TIMEOUT_OR_FAILED', message: 'All models failed or timed out' });
