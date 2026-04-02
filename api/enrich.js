@@ -95,13 +95,10 @@ CONTENT:
 ${textToSend}`;
 
   try {
-    // We fire 5 separate requests at the exact same time
+   // We fire 2 separate requests at the exact same time to save API limits
     const models = [
-      'arcee-ai/trinity-mini:free',
-      'meta-llama/llama-3.2-3b-instruct:free',
-      'google/gemma-3-4b:free',
       'google/gemma-3-12b-it:free',
-      'openrouter/free' // Nuclear fallback
+      'meta-llama/llama-3.1-8b-instruct:free'
     ];
 
     // Create a kill switch for each individual request
