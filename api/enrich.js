@@ -73,62 +73,72 @@ use_cases: ["case 1", "case 2"]
 CONTENT:
 ${textToSend}`;
 
-  try {
-    const models = [
-      'google/gemma-3-4b:free',
-      'liquid/lfm-2.5-1.2b-instruct:free'
-    ];
+  // PRIMARY: Gemma 3 4b — good quality, sometimes rate-limited
+  // FALLBACK: Mistral Small 3.1 24b — better structured output than LFM, still free
+  const MODELS = [
+    { id: 'google/gemma-3-4b:free',                      timeoutMs: 7000 },
+    { id: 'mistralai/mistral-small-3.1-24b-instruct:free', timeoutMs: 8500 },
+  ];
 
-    const controllers = models.map(() => new AbortController());
-    
-    const masterTimer = setTimeout(() => {
-      controllers.forEach(c => c.abort());
-    }, 9000);
-
-    const requests = models.map(async (model, index) => {
-      try {
-        const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
-            'HTTP-Referer': 'https://relatch-fe.vercel.app',
-            'X-Title': 'Relatch',
-          },
-          body: JSON.stringify({
-            model: model, 
-            messages: [{ role: 'user', content: prompt }],
-            max_tokens: 900,
-            temperature: 0.3,
-          }),
-          signal: controllers[index].signal,
-        });
-
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-        const data = await response.json();
-        const enriched = data.choices?.[0]?.message?.content?.trim() || '';
-        
-        if (enriched.length < 100 || !enriched.includes('## Identity') || !enriched.includes('---')) {
-          throw new Error('Format error');
-        }
-
-        controllers.forEach((c, i) => {
-          if (i !== index) c.abort();
-        });
-
-        return { enriched, model: data.model || model };
-      } catch (err) {
-        throw err; 
-      }
-    });
-
-    const winner = await Promise.any(requests);
-    clearTimeout(masterTimer);
-
-    return res.status(200).json(winner);
-
-  } catch (err) {
-    return res.status(503).json({ error: 'FAILED', message: 'All models failed or timed out' });
+  function isValidSkillFile(text) {
+    return (
+      text.length >= 100 &&
+      text.includes('## Identity') &&
+      text.includes('---')
+    );
   }
+
+  async function callModel({ id, timeoutMs }) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+          'HTTP-Referer': 'https://relatch-fe.vercel.app',
+          'X-Title': 'Relatch',
+        },
+        body: JSON.stringify({
+          model: id,
+          messages: [{ role: 'user', content: prompt }],
+          max_tokens: 900,
+          temperature: 0.3,
+        }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+      const data = await response.json();
+      const enriched = data.choices?.[0]?.message?.content?.trim() || '';
+
+      if (!isValidSkillFile(enriched)) throw new Error('Format validation failed');
+
+      return { enriched, model: data.model || id };
+
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // Sequential: try primary first, only hit fallback if primary fails.
+  // This means happy-path users cost 1 request, not 2.
+  for (const modelConfig of MODELS) {
+    try {
+      const result = await callModel(modelConfig);
+      return res.status(200).json(result);
+    } catch (err) {
+      // Primary failed (rate-limit, timeout, format error) — try next model
+      continue;
+    }
+  }
+
+  // Both models failed
+  return res.status(503).json({
+    error: 'FAILED',
+    message: 'All models failed or timed out',
+  });
 };
