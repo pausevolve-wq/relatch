@@ -95,61 +95,43 @@ CONTENT:
 ${textToSend}`;
 
   try {
-    const models = [
-      'google/gemma-3-4b:free',
-      'arcee-ai/trinity-mini:free'
-    ];
-    
-    const controllers = models.map(() => new AbortController());
+    const controller = new AbortController();
     
     const masterTimer = setTimeout(() => {
-      controllers.forEach(c => c.abort());
+      controller.abort();
     }, 9200);
 
-    const requests = models.map(async (model, index) => {
-      try {
-        const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
-            'HTTP-Referer': 'https://relatch-fe.vercel.app',
-            'X-Title': 'Relatch',
-          },
-          body: JSON.stringify({
-            model: model, 
-            messages: [{ role: 'user', content: prompt }],
-            max_tokens: 500,
-            temperature: 0.4,
-          }),
-          signal: controllers[index].signal,
-        });
-
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-        const data = await response.json();
-        const enriched = data.choices?.[0]?.message?.content?.trim() || '';
-        
-        if (enriched.length < 150 || !enriched.includes('## Identity')) {
-          throw new Error('Bad formatting');
-        }
-
-        controllers.forEach((c, i) => {
-          if (i !== index) c.abort();
-        });
-
-        return { enriched, model: data.model || model };
-      } catch (err) {
-        throw err; 
-      }
+    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+        'HTTP-Referer': 'https://relatch-fe.vercel.app',
+        'X-Title': 'Relatch',
+      },
+      body: JSON.stringify({
+        model: 'google/gemma-3-12b-it:free', 
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: 900,
+        temperature: 0.4,
+      }),
+      signal: controller.signal,
     });
 
-    const winner = await Promise.any(requests);
     clearTimeout(masterTimer);
 
-    return res.status(200).json(winner);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+    const data = await response.json();
+    const enriched = data.choices?.[0]?.message?.content?.trim() || '';
+    
+    if (enriched.length < 150 || !enriched.includes('## Identity')) {
+      throw new Error('Bad formatting');
+    }
+
+    return res.status(200).json({ enriched, model: 'google/gemma-3-12b-it:free' });
 
   } catch (err) {
-    return res.status(503).json({ error: 'TIMEOUT_OR_FAILED', message: 'All models failed or timed out' });
+    return res.status(503).json({ error: 'FAILED', message: 'Model failed or timed out' });
   }
 };
