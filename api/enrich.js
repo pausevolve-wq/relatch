@@ -96,11 +96,11 @@ ${textToSend}`;
 
   try {
    // We fire 2 separate requests at the exact same time to save API limits
-    const models = [
+   const models = [
       'google/gemma-3-12b-it:free',
-      'meta-llama/llama-3.1-8b-instruct:free'
+      'meta-llama/llama-3.2-3b-instruct:free'
     ];
-
+    
     // Create a kill switch for each individual request
     const controllers = models.map(() => new AbortController());
     
