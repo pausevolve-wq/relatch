@@ -139,9 +139,11 @@ ${textToSend}`;
     return text.trim();
   }
 
+  // Use the verified active models
   const modelList = [
-    "gemini-1.5-flash",
-    "gemini-1.5-flash-8b"
+    "gemini-2.5-flash",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-3-flash-preview"
   ];
 
   let finalRawText = null;
@@ -149,44 +151,57 @@ ${textToSend}`;
   let lastGoogleError = "Unknown Error";
 
   for (const modelId of modelList) {
-    try {
-      const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${process.env.GEMINI_API_KEY}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: { maxOutputTokens: 900, temperature: 0.3 }
-          })
-        }
-      );
+    // Implement a maximum of 2 attempts per model to power through momentary 503s
+    let attempts = 0;
+    while (attempts < 2) {
+      try {
+        const response = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${process.env.GEMINI_API_KEY}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: [{ parts: [{ text: prompt }] }],
+              generationConfig: { maxOutputTokens: 900, temperature: 0.3 }
+            })
+          }
+        );
 
-      if (!response.ok) {
-        const errorData = await response.json();
-        // Capture the exact error Google is throwing
-        lastGoogleError = `HTTP ${response.status}: ${errorData.error?.message || JSON.stringify(errorData)}`;
+        if (!response.ok) {
+          const errorData = await response.json();
+          lastGoogleError = `HTTP ${response.status}: ${errorData.error?.message || JSON.stringify(errorData)}`;
+          
+          if (response.status === 503 || response.status === 429) {
+            attempts++;
+            // Wait 2.5 seconds before retrying the same model
+            await new Promise(resolve => setTimeout(resolve, 2500));
+            continue; 
+          } else {
+            // It's a hard error (like a 400 or 404), break out of the while loop and move to the next model
+            break; 
+          }
+        }
+
+        const data = await response.json();
+        const candidateText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
         
-        if (response.status === 503 || response.status === 429) {
-          await new Promise(resolve => setTimeout(resolve, 3000));
-          continue;
+        if (candidateText.length > 150 && candidateText.includes('## Identity')) {
+          finalRawText = candidateText;
+          successfulModel = modelId;
+          break; // Break while loop
         } else {
-          // If it's a 400 or 403 (API key issue), don't bother retrying, just break and show the error.
-          break;
+          lastGoogleError = "Model returned incomplete content.";
+          break; // Break while loop
         }
-      }
 
-      const data = await response.json();
-      const candidateText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-      if (candidateText.length > 150 && candidateText.includes('## Identity')) {
-        finalRawText = candidateText;
-        successfulModel = modelId;
-        break;
+      } catch (err) {
+        lastGoogleError = `Fetch Error: ${err.message}`;
+        break; // Break while loop on critical fetch failure
       }
-    } catch (err) {
-      lastGoogleError = `Fetch Error: ${err.message}`;
-      continue;
     }
+    
+    // If we successfully found text, break the outer modelList loop too
+    if (finalRawText) break;
   }
 
   if (finalRawText) {
@@ -195,10 +210,9 @@ ${textToSend}`;
       model: successfulModel
     });
   } else {
-    // Return the actual Google error so we can stop guessing
     return res.status(503).json({ 
       error: 'GOOGLE_API_ERROR', 
-      message: `Google rejected the request. Details: ${lastGoogleError}` 
+      message: `Google rejected the request or timed out. Details: ${lastGoogleError}` 
     });
   }
 };
