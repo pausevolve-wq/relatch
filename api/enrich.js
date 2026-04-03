@@ -6,9 +6,10 @@ module.exports = async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  const { rawText, category, fileName } = req.body;
+ const { rawText, category, fileName } = req.body;
   if (!rawText || !category || !fileName) return res.status(400).json({ error: 'Missing required fields' });
-  if (rawText.length > 12000) return res.status(400).json({ error: 'Content too large' });
+
+  const processedText = rawText.length > 15000 ? rawText.slice(0, 15000) : rawText;
 
   const hasEnoughLength = rawText.trim().length > 150;
   const hasRealWords = /[a-zA-Z]{3,}/.test(rawText);
@@ -103,7 +104,7 @@ use_cases: ["case 1", "case 2"]
 [How to know when output is done right.]
 
 CONTENT:
-${textToSend}`;
+${processedText}`;
 
   function sanitize(raw, skillName) {
     let text = raw;
