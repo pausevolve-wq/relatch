@@ -18,15 +18,52 @@ module.exports = async function handler(req, res) {
   }
 
   const fileMime = mimeType || 'application/pdf';
-  const ocrKey = process.env.OCRCLD_API_KEY;
-  const filestackKey = process.env.FILESTACK_API_KEY;
+  const mistralKey = process.env.MISTRALOCR_API_KEY;
+  const ocrSpaceKey = process.env.OCRCLD_API_KEY;
 
-  if (ocrKey) {
+  const dataUri = base64.startsWith('data:') ? base64 : `data:${fileMime};base64,${base64}`;
+
+  if (mistralKey) {
     try {
-      console.log(`[ocr] trying OCR.space for: ${fileName}`);
+      console.log(`[ocr] trying Mistral OCR for: ${fileName}`);
+      
+      const mistralResponse = await fetch("https://api.mistral.ai/v1/ocr", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${mistralKey}`
+        },
+        body: JSON.stringify({
+          model: "mistral-ocr-latest",
+          document: {
+            type: "document_url",
+            document_url: dataUri
+          }
+        })
+      });
+
+      if (mistralResponse.ok) {
+        const data = await mistralResponse.json();
+        const text = data.pages.map(p => p.markdown).join("\n\n").trim();
+        
+        if (text.length > 50) {
+          console.log(`[ocr] Mistral success: ${text.length} chars from ${fileName}`);
+          return res.status(200).json({ text, source: 'mistral' });
+        }
+      } else {
+        console.log(`[ocr] Mistral HTTP ${mistralResponse.status}`);
+      }
+    } catch (err) {
+      console.log(`[ocr] Mistral threw: ${err.message || 'unknown'}`);
+    }
+  }
+
+  if (ocrSpaceKey) {
+    try {
+      console.log(`[ocr] trying OCR.space fallback for: ${fileName}`);
 
       const formData = new URLSearchParams();
-      formData.append('base64Image', base64.startsWith('data:') ? base64 : `data:${fileMime};base64,${base64}`);
+      formData.append('base64Image', dataUri);
       formData.append('language', 'eng');
       formData.append('isOverlayRequired', 'false');
       formData.append('detectOrientation', 'true');
@@ -36,7 +73,7 @@ module.exports = async function handler(req, res) {
       const response = await fetch('https://api.ocr.space/parse/image', {
         method: 'POST',
         headers: {
-          'apikey': ocrKey,
+          'apikey': ocrSpaceKey,
           'Content-Type': 'application/x-www-form-urlencoded',
         },
         body: formData.toString()
@@ -44,84 +81,19 @@ module.exports = async function handler(req, res) {
 
       if (response.ok) {
         const data = await response.json();
-
-        if (data.IsErroredOnProcessing) {
-          console.log(`[ocr] OCR.space error: ${data.ErrorMessage?.[0]}`);
-        } else {
-          const text = data.ParsedResults
-            ?.map(r => r.ParsedText || '')
-            .join('\n')
-            .trim() || '';
-
+        if (!data.IsErroredOnProcessing) {
+          const text = data.ParsedResults?.map(r => r.ParsedText || '').join('\n').trim() || '';
           if (text.length > 50) {
             console.log(`[ocr] OCR.space success: ${text.length} chars from ${fileName}`);
             return res.status(200).json({ text, source: 'ocr.space' });
-          } else {
-            console.log(`[ocr] OCR.space returned too little text (${text.length} chars)`);
           }
         }
       } else {
         console.log(`[ocr] OCR.space HTTP ${response.status}`);
       }
     } catch (err) {
-      console.log(`[ocr] OCR.space threw: ${err?.message || 'unknown'}`);
+      console.log(`[ocr] OCR.space threw: ${err.message || 'unknown'}`);
     }
-  } else {
-    console.log('[ocr] OCRCLD_API_KEY not set, skipping OCR.space');
-  }
-
-  if (filestackKey) {
-    try {
-      console.log(`[ocr] trying Filestack for: ${fileName}`);
-
-      const uploadResponse = await fetch(
-        `https://www.filestackapi.com/api/store/S3?key=${filestackKey}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': fileMime },
-          body: Buffer.from(base64.includes('base64,') ? base64.split(',')[1] : base64, 'base64')
-        }
-      );
-
-      if (!uploadResponse.ok) {
-        console.log(`[ocr] Filestack upload failed: HTTP ${uploadResponse.status}`);
-      } else {
-        const uploadData = await uploadResponse.json();
-        const handle = uploadData.handle;
-
-        if (!handle) {
-          console.log('[ocr] Filestack upload returned no handle');
-        } else {
-          const ocrResponse = await fetch(
-            `https://cdn.filestackcontent.com/OCR/${handle}`,
-            {
-              headers: { 'Filestack-api-key': filestackKey }
-            }
-          );
-
-          if (ocrResponse.ok) {
-            const ocrData = await ocrResponse.json();
-            const text = ocrData?.document?.text_areas
-              ?.flatMap(area => area.lines?.map(l => l.text) || [])
-              .join('\n')
-              .trim() || '';
-
-            if (text.length > 50) {
-              console.log(`[ocr] Filestack success: ${text.length} chars from ${fileName}`);
-              return res.status(200).json({ text, source: 'filestack' });
-            } else {
-              console.log(`[ocr] Filestack returned too little text (${text.length} chars)`);
-            }
-          } else {
-            console.log(`[ocr] Filestack OCR failed: HTTP ${ocrResponse.status}`);
-          }
-        }
-      }
-    } catch (err) {
-      console.log(`[ocr] Filestack threw: ${err?.message || 'unknown'}`);
-    }
-  } else {
-    console.log('[ocr] FILESTACK_API_KEY not set, skipping Filestack');
   }
 
   console.log(`[ocr] all OCR methods failed for: ${fileName}`);
