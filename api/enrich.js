@@ -146,6 +146,7 @@ ${textToSend}`;
 
   let finalRawText = null;
   let successfulModel = null;
+  let lastGoogleError = "Unknown Error";
 
   for (const modelId of modelList) {
     try {
@@ -161,21 +162,29 @@ ${textToSend}`;
         }
       );
 
-      if (response.status === 503 || response.status === 429) {
-        await new Promise(resolve => setTimeout(resolve, 3000));
-        continue;
-      }
-
-      if (response.ok) {
-        const data = await response.json();
-        const candidateText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-        if (candidateText.length > 150 && candidateText.includes('## Identity')) {
-          finalRawText = candidateText;
-          successfulModel = modelId;
+      if (!response.ok) {
+        const errorData = await response.json();
+        // Capture the exact error Google is throwing
+        lastGoogleError = `HTTP ${response.status}: ${errorData.error?.message || JSON.stringify(errorData)}`;
+        
+        if (response.status === 503 || response.status === 429) {
+          await new Promise(resolve => setTimeout(resolve, 3000));
+          continue;
+        } else {
+          // If it's a 400 or 403 (API key issue), don't bother retrying, just break and show the error.
           break;
         }
       }
+
+      const data = await response.json();
+      const candidateText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      if (candidateText.length > 150 && candidateText.includes('## Identity')) {
+        finalRawText = candidateText;
+        successfulModel = modelId;
+        break;
+      }
     } catch (err) {
+      lastGoogleError = `Fetch Error: ${err.message}`;
       continue;
     }
   }
@@ -186,9 +195,10 @@ ${textToSend}`;
       model: successfulModel
     });
   } else {
+    // Return the actual Google error so we can stop guessing
     return res.status(503).json({ 
-      error: 'FAILED', 
-      message: 'Service unavailable. System is currently under high load.' 
+      error: 'GOOGLE_API_ERROR', 
+      message: `Google rejected the request. Details: ${lastGoogleError}` 
     });
   }
 };
