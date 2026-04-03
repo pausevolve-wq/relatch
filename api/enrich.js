@@ -105,7 +105,6 @@ use_cases: ["case 1", "case 2"]
 CONTENT:
 ${textToSend}`;
 
-  // ─── SANITIZER ─────────────────────────────────────────────────────────────
   function sanitize(raw, skillName) {
     let text = raw;
     text = text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\uFEFF\u200B-\u200D\u2060]/g, '');
@@ -139,107 +138,43 @@ ${textToSend}`;
     text = text.replace(/\n{3,}/g, '\n\n');
     return text.trim();
   }
-  // ───────────────────────────────────────────────────────────────────────────
-
-  // ─── STAGGERED WAVE STRATEGY ───────────────────────────────────────────────
-  // Wave 1 (t=0ms)    — 2 requests  → fast reliable models
-  // Wave 2 (t=3000ms) — 2 requests  → only fires if wave 1 hasn't resolved
-  // Wave 3 (t=6000ms) — 1 request   → nuclear fallback, only if still nothing
-  //
-  // Happy path (most users): 2 requests total → safe at 20 concurrent users
-  // Slow path: up to 5 requests but staggered, never all at once
-  // ───────────────────────────────────────────────────────────────────────────
-
-  const WAVES = [
-    { models: ['google/gemma-3-4b:free', 'stepfun/step-3.5-flash:free'],       delay: 0    },
-    { models: ['meta-llama/llama-3.2-3b-instruct:free', 'google/gemma-3-12b-it:free'], delay: 3000 },
-    { models: ['openrouter/auto'],                                               delay: 6000 },
-  ];
-
-  let winner = null;
-  const allControllers = [];
-
-  // Tracks all in-flight promises so we can let them finish/abort cleanly
-  const inFlight = [];
-
-  function callModel(model) {
-    const controller = new AbortController();
-    allControllers.push(controller);
-
-    const p = fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
-        'HTTP-Referer': 'https://relatch-fe.vercel.app',
-        'X-Title': 'Relatch',
-      },
-      body: JSON.stringify({
-        model,
-        messages: [{ role: 'user', content: prompt }],
-        max_tokens: 900,
-        temperature: 0.4,
-      }),
-      signal: controller.signal,
-    })
-    .then(async res => {
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      const raw = data.choices?.[0]?.message?.content?.trim() || '';
-      if (raw.length < 150 || !raw.includes('## Identity')) throw new Error('Bad formatting');
-      return { enriched: sanitize(raw, skillName), model: data.model || model };
-    });
-
-    return { promise: p, controller };
-  }
 
   try {
-    await new Promise((resolve, reject) => {
-      let settled = false;
-      let waveTimers = [];
-
-      // Hard kill at 8.5s — abort everything and reject
-      const masterTimer = setTimeout(() => {
-        if (!settled) {
-          settled = true;
-          allControllers.forEach(c => c.abort());
-          waveTimers.forEach(t => clearTimeout(t));
-          reject(new Error('master timeout'));
-        }
-      }, 8500);
-
-      function launchWave(models) {
-        if (settled) return; // a winner already found, don't fire
-        models.forEach(model => {
-          const { promise } = callModel(model);
-          inFlight.push(promise);
-          promise.then(result => {
-            if (!settled) {
-              settled = true;
-              winner = result;
-              allControllers.forEach(c => c.abort()); // kill all others
-              waveTimers.forEach(t => clearTimeout(t));
-              clearTimeout(masterTimer);
-              resolve();
-            }
-          }).catch(() => {}); // individual failures are fine, race continues
-        });
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: {
+            maxOutputTokens: 900,
+            temperature: 0.3
+          }
+        })
       }
+    );
 
-      // Launch waves on schedule
-      WAVES.forEach(({ models, delay }) => {
-        if (delay === 0) {
-          launchWave(models);
-        } else {
-          waveTimers.push(setTimeout(() => launchWave(models), delay));
-        }
-      });
+    if (!response.ok) {
+      throw new Error(`API Error ${response.status}`);
+    }
+
+    const data = await response.json();
+    const rawResult = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+
+    if (rawResult.length < 150 || !rawResult.includes('## Identity')) {
+      throw new Error('Incomplete model response');
+    }
+
+    return res.status(200).json({
+      enriched: sanitize(rawResult, skillName),
+      model: "gemini-1.5-flash"
     });
 
-    if (winner) return res.status(200).json(winner);
-    throw new Error('no winner');
-
   } catch (err) {
-    return res.status(503).json({ error: 'TIMEOUT_OR_FAILED', message: 'All models failed or timed out' });
+    return res.status(503).json({ 
+      error: 'FAILED', 
+      message: 'Service temporarily unavailable. Please try again.' 
+    });
   }
 };
