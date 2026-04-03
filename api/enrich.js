@@ -44,7 +44,7 @@ module.exports = async function handler(req, res) {
     personality: 'communication style, tone, voice patterns, how they phrase things, what they emphasize',
     instructions: 'rules, constraints, decision criteria, what to always do, what to never do',
     knowledge: 'domain expertise, mental models, frameworks they use, how they think about problems',
-    examples: 'the patterns in these examples — structure, style, what makes them work',
+    examples: 'the patterns in these examples, structure, style, what makes them work',
     context: 'the situation, constraints, goals, audience, and environment that shapes decisions',
     preferences: 'specific choices, standards, non-negotiables, defaults, and pet peeves',
   };
@@ -66,7 +66,7 @@ Focus on: ${focus}
 RULES:
 - Extract PATTERNS and WHY behind decisions.
 - NEVER copy-paste raw lines.
-- You MUST start your response exactly with the YAML block below — no code fences, no backticks, no preamble.
+- You MUST start your response exactly with the YAML block below, no code fences, no backticks, no preamble.
 - You MUST enclose all YAML values in double quotes.
 - The "name" field MUST be exactly: "${skillName}"
 
@@ -132,7 +132,7 @@ ${textToSend}`;
       '## Voice & Language', '## Quality Bar',
     ];
     for (const section of requiredSections) {
-      if (!text.includes(section)) text += `\n\n${section}\n[Not extracted — review source content]`;
+      if (!text.includes(section)) text += `\n\n${section}\n[Not extracted - review source content]`;
     }
     text = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
     text = text.replace(/\n{3,}/g, '\n\n');
@@ -140,9 +140,8 @@ ${textToSend}`;
   }
 
   const modelList = [
-    "gemini-2.5-flash",
-    "gemini-3.1-flash-lite-preview",
-    "gemini-3-flash-preview"
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-8b"
   ];
 
   let finalRawText = null;
@@ -162,8 +161,8 @@ ${textToSend}`;
         }
       );
 
-      if (response.status === 503) {
-        await new Promise(resolve => setTimeout(resolve, 1000));
+      if (response.status === 503 || response.status === 429) {
+        await new Promise(resolve => setTimeout(resolve, 3000));
         continue;
       }
 
@@ -189,7 +188,7 @@ ${textToSend}`;
   } else {
     return res.status(503).json({ 
       error: 'FAILED', 
-      message: 'All AI models exhausted. Falling back.' 
+      message: 'Service unavailable. System is currently under high load.' 
     });
   }
 };
