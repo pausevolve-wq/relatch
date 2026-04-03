@@ -1,8 +1,3 @@
-// /api/ocr.js — OCR pipeline for Relatch
-// Called by frontend when pdfjs extracts < 50 chars (scanned/image-based PDFs)
-// Strategy: OCR.space (primary, fast, base64 direct) → Filestack (secondary, upload+OCR)
-// Both fit within Vercel Hobby 10s limit
-
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
@@ -17,7 +12,6 @@ module.exports = async function handler(req, res) {
     return res.status(400).json({ error: 'Missing required fields: base64, fileName' });
   }
 
-  // Reject if payload is too large (Vercel body limit is 4.5MB)
   const estimatedBytes = base64.length * 0.75;
   if (estimatedBytes > 4000000) {
     return res.status(413).json({ error: 'File too large for OCR. Maximum size is ~4MB.' });
@@ -27,8 +21,6 @@ module.exports = async function handler(req, res) {
   const ocrKey = process.env.OCRCLD_API_KEY;
   const filestackKey = process.env.FILESTACK_API_KEY;
 
-  // ── PRIMARY: OCR.space ─────────────────────────────────────────────
-  // Accepts base64 directly, fast, no upload step needed
   if (ocrKey) {
     try {
       console.log(`[ocr] trying OCR.space for: ${fileName}`);
@@ -39,10 +31,7 @@ module.exports = async function handler(req, res) {
       formData.append('isOverlayRequired', 'false');
       formData.append('detectOrientation', 'true');
       formData.append('scale', 'true');
-      formData.append('OCREngine', '2'); // Engine 2 is better for printed text + PDFs
-
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 8000);
+      formData.append('OCREngine', '2'); 
 
       const response = await fetch('https://api.ocr.space/parse/image', {
         method: 'POST',
@@ -50,11 +39,8 @@ module.exports = async function handler(req, res) {
           'apikey': ocrKey,
           'Content-Type': 'application/x-www-form-urlencoded',
         },
-        body: formData.toString(),
-        signal: controller.signal,
+        body: formData.toString()
       });
-
-      clearTimeout(timer);
 
       if (response.ok) {
         const data = await response.json();
@@ -84,27 +70,18 @@ module.exports = async function handler(req, res) {
     console.log('[ocr] OCRCLD_API_KEY not set, skipping OCR.space');
   }
 
-  // ── SECONDARY: Filestack ───────────────────────────────────────────
-  // Two-step: upload base64 → get handle → call OCR on handle
   if (filestackKey) {
     try {
       console.log(`[ocr] trying Filestack for: ${fileName}`);
-
-      // Step 1: Upload the base64 file to Filestack
-      const uploadController = new AbortController();
-      const uploadTimer = setTimeout(() => uploadController.abort(), 5000);
 
       const uploadResponse = await fetch(
         `https://www.filestackapi.com/api/store/S3?key=${filestackKey}`,
         {
           method: 'POST',
           headers: { 'Content-Type': fileMime },
-          body: Buffer.from(base64, 'base64'),
-          signal: uploadController.signal,
+          body: Buffer.from(base64, 'base64')
         }
       );
-
-      clearTimeout(uploadTimer);
 
       if (!uploadResponse.ok) {
         console.log(`[ocr] Filestack upload failed: HTTP ${uploadResponse.status}`);
@@ -115,23 +92,15 @@ module.exports = async function handler(req, res) {
         if (!handle) {
           console.log('[ocr] Filestack upload returned no handle');
         } else {
-          // Step 2: Run OCR on the uploaded handle
-          const ocrController = new AbortController();
-          const ocrTimer = setTimeout(() => ocrController.abort(), 4000);
-
           const ocrResponse = await fetch(
             `https://cdn.filestackcontent.com/OCR/${handle}`,
             {
-              headers: { 'Filestack-api-key': filestackKey },
-              signal: ocrController.signal,
+              headers: { 'Filestack-api-key': filestackKey }
             }
           );
 
-          clearTimeout(ocrTimer);
-
           if (ocrResponse.ok) {
             const ocrData = await ocrResponse.json();
-            // Filestack returns text_areas with lines
             const text = ocrData?.document?.text_areas
               ?.flatMap(area => area.lines?.map(l => l.text) || [])
               .join('\n')
@@ -155,7 +124,6 @@ module.exports = async function handler(req, res) {
     console.log('[ocr] FILESTACK_API_KEY not set, skipping Filestack');
   }
 
-  // Both failed
   console.log(`[ocr] all OCR methods failed for: ${fileName}`);
   return res.status(422).json({
     error: 'OCR_FAILED',
