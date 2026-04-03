@@ -26,7 +26,7 @@ module.exports = async function handler(req, res) {
       console.log(`[ocr] trying OCR.space for: ${fileName}`);
 
       const formData = new URLSearchParams();
-      formData.append('base64Image', `data:${fileMime};base64,${base64}`);
+      formData.append('base64Image', base64.startsWith('data:') ? base64 : `data:${fileMime};base64,${base64}`);
       formData.append('language', 'eng');
       formData.append('isOverlayRequired', 'false');
       formData.append('detectOrientation', 'true');
@@ -79,7 +79,7 @@ module.exports = async function handler(req, res) {
         {
           method: 'POST',
           headers: { 'Content-Type': fileMime },
-          body: Buffer.from(base64, 'base64')
+          body: Buffer.from(base64.includes('base64,') ? base64.split(',')[1] : base64, 'base64')
         }
       );
 
