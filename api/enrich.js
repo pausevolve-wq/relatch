@@ -139,42 +139,57 @@ ${textToSend}`;
     return text.trim();
   }
 
-  try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: {
-            maxOutputTokens: 900,
-            temperature: 0.3
-          }
-        })
+  const modelList = [
+    "gemini-2.5-flash",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-3-flash-preview"
+  ];
+
+  let finalRawText = null;
+  let successfulModel = null;
+
+  for (const modelId of modelList) {
+    try {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${process.env.GEMINI_API_KEY}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { maxOutputTokens: 900, temperature: 0.3 }
+          })
+        }
+      );
+
+      if (response.status === 503) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        continue;
       }
-    );
 
-    if (!response.ok) {
-      throw new Error(`API Error ${response.status}`);
+      if (response.ok) {
+        const data = await response.json();
+        const candidateText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        if (candidateText.length > 150 && candidateText.includes('## Identity')) {
+          finalRawText = candidateText;
+          successfulModel = modelId;
+          break;
+        }
+      }
+    } catch (err) {
+      continue;
     }
+  }
 
-    const data = await response.json();
-    const rawResult = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-
-    if (rawResult.length < 150 || !rawResult.includes('## Identity')) {
-      throw new Error('Incomplete model response');
-    }
-
+  if (finalRawText) {
     return res.status(200).json({
-      enriched: sanitize(rawResult, skillName),
-      model: "gemini-1.5-flash"
+      enriched: sanitize(finalRawText, skillName),
+      model: successfulModel
     });
-
-  } catch (err) {
+  } else {
     return res.status(503).json({ 
       error: 'FAILED', 
-      message: 'Service temporarily unavailable. Please try again.' 
+      message: 'All AI models exhausted. Falling back.' 
     });
   }
 };
