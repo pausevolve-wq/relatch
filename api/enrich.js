@@ -139,69 +139,51 @@ ${textToSend}`;
     return text.trim();
   }
 
-  // Use the verified active models
   const modelList = [
     "gemini-2.5-flash",
     "gemini-3.1-flash-lite-preview",
-    "gemini-3-flash-preview"
+    "gemini-2.5-flash-lite"
   ];
 
   let finalRawText = null;
   let successfulModel = null;
-  let lastGoogleError = "Unknown Error";
+  let lastGoogleError = "No models responded";
 
   for (const modelId of modelList) {
-    // Implement a maximum of 2 attempts per model to power through momentary 503s
-    let attempts = 0;
-    while (attempts < 2) {
-      try {
-        const response = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${process.env.GEMINI_API_KEY}`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              contents: [{ parts: [{ text: prompt }] }],
-              generationConfig: { maxOutputTokens: 900, temperature: 0.3 }
-            })
-          }
-        );
-
-        if (!response.ok) {
-          const errorData = await response.json();
-          lastGoogleError = `HTTP ${response.status}: ${errorData.error?.message || JSON.stringify(errorData)}`;
-          
-          if (response.status === 503 || response.status === 429) {
-            attempts++;
-            // Wait 2.5 seconds before retrying the same model
-            await new Promise(resolve => setTimeout(resolve, 2500));
-            continue; 
-          } else {
-            // It's a hard error (like a 400 or 404), break out of the while loop and move to the next model
-            break; 
-          }
+    try {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${process.env.GEMINI_API_KEY}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { maxOutputTokens: 900, temperature: 0.3 }
+          })
         }
+      );
 
-        const data = await response.json();
-        const candidateText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-        
-        if (candidateText.length > 150 && candidateText.includes('## Identity')) {
-          finalRawText = candidateText;
-          successfulModel = modelId;
-          break; // Break while loop
-        } else {
-          lastGoogleError = "Model returned incomplete content.";
-          break; // Break while loop
+      if (!response.ok) {
+        const errorData = await response.json();
+        lastGoogleError = `HTTP ${response.status}: ${errorData.error?.message || JSON.stringify(errorData)}`;
+        if (response.status === 429 || response.status === 503) {
+          await new Promise(r => setTimeout(r, 2000));
+          continue;
         }
-
-      } catch (err) {
-        lastGoogleError = `Fetch Error: ${err.message}`;
-        break; // Break while loop on critical fetch failure
+        break;
       }
+
+      const data = await response.json();
+      const candidateText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      if (candidateText.length > 150 && candidateText.includes('## Identity')) {
+        finalRawText = candidateText;
+        successfulModel = modelId;
+        break;
+      }
+    } catch (err) {
+      lastGoogleError = `Fetch Error: ${err.message}`;
+      continue;
     }
-    
-    // If we successfully found text, break the outer modelList loop too
-    if (finalRawText) break;
   }
 
   if (finalRawText) {
@@ -212,7 +194,7 @@ ${textToSend}`;
   } else {
     return res.status(503).json({ 
       error: 'GOOGLE_API_ERROR', 
-      message: `Google rejected the request or timed out. Details: ${lastGoogleError}` 
+      message: `Google rejected the request. Details: ${lastGoogleError}` 
     });
   }
 };
