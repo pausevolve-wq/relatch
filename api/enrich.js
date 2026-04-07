@@ -6,8 +6,9 @@ module.exports = async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
- const { rawText, category, fileName, domainLabel, domainRole, domainFrame } = req.body;
+  const { rawText, category, fileName, domainLabel, domainRole, domainFrame } = req.body;
   if (!rawText || !category || !fileName) return res.status(400).json({ error: 'Missing required fields' });
+
   const processedText = rawText.length > 15000 ? rawText.slice(0, 15000) : rawText;
 
   const hasEnoughLength = rawText.trim().length > 150;
@@ -60,59 +61,56 @@ module.exports = async function handler(req, res) {
     .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
     .join(' ');
 
-  const modelList = [
-    "gemini-2.5-flash",
-    "gemini-3.1-flash-lite-preview"
-  ];
+  const safeDomainLabel = domainLabel || 'General';
+  const safeDomainRole = domainRole || 'an expert';
+  const safeDomainFrame = domainFrame || 'communicate effectively';
 
-  let finalRawText = null;
-  let successfulModel = null;
-  let lastGoogleError = "No models responded";
+  const prompt = `You are a Persona Simulation Engine. Do not act like an AI summarizing a text. Instead, analyze the Tonal DNA of the provided content and generate a Claude Skill File that perfectly mimics the author's voice, constraints, and structural habits.
+Focus on: ${focus}
+Domain Expert Persona: Act as ${safeDomainRole} who needs to ${safeDomainFrame}.
 
-  for (const modelId of modelList) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 15000); 
+RULES:
+- Extract Signature Moves (recurring phrases, punctuation habits, structural patterns).
+- NEVER copy-paste raw lines. Synthesize the core behavioral patterns.
+- You MUST start your response exactly with the YAML block below, no code fences, no backticks, no preamble.
+- You MUST enclose all YAML values in double quotes.
+- The "name" field MUST be exactly: "${skillName}"
+- The "domain" field MUST be exactly: "${safeDomainLabel}"
 
-    try {
-      const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${process.env.GEMINI_API_KEY}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: { maxOutputTokens: 900, temperature: 0.7 } 
-          }),
-          signal: controller.signal
-        }
-      );
+FORMAT:
+---
+name: "${skillName}"
+domain: "${safeDomainLabel}"
+content_type: "behavioral skill"
+use_cases: ["case 1", "case 2"]
+---
 
-      clearTimeout(timeoutId);
+## Identity & Role
+[2 sentences. Who Claude becomes. Use the tone of the original author. Be highly specific.]
 
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        lastGoogleError = `HTTP ${response.status}: ${errorData.error?.message || 'Unknown'}`;
-        
-        if (response.status === 429 || response.status === 503 || response.status === 504) {
-          continue; 
-        }
-        break; 
-      }
+## Core Principles
+[4 to 5 fundamental beliefs extracted from the text. Write these as if the author is speaking.]
 
-      const data = await response.json();
-      const candidateText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-      
-      if (candidateText.length > 150 && candidateText.includes('## Identity')) {
-        finalRawText = candidateText;
-        successfulModel = modelId;
-        break; 
-      }
-    } catch (err) {
-      clearTimeout(timeoutId);
-      lastGoogleError = err.name === 'AbortError' ? 'Timeout: Model took too long' : `Fetch Error: ${err.message}`;
-      continue; 
-    }
-  }
+## How to Think
+[The specific mental process, reasoning pattern, and constraints extracted from the text.]
+
+## How to Create
+[Specific craft instructions. Detail the structure, format, length constraints, and vocabulary.]
+
+## What to Always Do
+[5 specific behaviors. Start each with an action verb.]
+
+## What to Never Do
+[4 things clearly avoided in the text. Start each with "Never".]
+
+## Voice & Language
+[Detail the exact signature moves. Include specific words, phrases, tone, and formatting quirks like avoiding certain punctuation.]
+
+## Quality Bar
+[How to know when output is done right and matches the author's DNA.]
+
+CONTENT:
+${processedText}`;
 
   function sanitize(raw, skillName) {
     let text = raw;
