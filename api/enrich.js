@@ -146,9 +146,9 @@ ${processedText}`;
     return text.trim();
   }
 
-  const modelList = [
-    "gemini-2.5-flash",
-    "gemini-3.1-flash-lite-preview"
+const modelList = [
+    "gemini-3.1-flash-lite-preview",
+    "gemini-2.5-flash"
   ];
 
   let finalRawText = null;
@@ -157,7 +157,7 @@ ${processedText}`;
 
   for (const modelId of modelList) {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 15000); 
+    const timeoutId = setTimeout(() => controller.abort(), 45000); 
 
     try {
       const response = await fetch(
@@ -195,7 +195,7 @@ ${processedText}`;
       }
     } catch (err) {
       clearTimeout(timeoutId);
-      lastGoogleError = err.name === 'AbortError' ? 'Timeout: Model took too long' : `Fetch Error: ${err.message}`;
+      lastGoogleError = err.name === 'AbortError' ? 'Timeout: Model took too long (45s)' : `Fetch Error: ${err.message}`;
       continue; 
     }
   }
@@ -208,7 +208,7 @@ ${processedText}`;
   } else {
     return res.status(503).json({ 
       error: 'GOOGLE_API_ERROR', 
-      message: `Google rejected the request. Details: ${lastGoogleError}` 
+      message: `Enrichment failed. Details: ${lastGoogleError}` 
     });
   }
 };
