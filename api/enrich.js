@@ -6,9 +6,8 @@ module.exports = async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
- const { rawText, category, fileName } = req.body;
+ const { rawText, category, fileName, domainLabel, domainRole, domainFrame } = req.body;
   if (!rawText || !category || !fileName) return res.status(400).json({ error: 'Missing required fields' });
-
   const processedText = rawText.length > 15000 ? rawText.slice(0, 15000) : rawText;
 
   const hasEnoughLength = rawText.trim().length > 150;
@@ -61,50 +60,59 @@ module.exports = async function handler(req, res) {
     .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
     .join(' ');
 
-  const prompt = `Extract behavioral patterns from this content and write a Claude skill file.
-Focus on: ${focus}
+  const modelList = [
+    "gemini-2.5-flash",
+    "gemini-3.1-flash-lite-preview"
+  ];
 
-RULES:
-- Extract PATTERNS and WHY behind decisions.
-- NEVER copy-paste raw lines.
-- You MUST start your response exactly with the YAML block below, no code fences, no backticks, no preamble.
-- You MUST enclose all YAML values in double quotes.
-- The "name" field MUST be exactly: "${skillName}"
+  let finalRawText = null;
+  let successfulModel = null;
+  let lastGoogleError = "No models responded";
 
-FORMAT:
----
-name: "${skillName}"
-domain: "detected domain"
-content_type: "behavioral skill"
-use_cases: ["case 1", "case 2"]
----
+  for (const modelId of modelList) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000); 
 
-## Identity & Role
-[2 sentences. Who Claude becomes. Specific.]
+    try {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${process.env.GEMINI_API_KEY}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { maxOutputTokens: 900, temperature: 0.7 } 
+          }),
+          signal: controller.signal
+        }
+      );
 
-## Core Principles
-[4-5 fundamental beliefs extracted from content. Not rules but beliefs.]
+      clearTimeout(timeoutId);
 
-## How to Think
-[The mental process and reasoning pattern extracted from content.]
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        lastGoogleError = `HTTP ${response.status}: ${errorData.error?.message || 'Unknown'}`;
+        
+        if (response.status === 429 || response.status === 503 || response.status === 504) {
+          continue; 
+        }
+        break; 
+      }
 
-## How to Create
-[Specific craft instructions. Structure, format, style, vocabulary.]
-
-## What to Always Do
-[5 specific behaviors. Start each with a verb.]
-
-## What to Never Do
-[4 things clearly avoided. Start each with "Never".]
-
-## Voice & Language
-[Specific words, phrases, sentence patterns. Signature moves.]
-
-## Quality Bar
-[How to know when output is done right.]
-
-CONTENT:
-${processedText}`;
+      const data = await response.json();
+      const candidateText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      
+      if (candidateText.length > 150 && candidateText.includes('## Identity')) {
+        finalRawText = candidateText;
+        successfulModel = modelId;
+        break; 
+      }
+    } catch (err) {
+      clearTimeout(timeoutId);
+      lastGoogleError = err.name === 'AbortError' ? 'Timeout: Model took too long' : `Fetch Error: ${err.message}`;
+      continue; 
+    }
+  }
 
   function sanitize(raw, skillName) {
     let text = raw;
@@ -142,8 +150,7 @@ ${processedText}`;
 
   const modelList = [
     "gemini-2.5-flash",
-    "gemini-3.1-flash-lite-preview",
-    "gemini-2.5-flash-lite"
+    "gemini-3.1-flash-lite-preview"
   ];
 
   let finalRawText = null;
@@ -151,6 +158,9 @@ ${processedText}`;
   let lastGoogleError = "No models responded";
 
   for (const modelId of modelList) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000); 
+
     try {
       const response = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${process.env.GEMINI_API_KEY}`,
@@ -159,31 +169,36 @@ ${processedText}`;
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: { maxOutputTokens: 900, temperature: 0.3 }
-          })
+            generationConfig: { maxOutputTokens: 900, temperature: 0.7 } 
+          }),
+          signal: controller.signal
         }
       );
 
+      clearTimeout(timeoutId);
+
       if (!response.ok) {
-        const errorData = await response.json();
-        lastGoogleError = `HTTP ${response.status}: ${errorData.error?.message || JSON.stringify(errorData)}`;
-        if (response.status === 429 || response.status === 503) {
-          await new Promise(r => setTimeout(r, 2000));
-          continue;
+        const errorData = await response.json().catch(() => ({}));
+        lastGoogleError = `HTTP ${response.status}: ${errorData.error?.message || 'Unknown'}`;
+        
+        if (response.status === 429 || response.status === 503 || response.status === 504) {
+          continue; 
         }
-        break;
+        break; 
       }
 
       const data = await response.json();
       const candidateText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      
       if (candidateText.length > 150 && candidateText.includes('## Identity')) {
         finalRawText = candidateText;
         successfulModel = modelId;
-        break;
+        break; 
       }
     } catch (err) {
-      lastGoogleError = `Fetch Error: ${err.message}`;
-      continue;
+      clearTimeout(timeoutId);
+      lastGoogleError = err.name === 'AbortError' ? 'Timeout: Model took too long' : `Fetch Error: ${err.message}`;
+      continue; 
     }
   }
 
