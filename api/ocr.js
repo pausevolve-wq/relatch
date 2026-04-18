@@ -69,6 +69,8 @@ module.exports = async function handler(req, res) {
       formData.append('detectOrientation', 'true');
       formData.append('scale', 'true');
       formData.append('OCREngine', '2'); 
+      formData.append('isCreateSearchablePdf', 'true');
+      formData.append('isSearchablePdfHideTextLayer', 'true'); 
 
       const response = await fetch('https://api.ocr.space/parse/image', {
         method: 'POST',
@@ -83,9 +85,15 @@ module.exports = async function handler(req, res) {
         const data = await response.json();
         if (!data.IsErroredOnProcessing) {
           const text = data.ParsedResults?.map(r => r.ParsedText || '').join('\n').trim() || '';
+          const searchablePdfUrl = data.SearchablePDFURL || null;
+          
           if (text.length > 50) {
             console.log(`[ocr] OCR.space success: ${text.length} chars from ${fileName}`);
-            return res.status(200).json({ text, source: 'ocr.space' });
+            return res.status(200).json({ 
+              text, 
+              source: 'ocr.space',
+              searchablePdfUrl
+            });
           }
         }
       } else {
