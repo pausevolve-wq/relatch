@@ -23,7 +23,7 @@ module.exports = async function handler(req, res) {
 
   const dataUri = base64.startsWith('data:') ? base64 : `data:${fileMime};base64,${base64}`;
 
-  if (mistralKey) {
+  if (false && mistralKey) {
     try {
       console.log(`[ocr] trying Mistral OCR for: ${fileName}`);
       
