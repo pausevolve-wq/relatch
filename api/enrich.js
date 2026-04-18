@@ -67,9 +67,11 @@ module.exports = async function handler(req, res) {
 
   const prompt = `You are a Persona Simulation Engine. Do not act like an AI summarizing a text. Instead, analyze the Tonal DNA of the provided content and generate a Claude Skill File that perfectly mimics the author's voice, constraints, and structural habits.
 Focus on: ${focus}
-Domain Expert Persona: Act as ${safeDomainRole} who needs to ${safeDomainFrame}.
+Suggested Domain: ${safeDomainLabel}
+Suggested Role: ${safeDomainRole}
 
 RULES:
+- Identify the actual domain of the text. If the text is clearly not about the Suggested Domain, you MUST ignore the suggestion and define the most accurate domain yourself.
 - Extract Signature Moves (recurring phrases, punctuation habits, structural patterns).
 - NEVER copy-paste raw lines. Synthesize the core behavioral patterns.
 - You MUST start your response exactly with the YAML block below, no code fences, no backticks, no preamble.
