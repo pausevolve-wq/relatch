@@ -1,4 +1,4 @@
-module.exports = async function handler(req, res) {
+module.exports = async function handler(req, res) {   try {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -277,3 +277,11 @@ if (result) {
     message: 'Both primary and fallback models failed.'
   });
 }
+  } catch (err) {
+    console.error("ENRICH ERROR:", err);
+    return res.status(500).json({
+      error: "INTERNAL_ERROR",
+      message: err.message || "Unknown error"
+    });
+  }
+};
