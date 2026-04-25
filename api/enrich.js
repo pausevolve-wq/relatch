@@ -148,69 +148,97 @@ ${processedText}`;
     return text.trim();
   }
 
-const modelList = [
-    "gemini-3.1-flash-lite-preview",
-    "gemini-2.5-flash"
+function detectComplexity(text) {
+  const length = text.length;
+  const tokens = Math.ceil(length / 4);
+
+  if (tokens > 4000 || length > 15000) return 'heavy';
+  if (tokens > 1500 || length > 6000) return 'medium';
+  return 'light';
+}
+
+const complexity = detectComplexity(textToSend);
+
+const primaryModel =
+  complexity === 'heavy'
+    ? "gemini-2.5-flash"
+    : "gemini-3.1-flash-lite-preview";
+
+const fallbackModel =
+  complexity === 'heavy'
+    ? "gemini-3.1-flash-lite-preview"
+    : "gemini-2.5-flash";
+function isValidSkillOutput(text) {
+  if (!text || text.length < 200) return false;
+
+  const requiredSections = [
+    '## Identity & Role',
+    '## Core Principles',
+    '## How to Think',
+    '## How to Create',
+    '## What to Always Do',
+    '## What to Never Do',
+    '## Voice & Language',
+    '## Quality Bar'
   ];
 
-  let finalRawText = null;
-  let successfulModel = null;
-  let lastGoogleError = "No models responded";
+  const hasAllSections = requiredSections.every(section => text.includes(section));
 
-  for (const modelId of modelList) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 45000); 
+  const hasYAML = text.includes('---') && text.indexOf('---') < 10;
 
-    try {
-      const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${process.env.GEMINI_API_KEY}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: { maxOutputTokens: 900, temperature: 0.7 } 
-          }),
-          signal: controller.signal
-        }
-      );
+  return hasAllSections && hasYAML;
+}
+async function callModel(modelId) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 45000);
 
-      clearTimeout(timeoutId);
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        lastGoogleError = `HTTP ${response.status}: ${errorData.error?.message || 'Unknown'}`;
-        
-        if (response.status === 429 || response.status === 503 || response.status === 504) {
-          continue; 
-        }
-        break; 
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { maxOutputTokens: 900, temperature: 0.7 }
+        }),
+        signal: controller.signal
       }
+    );
 
-      const data = await response.json();
-      const candidateText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-      
-      if (candidateText.length > 150 && candidateText.includes('## Identity')) {
-        finalRawText = candidateText;
-        successfulModel = modelId;
-        break; 
-      }
-    } catch (err) {
-      clearTimeout(timeoutId);
-      lastGoogleError = err.name === 'AbortError' ? 'Timeout: Model took too long (45s)' : `Fetch Error: ${err.message}`;
-      continue; 
-    }
-  }
+    clearTimeout(timeoutId);
 
-  if (finalRawText) {
-    return res.status(200).json({
-      enriched: sanitize(finalRawText, skillName),
-      model: successfulModel
-    });
-  } else {
-    return res.status(503).json({ 
-      error: 'GOOGLE_API_ERROR', 
-      message: `Enrichment failed. Details: ${lastGoogleError}` 
-    });
+    if (!response.ok) return null;
+
+    const data = await response.json();
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+
+   if (text && text.length > 120) {
+  return { text, model: modelId };
+}
+
+return null;
+
+  } catch (err) {
+    clearTimeout(timeoutId);
+    return null;
   }
-};
+}
+
+let result = await callModel(primaryModel);
+
+if (!result) {
+  result = await callModel(fallbackModel);
+}
+
+if (result) {
+  return res.status(200).json({
+    enriched: sanitize(result.text, skillName),
+    model: result.model
+  });
+} else {
+  return res.status(503).json({
+    error: 'GOOGLE_API_ERROR',
+    message: 'Both primary and fallback models failed.'
+  });
+}
