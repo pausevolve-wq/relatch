@@ -1,32 +1,12 @@
-module.exports = async function handler(req, res) {   try {
+module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  if (req.method === 'OPTIONS') {
-  return res.status(200).end();
-}
+  if (req.method === 'OPTIONS') return res.status(200).end();
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-if (req.method !== 'POST') {
-  return res.status(405).json({ error: 'Method Not Allowed' });
-}
-
-  let body = {};
-
-try {
-  body = typeof req.body === 'string'
-    ? JSON.parse(req.body || '{}')
-    : (req.body || {});
-} catch (e) {
-  body = {};
-}
-
-const rawText = typeof body.rawText === 'string' ? body.rawText : '';
-const category = body.category || '';
-const fileName = body.fileName || '';
-const domainLabel = body.domainLabel || '';
-const domainRole = body.domainRole || '';
-const domainFrame = body.domainFrame || '';
+  const { rawText, category, fileName, domainLabel, domainRole, domainFrame } = req.body;
   if (!rawText || !category || !fileName) return res.status(400).json({ error: 'Missing required fields' });
 
   const processedText = rawText.length > 15000 ? rawText.slice(0, 15000) : rawText;
@@ -168,120 +148,69 @@ ${processedText}`;
     return text.trim();
   }
 
-function detectComplexity(text) {
-  const length = text.length;
-  const tokens = Math.ceil(length / 4);
-
-  if (tokens > 4000 || length > 15000) return 'heavy';
-  if (tokens > 1500 || length > 6000) return 'medium';
-  return 'light';
-}
-
-const complexity = detectComplexity(textToSend);
-
-const primaryModel =
-  complexity === 'heavy'
-    ? "gemini-2.5-flash"
-    : "gemini-3.1-flash-lite-preview";
-
-const fallbackModel =
-  complexity === 'heavy'
-    ? "gemini-3.1-flash-lite-preview"
-    : "gemini-2.5-flash";
-function isValidSkillOutput(text) {
-  if (!text || text.length < 120) return false;
-
-  const cleaned = String(text).trim();
-  const hasYamlStart = cleaned.indexOf('---') >= 0 && cleaned.indexOf('---') < 40;
-  const hasYamlBoundary = hasYamlStart && cleaned.indexOf('\n---', 3) !== -1;
-
-  const requiredSections = [
-    '## Identity & Role',
-    '## Core Principles',
-    '## How to Think',
-    '## How to Create',
-    '## What to Always Do',
-    '## What to Never Do',
-    '## Voice & Language',
-    '## Quality Bar'
+const modelList = [
+    "gemini-3.1-flash-lite-preview",
+    "gemini-2.5-flash"
   ];
 
-  const sectionCount = requiredSections.reduce((count, section) => (
-    cleaned.includes(section) ? count + 1 : count
-  ), 0);
+  let finalRawText = null;
+  let successfulModel = null;
+  let lastGoogleError = "No models responded";
 
-  const requiredKeyPatterns = [
-    /^\s*name\s*:/m,
-    /^\s*domain\s*:/m,
-    /^\s*content_type\s*:/m,
-    /^\s*use_cases\s*:/m
-  ];
-  const requiredKeyCount = requiredKeyPatterns.reduce((count, pattern) => (
-    pattern.test(cleaned) ? count + 1 : count
-  ), 0);
-  const hasMeaningfulContent = cleaned.length > 300;
+  for (const modelId of modelList) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 45000); 
 
-  return hasYamlBoundary && requiredKeyCount >= 4 && sectionCount >= 4 && hasMeaningfulContent;
-}
-async function callModel(modelId) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 45000);
+    try {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${process.env.GEMINI_API_KEY}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { maxOutputTokens: 900, temperature: 0.7 } 
+          }),
+          signal: controller.signal
+        }
+      );
 
-  try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${process.env.GEMINI_API_KEY}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { maxOutputTokens: 900, temperature: 0.7 }
-        }),
-        signal: controller.signal
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        lastGoogleError = `HTTP ${response.status}: ${errorData.error?.message || 'Unknown'}`;
+        
+        if (response.status === 429 || response.status === 503 || response.status === 504) {
+          continue; 
+        }
+        break; 
       }
-    );
 
-    clearTimeout(timeoutId);
-
-    if (!response.ok) return null;
-
-    const data = await response.json();
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-
-   if (text && isValidSkillOutput(sanitize(text, skillName))) {
-  return { text, model: modelId };
-}
-
-return null;
-
-  } catch (err) {
-    clearTimeout(timeoutId);
-    return null;
+      const data = await response.json();
+      const candidateText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      
+      if (candidateText.length > 150 && candidateText.includes('## Identity')) {
+        finalRawText = candidateText;
+        successfulModel = modelId;
+        break; 
+      }
+    } catch (err) {
+      clearTimeout(timeoutId);
+      lastGoogleError = err.name === 'AbortError' ? 'Timeout: Model took too long (45s)' : `Fetch Error: ${err.message}`;
+      continue; 
+    }
   }
-}
 
-let result = await callModel(primaryModel);
-
-if (!result) {
-  result = await callModel(fallbackModel);
-}
-
-if (result) {
-  return res.status(200).json({
-    enriched: sanitize(result.text, skillName),
-    model: result.model
-  });
-} else {
-  return res.status(503).json({
-    error: 'GOOGLE_API_ERROR',
-    message: 'Both primary and fallback models failed.'
-  });
-}
-  } catch (err) {
-    console.error("ENRICH ERROR:", err);
-    return res.status(500).json({
-      error: "INTERNAL_ERROR",
-      message: err.message || "Unknown error"
+  if (finalRawText) {
+    return res.status(200).json({
+      enriched: sanitize(finalRawText, skillName),
+      model: successfulModel
+    });
+  } else {
+    return res.status(503).json({ 
+      error: 'GOOGLE_API_ERROR', 
+      message: `Enrichment failed. Details: ${lastGoogleError}` 
     });
   }
 };
