@@ -21,7 +21,12 @@ try {
   body = {};
 }
 
-const { rawText, category, fileName, domainLabel, domainRole, domainFrame } = body;
+const rawText = typeof body.rawText === 'string' ? body.rawText : '';
+const category = body.category || '';
+const fileName = body.fileName || '';
+const domainLabel = body.domainLabel || '';
+const domainRole = body.domainRole || '';
+const domainFrame = body.domainFrame || '';
   if (!rawText || !category || !fileName) return res.status(400).json({ error: 'Missing required fields' });
 
   const processedText = rawText.length > 15000 ? rawText.slice(0, 15000) : rawText;
