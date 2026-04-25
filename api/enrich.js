@@ -6,7 +6,9 @@ module.exports = async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  const { rawText, category, fileName, domainLabel, domainRole, domainFrame } = req.body;
+  const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : (req.body || {});
+
+const { rawText, category, fileName, domainLabel, domainRole, domainFrame } = body;
   if (!rawText || !category || !fileName) return res.status(400).json({ error: 'Missing required fields' });
 
   const processedText = rawText.length > 15000 ? rawText.slice(0, 15000) : rawText;
