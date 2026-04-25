@@ -179,7 +179,11 @@ const fallbackModel =
     ? "gemini-3.1-flash-lite-preview"
     : "gemini-2.5-flash";
 function isValidSkillOutput(text) {
-  if (!text || text.length < 200) return false;
+  if (!text || text.length < 120) return false;
+
+  const cleaned = String(text).trim();
+  const hasYamlStart = cleaned.indexOf('---') >= 0 && cleaned.indexOf('---') < 40;
+  const hasYamlBoundary = hasYamlStart && cleaned.indexOf('\n---', 3) !== -1;
 
   const requiredSections = [
     '## Identity & Role',
@@ -192,11 +196,22 @@ function isValidSkillOutput(text) {
     '## Quality Bar'
   ];
 
-  const hasAllSections = requiredSections.every(section => text.includes(section));
+  const sectionCount = requiredSections.reduce((count, section) => (
+    cleaned.includes(section) ? count + 1 : count
+  ), 0);
 
-  const hasYAML = text.includes('---') && text.indexOf('---') < 10;
+  const requiredKeyPatterns = [
+    /^\s*name\s*:/m,
+    /^\s*domain\s*:/m,
+    /^\s*content_type\s*:/m,
+    /^\s*use_cases\s*:/m
+  ];
+  const requiredKeyCount = requiredKeyPatterns.reduce((count, pattern) => (
+    pattern.test(cleaned) ? count + 1 : count
+  ), 0);
+  const hasMeaningfulContent = cleaned.length > 300;
 
-  return hasAllSections && hasYAML;
+  return hasYamlBoundary && requiredKeyCount >= 4 && sectionCount >= 4 && hasMeaningfulContent;
 }
 async function callModel(modelId) {
   const controller = new AbortController();
@@ -223,7 +238,7 @@ async function callModel(modelId) {
     const data = await response.json();
     const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
 
-   if (text && text.length > 120) {
+   if (text && isValidSkillOutput(sanitize(text, skillName))) {
   return { text, model: modelId };
 }
 
