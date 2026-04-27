@@ -489,8 +489,8 @@ ${textToSend}`;
 
       // V2: replaced old 2-condition check with template-aware quality scoring
       // Flash Lite (index 0) must score >= 6
-      // Gemini 2.5 Flash (index 1) must score >= 5
-      const qualityThreshold = modelIndex === 0 ? 6 : 5;
+      // Gemini 2.5 Flash (index 1) must score >= 4
+      const qualityThreshold = modelIndex === 0 ? 6 : 4;
       if (scoreOutput(candidateText, activeTemplate) >= qualityThreshold) {
         finalRawText = candidateText;
         successfulModel = modelId;
