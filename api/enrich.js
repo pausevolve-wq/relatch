@@ -446,7 +446,7 @@ ${textToSend}`;
   let successfulModel = null;
   let lastGoogleError = "No models responded";
 
-  // V2: track model index for quality threshold (Lite >= 6, Flash >= 5)
+  // V2: track model index for quality threshold (Lite >= 6, Flash >= 4)
   let modelIndex = 0;
 
   for (const modelId of modelList) {
@@ -490,13 +490,23 @@ ${textToSend}`;
       // V2: replaced old 2-condition check with template-aware quality scoring
       // Flash Lite (index 0) must score >= 6
       // Gemini 2.5 Flash (index 1) must score >= 4
+      const yamlBlock = candidateText.match(/^---\n[\s\S]*?\n---\n/);
+      const requiredForTemplate = { A: ['## Identity & Role', '## Voice & Language'], B: ['## Role & Capability', '## Example Patterns'], C: ['## Domain Role', '## Decision Process'], D: ['## Domain Role', '## Decision Framework'] };
+      const sectionsRequired = requiredForTemplate[activeTemplate] || requiredForTemplate.A;
+      const isStructurallyValid = !!yamlBlock && sectionsRequired.every(s => candidateText.includes(s));
+
+      if (!isStructurallyValid) {
+        lastGoogleError = `Structural validation failed for model: ${modelId}`;
+        modelIndex++;
+        continue;
+      }
+
       const qualityThreshold = modelIndex === 0 ? 6 : 4;
       if (scoreOutput(candidateText, activeTemplate) >= qualityThreshold) {
         finalRawText = candidateText;
         successfulModel = modelId;
         break;
       } else {
-        // Output did not pass quality check — try next model
         lastGoogleError = `Quality check failed (score: ${scoreOutput(candidateText, activeTemplate)}/${qualityThreshold} required) for model: ${modelId}`;
         modelIndex++;
         continue;
