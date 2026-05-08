@@ -161,7 +161,7 @@ RULES:
 - You MUST start your response exactly with the YAML block below, no code fences, no backticks, no preamble.
 - You MUST enclose all YAML values in double quotes.
 - The "name" field MUST be exactly: "${skillName}"
-- The "domain" field MUST be exactly: "software engineering"
+- Use "software engineering" for the "domain" field by default, but if the content clearly belongs to a different domain, replace it with the most accurate domain instead.
 
 FORMAT:
 ---
@@ -218,7 +218,7 @@ RULES:
 - You MUST start your response exactly with the YAML block below, no code fences, no backticks, no preamble.
 - You MUST enclose all YAML values in double quotes.
 - The "name" field MUST be exactly: "${skillName}"
-- The "domain" field MUST be exactly: "${safeDomainLabel}"
+- Use "${safeDomainLabel}" for the "domain" field by default, but if the content clearly belongs to a different domain, replace it with the most accurate domain instead.
 
 FORMAT:
 ---
@@ -270,7 +270,7 @@ RULES:
 - You MUST start your response exactly with the YAML block below, no code fences, no backticks, no preamble.
 - You MUST enclose all YAML values in double quotes.
 - The "name" field MUST be exactly: "${skillName}"
-- The "domain" field MUST be exactly: "${safeDomainLabel}"
+- Use "${safeDomainLabel}" for the "domain" field by default, but if the content clearly belongs to a different domain, replace it with the most accurate domain instead.
 
 FORMAT:
 ---
@@ -328,7 +328,7 @@ RULES:
 - You MUST start your response exactly with the YAML block below, no code fences, no backticks, no preamble.
 - You MUST enclose all YAML values in double quotes.
 - The "name" field MUST be exactly: "${skillName}"
-- The "domain" field MUST be exactly: "${safeDomainLabel}"
+- Use "${safeDomainLabel}" for the "domain" field by default. Per the rule above, if the text is clearly not about the Suggested Domain, replace it with the most accurate domain instead.
 
 FORMAT:
 ---
