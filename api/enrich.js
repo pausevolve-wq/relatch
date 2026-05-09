@@ -8,7 +8,7 @@ module.exports = async function handler(req, res) {
 
   // V2: destructure new fields from frontend (template, richFormats, charCap)
   // Old fields remain exactly the same — backward compatible if frontend hasn't updated yet
-  const { rawText, category, fileName, domainLabel, domainRole, domainFrame, template, richFormats, charCap } = req.body;
+  const { rawText, category, fileName, domainLabel, domainRole, domainFrame, template, richFormats, charCap, sizeClass } = req.body;
   if (!rawText || !category || !fileName) return res.status(400).json({ error: 'Missing required fields' });
 
   const processedText = rawText.length > 15000 ? rawText.slice(0, 15000) : rawText;
@@ -48,6 +48,47 @@ module.exports = async function handler(req, res) {
   const effectiveCharCap = charCap || (signalLines.length >= 5 ? 2500 : 3500);
   const textToSend = filteredText.slice(0, effectiveCharCap);
 
+  // ── ADAPTIVE OUTPUT BUDGET ────────────────────────────────────────────────
+  // Derive sizeClass from frontend signal. If frontend is old and didn't send
+  // sizeClass, reconstruct from charCap with same thresholds as App.tsx profiler.
+  const effectiveSizeClass =
+    sizeClass === 'large' || sizeClass === 'medium' || sizeClass === 'small'
+      ? sizeClass
+      : charCap >= 8000
+        ? 'large'
+        : charCap >= 5000
+          ? 'medium'
+          : 'small';
+
+  // Token budgets per model, per sizeClass.
+  // Derived from Vercel 60s gateway + 45s internal timeout + Gemini throughput rates.
+  // Flash Lite: 55 tok/s degraded floor × 35s window = 1925 ceiling → 1800 safe.
+  // 2.5 Flash: fallback only, shorter effective window → capped lower.
+  const tokenBudgets = {
+    small:  { lite: 1000, flash: 1000 },
+    medium: { lite: 1400, flash: 1200 },
+    large:  { lite: 1800, flash: 1400 },
+  };
+  const budgetForSize = tokenBudgets[effectiveSizeClass] || tokenBudgets.small;
+  // ─────────────────────────────────────────────────────────────────────────
+
+  // ── DOCUMENT CONTEXT HEADER ───────────────────────────────────────────────
+  // Prepended to every template prompt. Orients the model on source complexity
+  // without changing template structure, domain, role, or section format.
+  // Small: no header — current behavior exactly preserved.
+  // Medium: depth instruction only.
+  // Large: depth instruction + sampling disclosure.
+  // Rules: no ## markers (would corrupt scoreOutput section detection),
+  //        no role/persona language (would conflict with domain frame),
+  //        no minimum length instruction (invites padding on Flash Lite).
+  const documentContext =
+    effectiveSizeClass === 'large'
+      ? `SOURCE CONTEXT: You have received sampled excerpts from a large document — beginning, middle, and end sections. Synthesize patterns that appear consistently across all excerpts as primary signals. Where sections differ, preserve the variation rather than collapsing it into one point. Expand each section to the depth the source material warrants. Go deeper only where source density justifies it. Do not repeat. Do not pad. Do not elaborate beyond what is grounded in the source.\n\n`
+      : effectiveSizeClass === 'medium'
+        ? `SOURCE CONTEXT: This document contains multiple frameworks, rules, or patterns. Expand each section to the depth the source warrants. Go deeper only where source density justifies it. Do not repeat. Do not pad.\n\n`
+        : '';
+  // ─────────────────────────────────────────────────────────────────────────
+
   // UNCHANGED — exact same category context as before
   const categoryContext = {
     personality: 'communication style, tone, voice patterns, how they phrase things, what they emphasize',
@@ -83,12 +124,19 @@ module.exports = async function handler(req, res) {
   // Now template-aware. Returns a score 0-9.
   // Flash Lite accepted at >= 6. Gemini 2.5 Flash accepted at >= 5.
   // ─────────────────────────────────────────────────────────────────────────────
-  function scoreOutput(text, tmpl) {
+  function scoreOutput(text, tmpl, docSizeClass) {
     let score = 0;
 
-    // +2: Length floor (hard requirement)
-    const lengthFloor = { A: 600, B: 500, C: 500, D: 700 };
-    if (text.length >= (lengthFloor[tmpl] || 600)) score += 2;
+    // +2: Length floor (hard requirement, scales with document sizeClass)
+    // Small floors are identical to legacy values — no regression on small documents.
+    // Medium ~1.5× small; large ~2.3× small — matches the per-sizeClass token budgets.
+    const lengthFloors = {
+      small:  { A: 600,  B: 500,  C: 500,  D: 700  },
+      medium: { A: 900,  B: 800,  C: 800,  D: 1000 },
+      large:  { A: 1400, B: 1200, C: 1200, D: 1600 },
+    };
+    const floorMap = lengthFloors[docSizeClass] || lengthFloors.small;
+    if (text.length >= (floorMap[tmpl] || 600)) score += 2;
 
     // +2: Required sections present (hard requirement)
     const requiredSections = {
@@ -149,7 +197,7 @@ module.exports = async function handler(req, res) {
 
   if (activeTemplate === 'B') {
     // ── TEMPLATE B: Code & Technical ──────────────────────────────────────────
-    prompt = `You are a Code Pattern Extraction Engine. Analyze the provided code or technical content and extract the developer's patterns, conventions, and architectural decisions into a Claude Skill File. Do not summarize — extract the actual behavioral DNA of how this developer writes code.
+    prompt = `${documentContext}You are a Code Pattern Extraction Engine. Analyze the provided code or technical content and extract the developer's patterns, conventions, and architectural decisions into a Claude Skill File. Do not summarize — extract the actual behavioral DNA of how this developer writes code.
 Focus on: ${focus}
 Domain: Software Engineering
 Role: ${safeDomainRole}
@@ -206,7 +254,7 @@ ${textToSend}`;
 
   } else if (activeTemplate === 'C') {
     // ── TEMPLATE C: Process & Workflow ────────────────────────────────────────
-    prompt = `You are a Process Architecture Engine. Analyze the provided document and extract the workflow logic, decision criteria, and operational rules into a Claude Skill File. Do not summarize — extract the actual process DNA.
+    prompt = `${documentContext}You are a Process Architecture Engine. Analyze the provided document and extract the workflow logic, decision criteria, and operational rules into a Claude Skill File. Do not summarize — extract the actual process DNA.
 Focus on: ${focus}
 Domain: ${safeDomainLabel}
 Role: ${safeDomainRole}
@@ -258,7 +306,7 @@ ${textToSend}`;
 
   } else if (activeTemplate === 'D') {
     // ── TEMPLATE D: Professional Domain ───────────────────────────────────────
-    prompt = `You are a Professional Domain Skill Architect. Analyze the provided document and extract the domain expertise, decision frameworks, and professional standards into a Claude Skill File. Do not summarize — extract the actual professional DNA.
+    prompt = `${documentContext}You are a Professional Domain Skill Architect. Analyze the provided document and extract the domain expertise, decision frameworks, and professional standards into a Claude Skill File. Do not summarize — extract the actual professional DNA.
 Focus on: ${focus}
 Domain: ${safeDomainLabel}
 Role: ${safeDomainRole}
@@ -316,7 +364,7 @@ ${textToSend}`;
   } else {
     // ── TEMPLATE A: Persona & Voice (default) ─────────────────────────────────
     // Original prompt preserved exactly, with enhanced format rules added before CONTENT
-    prompt = `You are a Persona Simulation Engine. Do not act like an AI summarizing a text. Instead, analyze the Tonal DNA of the provided content and generate a Claude Skill File that perfectly mimics the author's voice, constraints, and structural habits.
+    prompt = `${documentContext}You are a Persona Simulation Engine. Do not act like an AI summarizing a text. Instead, analyze the Tonal DNA of the provided content and generate a Claude Skill File that perfectly mimics the author's voice, constraints, and structural habits.
 Focus on: ${focus}
 Suggested Domain: ${safeDomainLabel}
 Suggested Role: ${safeDomainRole}
@@ -455,6 +503,13 @@ ${textToSend}`;
     // UNCHANGED — exact same 45s timeout as before
     const timeoutId = setTimeout(() => controller.abort(), 45000);
 
+    // V2 ADAPTIVE: per-model output token budget driven by sizeClass.
+    // modelIndex 0 = Flash Lite (full window), modelIndex 1 = 2.5 Flash (fallback, capped lower).
+    // Always resolves to a number because budgetForSize falls back to tokenBudgets.small.
+    const outputTokenBudget = modelIndex === 0
+      ? budgetForSize.lite
+      : budgetForSize.flash;
+
     try {
       const response = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${process.env.GEMINI_API_KEY}`,
@@ -463,8 +518,8 @@ ${textToSend}`;
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             contents: [{ parts: [{ text: prompt }] }],
-            // V2: raised from 900 to 1400 — needed for tables, flowcharts, rich output
-            generationConfig: { maxOutputTokens: 1400, temperature: 0.7 }
+            // V2 ADAPTIVE: ceiling per (sizeClass, model) — temperature unchanged.
+            generationConfig: { maxOutputTokens: outputTokenBudget, temperature: 0.7 }
           }),
           signal: controller.signal
         }
@@ -491,13 +546,13 @@ ${textToSend}`;
       // Flash Lite (index 0) must score >= 6
       // Gemini 2.5 Flash (index 1) must score >= 4
       const qualityThreshold = modelIndex === 0 ? 6 : 4;
-      if (scoreOutput(candidateText, activeTemplate) >= qualityThreshold) {
+      if (scoreOutput(candidateText, activeTemplate, effectiveSizeClass) >= qualityThreshold) {
         finalRawText = candidateText;
         successfulModel = modelId;
         break;
       } else {
         // Output did not pass quality check — try next model
-        lastGoogleError = `Quality check failed (score: ${scoreOutput(candidateText, activeTemplate)}/${qualityThreshold} required) for model: ${modelId}`;
+        lastGoogleError = `Quality check failed (score: ${scoreOutput(candidateText, activeTemplate, effectiveSizeClass)}/${qualityThreshold} required) for model: ${modelId}`;
         modelIndex++;
         continue;
       }
