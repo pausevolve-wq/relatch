@@ -8,7 +8,7 @@ module.exports = async function handler(req, res) {
 
   // V2: destructure new fields from frontend (template, richFormats, charCap)
   // Old fields remain exactly the same — backward compatible if frontend hasn't updated yet
-  const { rawText, category, fileName, domainLabel, domainRole, domainFrame, template, richFormats, charCap, sizeClass } = req.body;
+  const { rawText, category, fileName, domainLabel, domainRole, domainFrame, template, richFormats, charCap, sizeClass, target = 'claude', codexShape = 'execute' } = req.body;
   if (!rawText || !category || !fileName) return res.status(400).json({ error: 'Missing required fields' });
 
   const processedText = rawText.length > 15000 ? rawText.slice(0, 15000) : rawText;
@@ -29,7 +29,12 @@ module.exports = async function handler(req, res) {
     });
   }
 
-  // UNCHANGED — exact same signal filter logic as before
+  // Signal-line filter. Claude path uses the original behavioral-keyword criteria
+  // exactly as before. v2.2.1 adds a Codex-only branch that preserves code-shaped
+  // lines (declarations, control flow, syntax-marker chars, comments) — these have
+  // no digits / no action verbs / no colons and would otherwise be dropped, hurting
+  // EXECUTE-shape output on code-heavy sources. The added clause is gated on
+  // `target === 'codex'` so the Claude filter behavior is byte-for-byte identical.
   const allLines = rawText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
   const signalLines = allLines.filter(line =>
     line.length > 20 && (
@@ -38,7 +43,12 @@ module.exports = async function handler(req, res) {
       line.includes(':') ||
       /^[-•*#>]/.test(line) ||
       /^(\d+[.)]\s|#{1,3}\s)/.test(line) ||
-      line.endsWith('.') || line.endsWith('!') || line.endsWith('?')
+      line.endsWith('.') || line.endsWith('!') || line.endsWith('?') ||
+      (target === 'codex' && (
+        /^\s*(const|let|var|function|class|interface|type|import|export|async|await|return|def|fn|fun|impl|use|struct|enum|trait|public|private|protected|namespace|module|require|template|throw|throws|try|catch|finally|new|this|super|extends|implements|abstract|static|virtual)\b/.test(line) ||
+        /[{};]|=>|::|->/.test(line) ||
+        /^\s*(\/\/|\/\*|\*\s|#\s)/.test(line)
+      ))
     )
   );
 
@@ -115,8 +125,54 @@ module.exports = async function handler(req, res) {
   const safeDomainRole = domainRole || 'an expert';
   const safeDomainFrame = domainFrame || 'communicate effectively';
 
+  // v2.1: Codex export target — kebab-case slug for OpenAI Codex skill name
+  const codexSlug = skillName.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '') || 'my-skill';
+  const activeTarget = target === 'codex' ? 'codex' : 'claude';
+
   // V2: determine active template — default to 'A' if not provided (backward compatible)
   const activeTemplate = template || 'A';
+  // v2.1: when targeting Codex, override template selection to the CODEX prompt + scoring path
+  const effectiveTemplate = activeTarget === 'codex' ? 'CODEX' : activeTemplate;
+
+  // v2.2: Codex generation shape — three sub-templates with different cognitive profiles.
+  // EXECUTE  = direct execution playbook (refactor guides, runbooks, migrations) — code-heavy
+  // EXPERTISE = human-in-loop creative judgment (brand voice, design critique, copy) — prose + examples
+  // SPECIALIST = constrained domain role (compliance, legal, ops) — flowcharts + decision matrices
+  // Backward-compatible: defaults to 'execute' when not provided (the 70% bet).
+  const allowedShapes = ['execute', 'expertise', 'specialist'];
+  const activeCodexShape = allowedShapes.includes(codexShape) ? codexShape : 'execute';
+
+  // v2.2.1: Source-structure pre-scan — detect which rich components the source
+  // actually supports, so Codex prompts can tell Gemini what to render vs skip.
+  // Without this, Gemini guesses — and on sources lacking branching/code/tables,
+  // it either hallucinates fake components or bails to placeholder text (which
+  // costs score points). Computed only when targeting Codex. No Claude impact.
+  let codexSourceHint = '';
+  if (activeTarget === 'codex') {
+    const codeFenceCount = (textToSend.match(/```/g) || []).length;
+    const codeKeywordHits = (textToSend.match(/^\s*(const|let|var|function|class|def|fn|import|export|return|async|interface|type|struct|enum|impl)\b/gm) || []).length;
+    const syntaxMarkerLines = (textToSend.match(/^[^\n]*[{};]\s*$/gm) || []).length;
+    const hasCode = codeFenceCount >= 2 || codeKeywordHits >= 3 || syntaxMarkerLines >= 3;
+
+    const branchingHits = (textToSend.match(/\b(if|when|unless|otherwise|either|depend(?:s|ing)?|whereas|provided|except|condition|case)\b/gi) || []).length;
+    const hasBranching = branchingHits >= 3;
+
+    const colonPairCount = (textToSend.match(/^[^:\n]{2,50}:\s+\S/gm) || []).length;
+    const hasTableLike = colonPairCount >= 5;
+
+    const numberedStepCount = (textToSend.match(/^\s*\d+[.)]\s/gm) || []).length;
+    const hasNumberedSteps = numberedStepCount >= 3;
+
+    const available = [];
+    if (hasCode) available.push(`code patterns (${codeKeywordHits} declarations, ${codeFenceCount} fences, ${syntaxMarkerLines} syntax-marker lines)`);
+    if (hasBranching) available.push(`branching language (${branchingHits} if/when/unless/depending references)`);
+    if (hasTableLike) available.push(`${colonPairCount} key-value lines suitable for table rows`);
+    if (hasNumberedSteps) available.push(`${numberedStepCount} explicit numbered steps`);
+
+    codexSourceHint = available.length > 0
+      ? `\nSOURCE STRUCTURE DETECTED: The provided content contains ${available.join('; ')}. Use these signals to decide which optional sections to populate vs skip. Render rich components (code blocks, decision tables, ASCII flowcharts, templates) ONLY where the source supports them — do not fabricate components the source does not contain. Fall back to prose bullets where the spec allows.\n`
+      : `\nSOURCE STRUCTURE: The provided content has no detectable code, branching language, table-shaped key-value pairs, or numbered step sequences. Render with prose-heavy sections. SKIP optional sections (Code Patterns, ASCII flowcharts, Decision Matrix, Templates) that would require fabricated content — use the prose-bullet fallback where the spec allows.\n`;
+  }
 
   // ─────────────────────────────────────────────────────────────────────────────
   // V2: QUALITY SCORING FUNCTION
@@ -125,6 +181,41 @@ module.exports = async function handler(req, res) {
   // Flash Lite accepted at >= 6. Gemini 2.5 Flash accepted at >= 5.
   // ─────────────────────────────────────────────────────────────────────────────
   function scoreOutput(text, tmpl, docSizeClass) {
+    // v2.1: Codex scoring path — closes over activeCodexShape (declared in handler scope).
+    // v2.2: three shape-aware branches with different required anchors and component bonuses.
+    // All return 0-9 to match the Claude scoring scale used by the qualityThreshold gate.
+    if (tmpl === 'CODEX') {
+      let score = 0;
+
+      // Shared baseline (5 points possible across all shapes):
+      // +2 frontmatter has name + description
+      if (text.includes('name:') && text.includes('description:')) score += 2;
+      // +2 no placeholder bail-outs
+      if (!text.includes('[Not extracted') && !text.includes('[review source') && !text.includes('to be added')) score += 2;
+      // +1 trigger sub-sections present (universal across all three shapes)
+      if (text.includes('### Must Use') && text.includes('### Recommended') && text.includes('### Skip')) score += 1;
+
+      if (activeCodexShape === 'execute') {
+        // EXECUTE rewards: workflow anchor + code blocks + anti-patterns + executable principles.
+        if (text.includes('## When to Activate') && text.includes('## Implementation Workflow') && text.includes('## Key Principles')) score += 2;
+        const codeBlockCount = (text.match(/```[a-z]*\n/gi) || []).length;
+        if (codeBlockCount >= 2) score += 1;
+        if (text.includes('## Common Mistakes to Avoid')) score += 1;
+      } else if (activeCodexShape === 'expertise') {
+        // EXPERTISE rewards: judgment anchor + quality criteria + human-pause discipline.
+        if (text.includes('## When to Activate') && text.includes('## Judgment Framework') && text.includes('## When to Pause for Human')) score += 2;
+        if (text.includes('## Quality Bar') && text.includes('## Example Pairs')) score += 1;
+        if (text.includes('## Key Principles')) score += 1;
+      } else {
+        // SPECIALIST rewards: scope anchor + workflow/decision structure + escalation discipline.
+        if (text.includes('## When to Activate') && text.includes('## Scope Boundaries') && text.includes('## Workflow')) score += 2;
+        if (text.includes('## Decision Matrix') && text.includes('|')) score += 1;
+        if (text.includes('## Escalation Rules') && text.includes('## Common Mistakes to Avoid')) score += 1;
+      }
+
+      return score;
+    }
+
     let score = 0;
 
     // +2: Length floor (hard requirement, scales with document sizeClass)
@@ -195,7 +286,175 @@ module.exports = async function handler(req, res) {
 
   let prompt;
 
-  if (activeTemplate === 'B') {
+  if (activeTarget === 'codex') {
+    // ── CODEX TARGET: OpenAI Codex CLI Skill ──────────────────────────────────
+    // v2.2: three shape-aware sub-prompts selected by activeCodexShape.
+    // Codex is an EXECUTING agent (not a personality clone like Claude skills) —
+    // each shape matches a different cognitive profile of work Codex performs.
+    //
+    // EXECUTE  (~70%): direct procedural playbooks — refactors, migrations, deploys, runbooks
+    // EXPERTISE       : human-in-loop creative/judgment — brand voice, design critique, copy
+    // SPECIALIST      : constrained domain role — compliance, legal, security audit, ops
+    //
+    // Frontmatter spec is shape-invariant: ONLY `name` (kebab-case == codexSlug) and
+    // `description` (1-3 sentences with source-extracted trigger phrases). All other
+    // YAML fields are forbidden per the official OpenAI Codex skill spec.
+    //
+    // Trigger-phrase rule (shared across all shapes): description must contain at least
+    // 3 phrases that appear literally in the source — Codex's loader uses description-
+    // to-user-intent matching to decide when to activate. Vague descriptions never trigger.
+
+    if (activeCodexShape === 'expertise') {
+      // ── CODEX-EXPERTISE: human-in-loop creative judgment ──────────────────────
+      prompt = `${documentContext}You are a Skill Architect for OpenAI Codex CLI generating an EXPERTISE skill. Codex is an autonomous coding agent — when this skill activates, Codex drafts a first pass then PAUSES for human review before continuing. This is judgment-based creative work, not pure execution. Extract the judgment framework, quality criteria, and example patterns from the provided content.
+Focus on: ${focus}
+Domain: ${safeDomainLabel}
+Role: ${safeDomainRole}
+
+CRITICAL FRONTMATTER RULES:
+- Frontmatter MUST contain ONLY two fields: name and description. No other YAML fields whatsoever.
+- The "name" field MUST be exactly: "${codexSlug}"
+- Description: 2-3 sentences. Sentence 1: what this skill helps with (judgment/creative work). Sentence 2: trigger contexts — INCLUDE AT LEAST 3 SPECIFIC PHRASES THAT APPEAR LITERALLY IN THE SOURCE (the actual nouns/verbs/scenarios a user would type). You may add up to 2 canonical domain keywords. Sentence 3 (optional): explicit exclusions.
+- Do NOT wrap in code fences. Start your response with --- on line 1.
+- Do NOT add domain, origin, content_type, use_cases, or any other YAML field.
+
+CONTENT BUDGET: Target 500-900 words. Judgment guidance resists compression — but every paragraph must earn its place. If approaching the upper word range, prioritize completing all REQUIRED sections over depth in any single section.
+${codexSourceHint}
+REQUIRED SECTIONS (in this order):
+
+## When to Activate
+### Must Use
+- 3-5 specific trigger contexts (source-extracted phrases strongly preferred)
+### Recommended
+- 2-3 broader use cases
+### Skip
+- 2-3 explicit exclusions
+
+## Judgment Framework
+Prose paragraphs (not bullets) explaining how to weigh tradeoffs in this domain — what matters more than what, why, and how to resolve conflicts. Synthesize the author's decision-making approach from the source.
+
+## Quality Bar
+4-6 concrete, testable criteria for "good" output. No generic phrases like "be professional" or "high quality."
+
+## Example Pairs
+2-3 paired examples lifted from or grounded in the source. Use blockquote format:
+> **Weak:** [text/pattern that misses the bar]
+> **Strong:** [text/pattern that meets the bar] — [1-sentence explanation of why]
+
+## When to Pause for Human   [REQUIRED]
+3-5 specific moments where Codex must stop drafting and surface options to the human (e.g. "if brand voice could read two ways for the audience, surface both options before committing"). Each pause trigger is concrete and actionable.
+
+## Key Principles
+4-6 non-negotiable judgment rules lifted from the source.
+
+FORBIDDEN: ASCII flowcharts, decision tables, code anti-pattern pairs, heavy numbered procedures — those belong to EXECUTE and SPECIALIST shapes.
+
+CONTENT:
+${textToSend}`;
+
+    } else if (activeCodexShape === 'specialist') {
+      // ── CODEX-SPECIALIST: constrained domain role ─────────────────────────────
+      prompt = `${documentContext}You are a Skill Architect for OpenAI Codex CLI generating a SPECIALIST skill. Codex is an autonomous coding agent — when this skill activates, Codex becomes a constrained domain role and MUST REFUSE out-of-scope work. Extract the scope boundaries, workflow, decision rules, and escalation paths from the provided content.
+Focus on: ${focus}
+Domain: ${safeDomainLabel}
+Role: ${safeDomainRole}
+
+CRITICAL FRONTMATTER RULES:
+- Frontmatter MUST contain ONLY two fields: name and description. No other YAML fields whatsoever.
+- The "name" field MUST be exactly: "${codexSlug}"
+- Description: 2-3 sentences. Sentence 1: what role this skill assumes. Sentence 2: trigger contexts — INCLUDE AT LEAST 3 SPECIFIC PHRASES THAT APPEAR LITERALLY IN THE SOURCE. You may add up to 2 canonical domain keywords. Sentence 3 (optional): what this role does NOT cover.
+- Do NOT wrap in code fences. Start your response with --- on line 1.
+- Do NOT add domain, origin, content_type, use_cases, or any other YAML field.
+
+CONTENT BUDGET: Target 700-1100 words. Specialist skills carry more structure than execute/expertise — but every section must be load-bearing. If approaching the upper word range, prioritize completing all REQUIRED sections over depth in any single section.
+${codexSourceHint}
+REQUIRED SECTIONS (in this order):
+
+## When to Activate
+### Must Use
+- 3-5 specific trigger contexts (source-extracted phrases strongly preferred)
+### Recommended
+- 2-3 broader use cases
+### Skip
+- 2-3 explicit exclusions
+
+## Scope Boundaries
+Two explicit sub-lists. The "does NOT" list is critical — it is how Codex knows when to refuse.
+**This role DOES:**
+- 4-6 specific in-scope responsibilities
+**This role does NOT:**
+- 4-6 explicit out-of-scope items — work that must be refused or escalated
+
+## Workflow
+If the source has branching multi-step logic, render it as an ASCII flowchart inside a triple-backtick code fence using ONLY → ↓ ├── └── characters (no Unicode box-drawing). Then below the chart, list numbered steps with checkable outcomes. If the workflow is purely linear, skip the ASCII chart and use numbered steps only.
+
+## Decision Matrix
+Markdown table with these exact columns:
+| Condition | Action | Escalate? |
+Provide 4-7 rows. Use "Yes" / "No" / "If unclear" in the Escalate column. Each row maps a real source-grounded condition to a concrete action.
+
+## Templates
+Placeholder-filled templates lifted from or grounded in the source (e.g. a contract clause skeleton, a financial model row structure, an audit report section). Skip this section entirely if the source provides no templates — do not invent them.
+
+## Escalation Rules
+3-5 specific cases when Codex must surface to a human (uncertainty, out-of-scope edge cases, high-stakes decisions). Each rule is concrete.
+
+## Common Mistakes to Avoid   [REQUIRED]
+4-6 domain-specific anti-patterns (prose bullets, not code). Each anti-pattern is specific to this role, not generic.
+
+## Key Principles
+4-6 non-negotiable role rules that define the constraint.
+
+FORBIDDEN: Long judgment-prose paragraphs (use the decision matrix instead), code anti-pattern pairs unless the source itself is code, generic professional advice.
+
+CONTENT:
+${textToSend}`;
+
+    } else {
+      // ── CODEX-EXECUTE: direct execution playbook (default shape) ──────────────
+      prompt = `${documentContext}You are a Skill Architect for OpenAI Codex CLI generating an EXECUTION skill. Codex is an autonomous coding agent — when this skill activates, Codex reads it and STARTS WORKING immediately. Extract a direct execution playbook from the provided content. No deliberation, no human pause — just the playbook to execute.
+Focus on: ${focus}
+Domain: ${safeDomainLabel}
+Role: ${safeDomainRole}
+
+CRITICAL FRONTMATTER RULES:
+- Frontmatter MUST contain ONLY two fields: name and description. No other YAML fields whatsoever.
+- The "name" field MUST be exactly: "${codexSlug}"
+- Description: 2-3 sentences. Sentence 1: what this skill executes. Sentence 2: trigger contexts — INCLUDE AT LEAST 3 SPECIFIC PHRASES THAT APPEAR LITERALLY IN THE SOURCE (the actual nouns/verbs/scenarios a user would type to invoke this work). You may add up to 2 canonical domain keywords. Sentence 3 (optional): explicit exclusions.
+- Do NOT wrap in code fences. Start your response with --- on line 1.
+- Do NOT add domain, origin, content_type, use_cases, or any other YAML field.
+
+CONTENT BUDGET: Target 600-1100 words. SKILL.md is loaded into Codex's context on every trigger match — keep it tight and load-bearing. If approaching the upper word range, prioritize completing all REQUIRED sections over depth in any single section.
+${codexSourceHint}
+REQUIRED SECTIONS (in this order):
+
+## When to Activate
+### Must Use
+- 3-5 specific trigger contexts (source-extracted phrases strongly preferred)
+### Recommended
+- 2-3 broader use cases
+### Skip
+- 2-3 explicit exclusions
+
+## Implementation Workflow
+5-10 numbered steps. Each step names actual files, paths, commands, flags, or tools — verifiable actions. Embed fenced \`\`\`lang code blocks where the source shows code patterns. Use language tags (\`\`\`typescript, \`\`\`bash, \`\`\`python, etc.). Do NOT use ASCII flowcharts here — use numbered steps.
+
+## Code Patterns
+Fenced code blocks showing preferred patterns lifted from or grounded in the source. Include the language tag. Skip this section entirely if the source contains no code patterns — do not invent code.
+
+## Common Mistakes to Avoid   [REQUIRED]
+3-4 anti-pattern pairs. Each pair is two fenced code blocks: first with a "// don't" comment showing the wrong pattern, then with a "// do this instead" comment showing the corrected pattern. Use the language of the source. If the source contains no code, render as prose bullets instead but still 3-4 paired don't/do anti-patterns.
+
+## Key Principles
+4-6 non-negotiable executable rules (e.g. "always run pnpm install before pnpm test"). Not abstract values — actions. Lift these directly from the source.
+
+FORBIDDEN: ASCII flowcharts, judgment/taste prose, "human review" or pause sections, decision tables (this is an execution playbook — no branching deliberation).
+
+CONTENT:
+${textToSend}`;
+    }
+
+  } else if (activeTemplate === 'B') {
     // ── TEMPLATE B: Code & Technical ──────────────────────────────────────────
     prompt = `${documentContext}You are a Code Pattern Extraction Engine. Analyze the provided code or technical content and extract the developer's patterns, conventions, and architectural decisions into a Claude Skill File. Do not summarize — extract the actual behavioral DNA of how this developer writes code.
 Focus on: ${focus}
@@ -442,6 +701,50 @@ ${textToSend}`;
     text = text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\uFEFF\u200B-\u200D\u2060]/g, '');
     text = text.replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/, '').trim();
 
+    // v2.1: Codex sanitize path — strict spec, frontmatter has ONLY name + description.
+    // When called for Codex, `skillName` param holds the kebab-case codexSlug (see call site).
+    if (tmpl === 'CODEX') {
+      const yamlStartCodex = text.indexOf('---');
+      if (yamlStartCodex > 0) text = text.slice(yamlStartCodex);
+      if (!text.startsWith('---')) text = '---\n' + text;
+
+      const fmMatchCodex = text.match(/^---\n([\s\S]*?)\n---/);
+      if (fmMatchCodex) {
+        let fm = fmMatchCodex[1];
+        if (/^name:/m.test(fm)) {
+          fm = fm.replace(/^name:.*$/m, `name: ${skillName}`);
+        } else {
+          fm = `name: ${skillName}\n` + fm;
+        }
+        // Strip every non-spec YAML field — Codex frontmatter accepts ONLY name + description.
+        fm = fm.split('\n')
+          .filter(line => /^(name:|description:)/.test(line.trim()) || line.trim() === '')
+          .join('\n');
+        if (!/^description:/m.test(fm)) {
+          fm += `\ndescription: ${skillName.replace(/-/g, ' ')} skill.`;
+        }
+        text = `---\n${fm.trim()}\n---` + text.slice(fmMatchCodex[0].length);
+      }
+      if (!text.includes('## When to Activate')) {
+        text += '\n\n## When to Activate\n[Review source document and define activation contexts.]';
+      }
+
+      // v2.2: Shape-aware required-section fallback. Closes over activeCodexShape from
+      // handler scope. Appends a placeholder section only if the model omitted the
+      // shape-critical anchor — preserves model output otherwise. scoreOutput will
+      // penalize placeholder text, so the model is incentivized to fill it on retry.
+      if (activeCodexShape === 'execute' && !text.includes('## Common Mistakes to Avoid')) {
+        text += '\n\n## Common Mistakes to Avoid\n[Review source document and extract domain-specific anti-patterns.]';
+      } else if (activeCodexShape === 'expertise' && !text.includes('## When to Pause for Human')) {
+        text += '\n\n## When to Pause for Human\n[Review source document and define explicit human-review triggers.]';
+      } else if (activeCodexShape === 'specialist' && !text.includes('## Scope Boundaries')) {
+        text += '\n\n## Scope Boundaries\n**This role DOES:**\n- [Review source document and define in-scope responsibilities]\n\n**This role does NOT:**\n- [Review source document and define out-of-scope items]';
+      }
+
+      text = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n{3,}/g, '\n\n');
+      return text.trim();
+    }
+
     // UNCHANGED — exact same YAML positioning as before
     const yamlStart = text.indexOf('---');
     if (yamlStart > 0) text = text.slice(yamlStart);
@@ -546,13 +849,13 @@ ${textToSend}`;
       // Flash Lite (index 0) must score >= 6
       // Gemini 2.5 Flash (index 1) must score >= 4
       const qualityThreshold = modelIndex === 0 ? 6 : 4;
-      if (scoreOutput(candidateText, activeTemplate, effectiveSizeClass) >= qualityThreshold) {
+      if (scoreOutput(candidateText, effectiveTemplate, effectiveSizeClass) >= qualityThreshold) {
         finalRawText = candidateText;
         successfulModel = modelId;
         break;
       } else {
         // Output did not pass quality check — try next model
-        lastGoogleError = `Quality check failed (score: ${scoreOutput(candidateText, activeTemplate, effectiveSizeClass)}/${qualityThreshold} required) for model: ${modelId}`;
+        lastGoogleError = `Quality check failed (score: ${scoreOutput(candidateText, effectiveTemplate, effectiveSizeClass)}/${qualityThreshold} required) for model: ${modelId}`;
         modelIndex++;
         continue;
       }
@@ -569,7 +872,7 @@ ${textToSend}`;
   // UNCHANGED — exact same response format as before
   if (finalRawText) {
     return res.status(200).json({
-      enriched: sanitize(finalRawText, skillName, activeTemplate),
+      enriched: sanitize(finalRawText, activeTarget === 'codex' ? codexSlug : skillName, effectiveTemplate),
       model: successfulModel
     });
   } else {
