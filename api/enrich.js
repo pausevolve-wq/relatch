@@ -196,20 +196,23 @@ module.exports = async function handler(req, res) {
       if (text.includes('### Must Use') && text.includes('### Recommended') && text.includes('### Skip')) score += 1;
 
       if (activeCodexShape === 'execute') {
-        // EXECUTE rewards: workflow anchor + code blocks + anti-patterns + executable principles.
+        // EXECUTE rewards: workflow anchor + code blocks + anti-patterns + final checks.
         if (text.includes('## When to Activate') && text.includes('## Implementation Workflow') && text.includes('## Key Principles')) score += 2;
         const codeBlockCount = (text.match(/```[a-z]*\n/gi) || []).length;
         if (codeBlockCount >= 2) score += 1;
         if (text.includes('## Common Mistakes to Avoid')) score += 1;
+        if (text.includes('## Final Checks')) score += 1;
       } else if (activeCodexShape === 'expertise') {
-        // EXPERTISE rewards: judgment anchor + quality criteria + human-pause discipline.
+        // EXPERTISE rewards: review workflow + judgment anchor + quality criteria + human-pause.
         if (text.includes('## When to Activate') && text.includes('## Judgment Framework') && text.includes('## When to Pause for Human')) score += 2;
         if (text.includes('## Quality Bar') && text.includes('## Example Pairs')) score += 1;
+        if (text.includes('## Review Workflow')) score += 1;
         if (text.includes('## Key Principles')) score += 1;
       } else {
-        // SPECIALIST rewards: scope anchor + workflow/decision structure + escalation discipline.
+        // SPECIALIST rewards: scope + operating mode + workflow/decision structure + escalation.
         if (text.includes('## When to Activate') && text.includes('## Scope Boundaries') && text.includes('## Workflow')) score += 2;
         if (text.includes('## Decision Matrix') && text.includes('|')) score += 1;
+        if (text.includes('## Operating Mode')) score += 1;
         if (text.includes('## Escalation Rules') && text.includes('## Common Mistakes to Avoid')) score += 1;
       }
 
@@ -306,7 +309,7 @@ module.exports = async function handler(req, res) {
 
     if (activeCodexShape === 'expertise') {
       // ── CODEX-EXPERTISE: human-in-loop creative judgment ──────────────────────
-      prompt = `${documentContext}You are a Skill Architect for OpenAI Codex CLI generating an EXPERTISE skill. Codex is an autonomous coding agent — when this skill activates, Codex drafts a first pass then PAUSES for human review before continuing. This is judgment-based creative work, not pure execution. Extract the judgment framework, quality criteria, and example patterns from the provided content.
+      prompt = `${documentContext}You are a Skill Architect for OpenAI Codex CLI generating an EXPERTISE skill. Codex is an autonomous coding agent — when this skill activates, Codex performs review, editing, or creative work and PAUSES for human approval at key decision points. Convert the source into instructions Codex can follow while reviewing, rewriting, or producing work. Prefer minimal-edit review guidance before full rewrites. Prefer concrete checks over abstract advice.
 Focus on: ${focus}
 Domain: ${safeDomainLabel}
 Role: ${safeDomainRole}
@@ -314,47 +317,50 @@ Role: ${safeDomainRole}
 CRITICAL FRONTMATTER RULES:
 - Frontmatter MUST contain ONLY two fields: name and description. No other YAML fields whatsoever.
 - The "name" field MUST be exactly: "${codexSlug}"
-- Description: 2-3 sentences. Sentence 1: what this skill helps with (judgment/creative work). Sentence 2: trigger contexts — INCLUDE AT LEAST 3 SPECIFIC PHRASES THAT APPEAR LITERALLY IN THE SOURCE (the actual nouns/verbs/scenarios a user would type). You may add up to 2 canonical domain keywords. Sentence 3 (optional): explicit exclusions.
+- Description: 2-3 sentences. Sentence 1: what Codex should do when this skill is relevant. Sentence 2: trigger contexts — include 1-2 phrases that appear literally in the source AND 2-4 real user-intent phrases a Codex user would naturally type (e.g. "review landing page copy", "tighten this headline", "improve the CTA"). Sentence 3 (optional): explicit exclusions.
 - Do NOT wrap in code fences. Start your response with --- on line 1.
 - Do NOT add domain, origin, content_type, use_cases, or any other YAML field.
 
-CONTENT BUDGET: Target 500-900 words. Judgment guidance resists compression — but every paragraph must earn its place. If approaching the upper word range, prioritize completing all REQUIRED sections over depth in any single section.
+CONTENT BUDGET: Target 500-900 words. If approaching the upper range, prioritize completing all REQUIRED sections over depth in any single section.
 ${codexSourceHint}
 REQUIRED SECTIONS (in this order):
 
 ## When to Activate
 ### Must Use
-- 3-5 specific trigger contexts (source-extracted phrases strongly preferred)
+- 3-5 specific trigger contexts (mix of source phrases and real user-intent phrasing)
 ### Recommended
 - 2-3 broader use cases
 ### Skip
 - 2-3 explicit exclusions
 
+## Review Workflow
+4-7 numbered steps for how Codex should approach reviewing or rewriting work in this domain. Example order: clarify intent → identify weak claims → check proof/support → check CTA or conclusion → verify tone → suggest minimal diff first before full rewrite. Lift the actual review logic from the source.
+
 ## Judgment Framework
-Prose paragraphs (not bullets) explaining how to weigh tradeoffs in this domain — what matters more than what, why, and how to resolve conflicts. Synthesize the author's decision-making approach from the source.
+Explain the explicit tradeoffs in this domain — clarity vs. cleverness, brevity vs. proof, emotion vs. specificity. State which side wins under which conditions. Synthesize the author's decision-making approach; do not generalize.
 
 ## Quality Bar
-4-6 concrete, testable criteria for "good" output. No generic phrases like "be professional" or "high quality."
+4-6 concrete, testable criteria for "good" output specific to this domain. No generic phrases like "be professional" or "high quality."
 
 ## Example Pairs
-2-3 paired examples lifted from or grounded in the source. Use blockquote format:
-> **Weak:** [text/pattern that misses the bar]
-> **Strong:** [text/pattern that meets the bar] — [1-sentence explanation of why]
+2-3 paired before/after examples grounded in the source — realistic edits (landing page copy, ad headlines, email subject lines, etc.), not broad pedagogy:
+> **Weak:** [specific text/pattern that misses the bar]
+> **Strong:** [specific improved version] — [1-sentence explanation of why]
 
 ## When to Pause for Human   [REQUIRED]
-3-5 specific moments where Codex must stop drafting and surface options to the human (e.g. "if brand voice could read two ways for the audience, surface both options before committing"). Each pause trigger is concrete and actionable.
+3-5 specific moments where Codex must STOP and surface options — only pause on ambiguity that blocks good output, not on ordinary rewrite work. Each trigger is concrete (e.g. "if the audience segment is unclear, ask before rewriting the hook").
 
 ## Key Principles
-4-6 non-negotiable judgment rules lifted from the source.
+4-6 non-negotiable judgment rules lifted directly from the source.
 
-FORBIDDEN: ASCII flowcharts, decision tables, code anti-pattern pairs, heavy numbered procedures — those belong to EXECUTE and SPECIALIST shapes.
+FORBIDDEN: ASCII flowcharts, decision tables, code anti-pattern pairs, heavy numbered procedures — those belong to EXECUTE and SPECIALIST shapes. Avoid generic educational exposition.
 
 CONTENT:
 ${textToSend}`;
 
     } else if (activeCodexShape === 'specialist') {
       // ── CODEX-SPECIALIST: constrained domain role ─────────────────────────────
-      prompt = `${documentContext}You are a Skill Architect for OpenAI Codex CLI generating a SPECIALIST skill. Codex is an autonomous coding agent — when this skill activates, Codex becomes a constrained domain role and MUST REFUSE out-of-scope work. Extract the scope boundaries, workflow, decision rules, and escalation paths from the provided content.
+      prompt = `${documentContext}You are a Skill Architect for OpenAI Codex CLI generating a SPECIALIST skill. Codex is an autonomous coding agent — when this skill activates, Codex operates as a constrained domain role and MUST REFUSE out-of-scope work. Convert the source into an operator playbook: what Codex is allowed to do autonomously, what it must escalate, and what it refuses. If the source is conceptual, translate it into an action sequence Codex can run.
 Focus on: ${focus}
 Domain: ${safeDomainLabel}
 Role: ${safeDomainRole}
@@ -362,45 +368,51 @@ Role: ${safeDomainRole}
 CRITICAL FRONTMATTER RULES:
 - Frontmatter MUST contain ONLY two fields: name and description. No other YAML fields whatsoever.
 - The "name" field MUST be exactly: "${codexSlug}"
-- Description: 2-3 sentences. Sentence 1: what role this skill assumes. Sentence 2: trigger contexts — INCLUDE AT LEAST 3 SPECIFIC PHRASES THAT APPEAR LITERALLY IN THE SOURCE. You may add up to 2 canonical domain keywords. Sentence 3 (optional): what this role does NOT cover.
+- Description: 2-3 sentences. Sentence 1: what role this skill assumes. Sentence 2: trigger contexts — include 1-2 phrases that appear literally in the source AND 2-4 real user-intent phrases a Codex user would naturally type. Sentence 3 (optional): what this role does NOT cover.
 - Do NOT wrap in code fences. Start your response with --- on line 1.
 - Do NOT add domain, origin, content_type, use_cases, or any other YAML field.
 
-CONTENT BUDGET: Target 700-1100 words. Specialist skills carry more structure than execute/expertise — but every section must be load-bearing. If approaching the upper word range, prioritize completing all REQUIRED sections over depth in any single section.
+CONTENT BUDGET: Target 700-1100 words. Every section must be load-bearing. If approaching the upper range, prioritize completing all REQUIRED sections over depth in any single section.
 ${codexSourceHint}
 REQUIRED SECTIONS (in this order):
 
 ## When to Activate
 ### Must Use
-- 3-5 specific trigger contexts (source-extracted phrases strongly preferred)
+- 3-5 specific trigger contexts (mix of source phrases and real user-intent phrasing)
 ### Recommended
 - 2-3 broader use cases
 ### Skip
 - 2-3 explicit exclusions
 
 ## Scope Boundaries
-Two explicit sub-lists. The "does NOT" list is critical — it is how Codex knows when to refuse.
+Two explicit sub-lists. The "does NOT" list defines when Codex refuses.
 **This role DOES:**
-- 4-6 specific in-scope responsibilities
+- 4-6 specific in-scope responsibilities (concrete, not abstract)
 **This role does NOT:**
 - 4-6 explicit out-of-scope items — work that must be refused or escalated
 
+## Operating Mode   [REQUIRED]
+Three short sub-sections defining Codex's behavioral envelope in this role:
+**Autonomous:** tasks Codex can complete and deliver without checking in
+**Escalate:** situations requiring human sign-off before proceeding
+**Refuse:** requests explicitly out of scope — state them clearly
+
 ## Workflow
-If the source has branching multi-step logic, render it as an ASCII flowchart inside a triple-backtick code fence using ONLY → ↓ ├── └── characters (no Unicode box-drawing). Then below the chart, list numbered steps with checkable outcomes. If the workflow is purely linear, skip the ASCII chart and use numbered steps only.
+If the source has branching multi-step logic, render it as an ASCII flowchart inside a triple-backtick code fence using ONLY → ↓ ├── └── characters. Then list numbered steps with checkable outcomes. If the workflow is purely linear, skip the ASCII chart and use numbered steps only.
 
 ## Decision Matrix
-Markdown table with these exact columns:
+Markdown table with concrete conditions, not broad categories:
 | Condition | Action | Escalate? |
-Provide 4-7 rows. Use "Yes" / "No" / "If unclear" in the Escalate column. Each row maps a real source-grounded condition to a concrete action.
+Provide 4-7 rows with "Yes" / "No" / "If unclear" in the Escalate column. Each row maps a specific, source-grounded condition to a concrete action.
 
 ## Templates
-Placeholder-filled templates lifted from or grounded in the source (e.g. a contract clause skeleton, a financial model row structure, an audit report section). Skip this section entirely if the source provides no templates — do not invent them.
+Placeholder-filled templates from the source (contract clause skeleton, audit section, financial row, etc.). Skip this section entirely if the source provides no reusable fill-in structures — do not invent them.
 
 ## Escalation Rules
-3-5 specific cases when Codex must surface to a human (uncertainty, out-of-scope edge cases, high-stakes decisions). Each rule is concrete.
+3-5 specific cases when Codex must surface to a human. Each rule names a concrete trigger, not a vague category.
 
 ## Common Mistakes to Avoid   [REQUIRED]
-4-6 domain-specific anti-patterns (prose bullets, not code). Each anti-pattern is specific to this role, not generic.
+4-6 domain-specific anti-patterns as prose bullets. Each anti-pattern is role-specific, not generic professional advice.
 
 ## Key Principles
 4-6 non-negotiable role rules that define the constraint.
@@ -412,7 +424,7 @@ ${textToSend}`;
 
     } else {
       // ── CODEX-EXECUTE: direct execution playbook (default shape) ──────────────
-      prompt = `${documentContext}You are a Skill Architect for OpenAI Codex CLI generating an EXECUTION skill. Codex is an autonomous coding agent — when this skill activates, Codex reads it and STARTS WORKING immediately. Extract a direct execution playbook from the provided content. No deliberation, no human pause — just the playbook to execute.
+      prompt = `${documentContext}You are a Skill Architect for OpenAI Codex CLI generating an EXECUTION skill. Codex is an autonomous coding agent — when this skill activates, Codex reads it and STARTS WORKING immediately. Convert the source into a direct execution playbook Codex can follow: concrete files, commands, checks, and artifacts. If the source is conceptual, translate it into an action sequence Codex can run. Prefer concrete checks over abstract advice.
 Focus on: ${focus}
 Domain: ${safeDomainLabel}
 Role: ${safeDomainRole}
@@ -420,33 +432,36 @@ Role: ${safeDomainRole}
 CRITICAL FRONTMATTER RULES:
 - Frontmatter MUST contain ONLY two fields: name and description. No other YAML fields whatsoever.
 - The "name" field MUST be exactly: "${codexSlug}"
-- Description: 2-3 sentences. Sentence 1: what this skill executes. Sentence 2: trigger contexts — INCLUDE AT LEAST 3 SPECIFIC PHRASES THAT APPEAR LITERALLY IN THE SOURCE (the actual nouns/verbs/scenarios a user would type to invoke this work). You may add up to 2 canonical domain keywords. Sentence 3 (optional): explicit exclusions.
+- Description: 2-3 sentences. Sentence 1: what this skill executes. Sentence 2: trigger contexts — include 1-2 phrases that appear literally in the source AND 2-4 real user-intent phrases a Codex user would naturally type (e.g. "refactor this component", "run the migration", "set up the test suite"). Sentence 3 (optional): explicit exclusions.
 - Do NOT wrap in code fences. Start your response with --- on line 1.
 - Do NOT add domain, origin, content_type, use_cases, or any other YAML field.
 
-CONTENT BUDGET: Target 600-1100 words. SKILL.md is loaded into Codex's context on every trigger match — keep it tight and load-bearing. If approaching the upper word range, prioritize completing all REQUIRED sections over depth in any single section.
+CONTENT BUDGET: Target 600-1100 words. SKILL.md is loaded into Codex's context on every trigger — keep it tight and load-bearing. If approaching the upper range, prioritize completing all REQUIRED sections over depth in any single section.
 ${codexSourceHint}
 REQUIRED SECTIONS (in this order):
 
 ## When to Activate
 ### Must Use
-- 3-5 specific trigger contexts (source-extracted phrases strongly preferred)
+- 3-5 specific trigger contexts (mix of source phrases and real user-intent phrasing)
 ### Recommended
 - 2-3 broader use cases
 ### Skip
 - 2-3 explicit exclusions
 
 ## Implementation Workflow
-5-10 numbered steps. Each step names actual files, paths, commands, flags, or tools — verifiable actions. Embed fenced \`\`\`lang code blocks where the source shows code patterns. Use language tags (\`\`\`typescript, \`\`\`bash, \`\`\`python, etc.). Do NOT use ASCII flowcharts here — use numbered steps.
+5-10 numbered steps. Each step MUST reference actual files, paths, commands, flags, tools, or checkable artifacts — no abstract steps. Embed fenced \`\`\`lang code blocks where the source shows code patterns. Use language tags (\`\`\`typescript, \`\`\`bash, \`\`\`python, etc.). Do NOT use ASCII flowcharts here — use numbered steps.
 
 ## Code Patterns
 Fenced code blocks showing preferred patterns lifted from or grounded in the source. Include the language tag. Skip this section entirely if the source contains no code patterns — do not invent code.
 
 ## Common Mistakes to Avoid   [REQUIRED]
-3-4 anti-pattern pairs. Each pair is two fenced code blocks: first with a "// don't" comment showing the wrong pattern, then with a "// do this instead" comment showing the corrected pattern. Use the language of the source. If the source contains no code, render as prose bullets instead but still 3-4 paired don't/do anti-patterns.
+3-4 anti-pattern pairs. When the source contains code, each pair is two fenced code blocks: first with "// ✗ don't" showing the wrong pattern, then "// ✓ do this instead" showing the corrected pattern. If the source has no code, use prose bullets with "Don't:" / "Do:" pairing. Make pairs specific — not generic advice.
+
+## Final Checks   [REQUIRED]
+3-5 verification steps Codex should run before considering the task done. Each check is concrete: a command to run, a file to inspect, a condition to assert, or a behavior to verify.
 
 ## Key Principles
-4-6 non-negotiable executable rules (e.g. "always run pnpm install before pnpm test"). Not abstract values — actions. Lift these directly from the source.
+4-6 non-negotiable executable rules (e.g. "always run pnpm install before pnpm test"). Not abstract values — verifiable actions. Lift these directly from the source.
 
 FORBIDDEN: ASCII flowcharts, judgment/taste prose, "human review" or pause sections, decision tables (this is an execution playbook — no branching deliberation).
 
@@ -733,12 +748,27 @@ ${textToSend}`;
       // handler scope. Appends a placeholder section only if the model omitted the
       // shape-critical anchor — preserves model output otherwise. scoreOutput will
       // penalize placeholder text, so the model is incentivized to fill it on retry.
-      if (activeCodexShape === 'execute' && !text.includes('## Common Mistakes to Avoid')) {
-        text += '\n\n## Common Mistakes to Avoid\n[Review source document and extract domain-specific anti-patterns.]';
-      } else if (activeCodexShape === 'expertise' && !text.includes('## When to Pause for Human')) {
-        text += '\n\n## When to Pause for Human\n[Review source document and define explicit human-review triggers.]';
-      } else if (activeCodexShape === 'specialist' && !text.includes('## Scope Boundaries')) {
-        text += '\n\n## Scope Boundaries\n**This role DOES:**\n- [Review source document and define in-scope responsibilities]\n\n**This role does NOT:**\n- [Review source document and define out-of-scope items]';
+      if (activeCodexShape === 'execute') {
+        if (!text.includes('## Common Mistakes to Avoid')) {
+          text += '\n\n## Common Mistakes to Avoid\n[Review source document and extract domain-specific anti-patterns.]';
+        }
+        if (!text.includes('## Final Checks')) {
+          text += '\n\n## Final Checks\n[Review source document and define verification steps before task completion.]';
+        }
+      } else if (activeCodexShape === 'expertise') {
+        if (!text.includes('## When to Pause for Human')) {
+          text += '\n\n## When to Pause for Human\n[Review source document and define explicit human-review triggers.]';
+        }
+        if (!text.includes('## Review Workflow')) {
+          text += '\n\n## Review Workflow\n[Review source document and define the step-by-step review sequence Codex should follow.]';
+        }
+      } else if (activeCodexShape === 'specialist') {
+        if (!text.includes('## Scope Boundaries')) {
+          text += '\n\n## Scope Boundaries\n**This role DOES:**\n- [Review source document and define in-scope responsibilities]\n\n**This role does NOT:**\n- [Review source document and define out-of-scope items]';
+        }
+        if (!text.includes('## Operating Mode')) {
+          text += '\n\n## Operating Mode\n**Autonomous:** [tasks Codex can complete without checking in]\n**Escalate:** [situations requiring human sign-off]\n**Refuse:** [requests explicitly out of scope]';
+        }
       }
 
       text = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n{3,}/g, '\n\n');
