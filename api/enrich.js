@@ -343,9 +343,10 @@ Explain the explicit tradeoffs in this domain — clarity vs. cleverness, brevit
 4-6 concrete, testable criteria for "good" output specific to this domain. No generic phrases like "be professional" or "high quality."
 
 ## Example Pairs
-2-3 paired before/after examples grounded in the source — realistic edits (landing page copy, ad headlines, email subject lines, etc.), not broad pedagogy:
-> **Weak:** [specific text/pattern that misses the bar]
-> **Strong:** [specific improved version] — [1-sentence explanation of why]
+2-3 before/after pairs showing concrete text-level edits (5-20 word snippets from real landing pages, ad headlines, email subjects, CTA buttons, or value propositions). Each pair MUST show the actual words, not a description of the problem. Use the source's domain and vocabulary:
+> **Weak:** "[exact weak phrasing]"
+> **Strong:** "[specific improved version]" — [1-sentence explanation anchored to the Judgment Framework above]
+Show the minimal diff first. Only escalate to a full rewrite if the weak version cannot be salvaged with small edits.
 
 ## When to Pause for Human   [REQUIRED]
 3-5 specific moments where Codex must STOP and surface options — only pause on ambiguity that blocks good output, not on ordinary rewrite work. Each trigger is concrete (e.g. "if the audience segment is unclear, ask before rewriting the hook").
@@ -401,12 +402,12 @@ Three short sub-sections defining Codex's behavioral envelope in this role:
 If the source has branching multi-step logic, render it as an ASCII flowchart inside a triple-backtick code fence using ONLY → ↓ ├── └── characters. Then list numbered steps with checkable outcomes. If the workflow is purely linear, skip the ASCII chart and use numbered steps only.
 
 ## Decision Matrix
-Markdown table with concrete conditions, not broad categories:
+Markdown table with concrete conditions:
 | Condition | Action | Escalate? |
-Provide 4-7 rows with "Yes" / "No" / "If unclear" in the Escalate column. Each row maps a specific, source-grounded condition to a concrete action.
+ANTI-HALLUCINATION RULE: every row must map to a condition explicitly present in the source. If the source yields fewer than 4 distinguishable conditions, provide fewer rows rather than fabricating. Use "Yes" / "No" / "If unclear" in the Escalate column. Each action must be concrete (name a file, command, or output), not a vague directive.
 
 ## Templates
-Placeholder-filled templates from the source (contract clause skeleton, audit section, financial row, etc.). Skip this section entirely if the source provides no reusable fill-in structures — do not invent them.
+SKIP ENTIRELY unless you can identify at least one reusable, fill-in-the-blank structure directly in the source. If it exists, render it with `[PLACEHOLDER]` markers. Do NOT synthesize templates from general domain knowledge — only extract them from what the source actually provides.
 
 ## Escalation Rules
 3-5 specific cases when Codex must surface to a human. Each rule names a concrete trigger, not a vague category.
@@ -455,10 +456,10 @@ REQUIRED SECTIONS (in this order):
 Fenced code blocks showing preferred patterns lifted from or grounded in the source. Include the language tag. Skip this section entirely if the source contains no code patterns — do not invent code.
 
 ## Common Mistakes to Avoid   [REQUIRED]
-3-4 anti-pattern pairs. When the source contains code, each pair is two fenced code blocks: first with "// ✗ don't" showing the wrong pattern, then "// ✓ do this instead" showing the corrected pattern. If the source has no code, use prose bullets with "Don't:" / "Do:" pairing. Make pairs specific — not generic advice.
+3-5 anti-pattern entries. When the source contains code, each entry is two fenced code blocks (// ✗ don't → // ✓ do this instead). When non-code, use "**Don't:** ... **Do:** ..." prose pairs. Each entry MUST include a one-line WHY — not just what is wrong but what breaks when you do it wrong. Make all entries source-specific, not generic advice.
 
 ## Final Checks   [REQUIRED]
-3-5 verification steps Codex should run before considering the task done. Each check is concrete: a command to run, a file to inspect, a condition to assert, or a behavior to verify.
+3-5 verification steps Codex should run before considering the task done. Format at least one as a runnable shell command (e.g. \`$ npm test\`, \`$ python -m pytest\`, \`$ grep -r "pattern" ./src\`) when the source is code-related. Always include at least one boundary check — a file, directory, interface, or architecture constraint to verify before shipping. Each check must be independently runnable and concrete, not a vague "ensure everything works."
 
 ## Key Principles
 4-6 non-negotiable executable rules (e.g. "always run pnpm install before pnpm test"). Not abstract values — verifiable actions. Lift these directly from the source.
