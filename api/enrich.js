@@ -8,6 +8,8 @@ module.exports = async function handler(req, res) {
 
   // V2: destructure new fields from frontend (template, richFormats, charCap)
   // Old fields remain exactly the same — backward compatible if frontend hasn't updated yet
+  // richFormats: consumed by Claude prompt templates only. Codex path uses codexSourceHint
+  // pre-scan (v2.2.1) for dynamic structure detection — intentionally unused on Codex path.
   const { rawText, category, fileName, domainLabel, domainRole, domainFrame, template, richFormats, charCap, sizeClass, target = 'claude', codexShape = 'execute' } = req.body;
   if (!rawText || !category || !fileName) return res.status(400).json({ error: 'Missing required fields' });
 
@@ -109,7 +111,22 @@ module.exports = async function handler(req, res) {
     preferences: 'specific choices, standards, non-negotiables, defaults, and pet peeves',
   };
 
-  const focus = categoryContext[category] || categoryContext.knowledge;
+  // v2.3: Codex-specific category focus strings — operational framing vs Claude's persona framing.
+  // Claude uses persona-flavored descriptions ("communication style, tone, voice patterns").
+  // Codex needs operational-flavored descriptions ("verifiable execution rules, command sequences").
+  // Only used when target === 'codex'. categoryContext is byte-identical — no Claude impact.
+  const codexCategoryContext = {
+    personality: 'behavioral enforcement rules, voice compliance criteria, and style constraint definitions that can be applied as operational checks',
+    instructions: 'verifiable execution rules, command sequences, checkable artifact states, hard constraints, and explicit refusal criteria',
+    knowledge: 'operational frameworks, domain-specific decision criteria, constraint sets, and reference patterns that Codex can apply procedurally',
+    examples: 'concrete reference implementations, before/after anti-pattern pairs, and approved pattern libraries with named artifacts',
+    context: 'operational boundaries, environmental prerequisites, scope limitations, escalation triggers, and refusal conditions',
+    preferences: 'non-negotiable defaults, enforced output standards, rejection criteria, and configuration invariants',
+  };
+
+  const focus = target === 'codex'
+    ? (codexCategoryContext[category] || codexCategoryContext.knowledge)
+    : (categoryContext[category] || categoryContext.knowledge);
 
   // UNCHANGED — exact same skillName derivation as before
   const skillName = fileName
@@ -900,16 +917,178 @@ ${textToSend}`;
     }
   }
 
-  // UNCHANGED — exact same response format as before
+  // v2.4: Codex deterministic fallback assembler.
+  // Declared inside handler so it closes over already-computed local vars:
+  //   signalLines, activeCodexShape, codexSlug, safeDomainLabel, safeDomainRole, focus
+  // Called only when activeTarget === 'codex' AND all Gemini models failed.
+  // No LLM calls. No new dependencies. Zero impact on Claude path.
+  function buildCodexFallback() {
+    // Step A — re-bucket signalLines by operational semantics (priority order, first match wins)
+    const buckets = {
+      workflow:     [],
+      refuse:       [],
+      escalate:     [],
+      antiPatterns: [],
+      constraints:  [],
+      other:        [],
+    };
+
+    for (const line of signalLines) {
+      const clean = line.replace(/^[-•*\d.)]+\s*/, '').trim();
+      if (!clean) continue;
+
+      if (/^\s*(\d+[.)]\s|step\s*\d|\bfirst\b|\bthen\b|\bfinally\b|\bnext\b|\bafter\b|\bbefore\b)/i.test(line)) {
+        buckets.workflow.push(clean);
+      } else if (/\b(refuse|reject|out.?of.?scope|not (in|within) scope|decline|cannot|will not|outside)\b/i.test(line)) {
+        buckets.refuse.push(clean);
+      } else if (/\b(escalate|human|review|approve|sign.?off|pause|ask|clarify|ambig|unclear|exception|edge case)\b/i.test(line)) {
+        buckets.escalate.push(clean);
+      } else if (/\b(never|avoid|don't|do not|incorrect|wrong|bad|anti-pattern|mistake|error|fail)\b/i.test(line)) {
+        buckets.antiPatterns.push(clean);
+      } else if (/^\s*[-•*]?\s*\b(always|must|never|avoid|ensure|require|enforce|refuse|reject|do not|don't|stop|halt|block|verify|confirm|check|validate|run|execute|apply|set|reset|clear|deploy|migrate|refactor|test|lint|build|install|import|export)\b/i.test(line)) {
+        buckets.constraints.push(clean);
+      } else {
+        buckets.other.push(clean);
+      }
+    }
+
+    // Step B — fill() helper: take n items from bucket, drain buckets.other if short, emit placeholder if empty
+    function fill(bucket, n, placeholder) {
+      const items = bucket.slice(0, n);
+      if (items.length < n) {
+        const needed = n - items.length;
+        items.push(...buckets.other.splice(0, needed));
+      }
+      if (items.length === 0) items.push(placeholder);
+      return items;
+    }
+
+    // Step C — shared sections (all shapes)
+    const safeDesc = `Applies ${safeDomainLabel} ${focus} as an operational ${activeCodexShape} skill for ${safeDomainRole} contexts.`;
+
+    const activationSection = [
+      '## When to Activate',
+      '### Must Use',
+      ...fill([...buckets.constraints], 3, `${safeDomainLabel} ${activeCodexShape} task`).map(i => `- ${i}`),
+      '### Recommended',
+      ...fill([...buckets.other], 2, `General ${safeDomainLabel} work`).map(i => `- ${i}`),
+      '### Skip',
+      ...fill(buckets.refuse.length > 0 ? [...buckets.refuse] : [...buckets.antiPatterns], 2, 'Out-of-scope requests').map(i => `- ${i}`),
+    ].join('\n');
+
+    const principlesSection = [
+      '## Key Principles',
+      ...fill([...buckets.constraints, ...buckets.other], 4, `Follow ${safeDomainLabel} operational standards`).map(i => `- ${i}`),
+    ].join('\n');
+
+    // Step D — shape-specific body sections, emitting exactly the anchors scoreOutput() rewards
+    let shapeBody = '';
+
+    if (activeCodexShape === 'execute') {
+      const workflowItems = buckets.workflow.length >= 3
+        ? buckets.workflow.slice(0, 8)
+        : fill([...buckets.workflow, ...buckets.constraints], 5, `Complete ${safeDomainLabel} task step`);
+      const antiPatternItems = fill([...buckets.antiPatterns], 4, 'Avoid shortcuts that skip validation');
+      const finalCheckItems = fill([...buckets.constraints.slice(3), ...buckets.other], 3, `Verify output meets ${safeDomainLabel} standard`);
+
+      shapeBody = [
+        '## Implementation Workflow',
+        ...workflowItems.map((s, i) => `${i + 1}. ${s}`),
+        '',
+        '## Common Mistakes to Avoid',
+        ...antiPatternItems.map(i => `- **Don't:** ${i}`),
+        '',
+        '## Final Checks',
+        ...finalCheckItems.map((s, i) => `${i + 1}. ${s}`),
+      ].join('\n');
+
+    } else if (activeCodexShape === 'expertise') {
+      const reviewItems = buckets.workflow.length >= 3
+        ? buckets.workflow.slice(0, 6)
+        : fill([...buckets.workflow, ...buckets.constraints], 4, `Evaluate ${safeDomainLabel} output`);
+      const judgmentItems = fill([...buckets.constraints, ...buckets.other], 3, `Apply ${safeDomainLabel} quality criteria`);
+      const pauseItems = buckets.escalate.length > 0
+        ? buckets.escalate.slice(0, 4)
+        : fill([...buckets.other], 3, 'Pause when intent or scope is ambiguous');
+
+      shapeBody = [
+        '## Review Workflow',
+        ...reviewItems.map((s, i) => `${i + 1}. ${s}`),
+        '',
+        '## Judgment Framework',
+        ...judgmentItems.map(i => `- ${i}`),
+        '',
+        '## When to Pause for Human',
+        ...pauseItems.map(i => `- ${i}`),
+      ].join('\n');
+
+    } else {
+      // specialist
+      const doesItems     = fill([...buckets.constraints, ...buckets.other], 4, `Perform ${safeDomainLabel} analysis`);
+      const doesNotItems  = fill([...buckets.refuse, ...buckets.antiPatterns], 3, `Out-of-scope ${safeDomainLabel} requests`);
+      const autonomousItems = fill(buckets.constraints.slice(0, 3), 2, `Standard ${safeDomainLabel} operations with clear scope`);
+      const escalateItems = fill([...buckets.escalate], 2, 'Decisions with legal, financial, or compliance impact');
+      const refuseItems   = fill([...buckets.refuse], 2, `Requests outside defined ${safeDomainLabel} boundaries`);
+      const workflowItems = buckets.workflow.length >= 2
+        ? buckets.workflow.slice(0, 6)
+        : fill([...buckets.workflow, ...buckets.constraints], 4, `Execute ${safeDomainLabel} procedure`);
+
+      shapeBody = [
+        '## Scope Boundaries',
+        '**This role DOES:**',
+        ...doesItems.map(i => `- ${i}`),
+        '**This role does NOT:**',
+        ...doesNotItems.map(i => `- ${i}`),
+        '',
+        '## Operating Mode',
+        `**Autonomous:** ${autonomousItems.join('; ')}`,
+        `**Escalate:** ${escalateItems.join('; ')}`,
+        `**Refuse:** ${refuseItems.join('; ')}`,
+        '',
+        '## Workflow',
+        ...workflowItems.map((s, i) => `${i + 1}. ${s}`),
+      ].join('\n');
+    }
+
+    // Step E — final assembly (format identical to what sanitize('CODEX') expects)
+    return [
+      '---',
+      `name: ${codexSlug}`,
+      `description: "${safeDesc}"`,
+      '---',
+      '',
+      activationSection,
+      '',
+      shapeBody,
+      '',
+      principlesSection,
+    ].join('\n');
+  }
+
+  // Primary path — byte-identical to original
   if (finalRawText) {
     return res.status(200).json({
       enriched: sanitize(finalRawText, activeTarget === 'codex' ? codexSlug : skillName, effectiveTemplate),
       model: successfulModel
     });
-  } else {
-    return res.status(503).json({
-      error: 'GOOGLE_API_ERROR',
-      message: `Enrichment failed. Details: ${lastGoogleError}`
+  }
+
+  // v2.4: Codex deterministic fallback — fires only when target === 'codex' AND all Gemini
+  // models failed. Passes through sanitize('CODEX') so shape-section injection and frontmatter
+  // enforcement fire identically to the primary path. Returns HTTP 200 with diagnostic signal.
+  // Claude target falls through to the 503 below — no safe local approximation exists for it.
+  if (activeTarget === 'codex') {
+    const fallbackRaw = buildCodexFallback();
+    return res.status(200).json({
+      enriched: sanitize(fallbackRaw, codexSlug, 'CODEX'),
+      model: 'deterministic-fallback',
+      fallbackReason: lastGoogleError,
     });
   }
+
+  // Claude target or unknown — 503 unchanged
+  return res.status(503).json({
+    error: 'GOOGLE_API_ERROR',
+    message: `Enrichment failed. Details: ${lastGoogleError}`
+  });
 };
