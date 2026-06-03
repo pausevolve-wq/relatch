@@ -25,6 +25,21 @@ module.exports = async function handler(req, res) {
   const { rawText, category, fileName, domainLabel, domainRole, domainFrame, template, richFormats, charCap, sizeClass, target = 'claude', codexShape = 'execute' } = req.body;
   if (!rawText || !category || !fileName) return res.status(400).json({ error: 'Missing required fields' });
 
+  const CODEX_POLICY = {
+    timeouts: {
+      model1: { small: 25000, medium: 25000, large: 35000 },
+      model2: { small: 20000, medium: 20000, large: 18000 },
+    },
+    tokenBudgets: {
+      small:  { lite: 1000, flash: 1000 },
+      medium: { lite: 1400, flash: 1200 },
+      large:  { lite: 1800, flash: 1400 },
+    },
+    qualityThresholds: { lite: 6, flash: 4 },
+    model2ReserveMs: 8000,
+  };
+  const requestStartMs = Date.now();
+
   const processedText = rawText.length > 15000 ? rawText.slice(0, 15000) : rawText;
 
   // UNCHANGED — exact same validation logic as before
@@ -955,8 +970,8 @@ ${textToSend}`;
     // model 2 runs, the budget is lower (1400 tokens) and remaining Vercel time is used.
     // Total ceiling: large = 35+18 = 53s, small/medium = 25+20 = 45s. Both < 60s limit.
     const perModelTimeoutMs = modelIndex === 0
-      ? (effectiveSizeClass === 'large' ? 35000 : 25000)
-      : (effectiveSizeClass === 'large' ? 18000 : 20000);
+      ? (CODEX_POLICY.timeouts.model1[effectiveSizeClass] ?? 25000)
+      : (CODEX_POLICY.timeouts.model2[effectiveSizeClass] ?? 20000);
     const timeoutId = setTimeout(() => controller.abort(), perModelTimeoutMs);
 
     // V2 ADAPTIVE: per-model output token budget driven by sizeClass.
@@ -965,6 +980,17 @@ ${textToSend}`;
     const outputTokenBudget = modelIndex === 0
       ? budgetForSize.lite
       : budgetForSize.flash;
+
+    // Codex-only: skip model 2 if insufficient time remains for a useful response.
+    // Prevents spending the last few seconds on a weak attempt likely to timeout.
+    if (activeTarget === 'codex' && modelIndex > 0) {
+      const remainingMs = 58000 - (Date.now() - requestStartMs);
+      if (remainingMs < CODEX_POLICY.model2ReserveMs) {
+        clearTimeout(timeoutId);
+        lastGoogleError = `timeout_model_2 (skipped: only ${Math.round(remainingMs / 1000)}s remaining)`;
+        break;
+      }
+    }
 
     try {
       const response = await fetch(
@@ -1002,7 +1028,7 @@ ${textToSend}`;
       // V2: replaced old 2-condition check with template-aware quality scoring
       // Flash Lite (index 0) must score >= 6
       // Gemini 2.5 Flash (index 1) must score >= 4
-      const qualityThreshold = modelIndex === 0 ? 6 : 4;
+      const qualityThreshold = modelIndex === 0 ? CODEX_POLICY.qualityThresholds.lite : CODEX_POLICY.qualityThresholds.flash;
       if (scoreOutput(candidateText, effectiveTemplate, effectiveSizeClass) >= qualityThreshold) {
         finalRawText = candidateText;
         successfulModel = modelId;
@@ -1070,7 +1096,17 @@ ${textToSend}`;
     }
 
     // Step C — shared sections (all shapes)
-    const safeDesc = `Applies ${safeDomainLabel} ${focus} as an operational ${activeCodexShape} skill for ${safeDomainRole} contexts.`;
+    const triggerCandidates = signalLines
+      .filter(l => /\b(when|if you|run|apply|execute|review|refactor|deploy|create|generate|fix|build|validate|check)\b/i.test(l))
+      .slice(0, 4)
+      .map(l => l.replace(/^[-•*\d.)]+\s*/, '').trim().split(/[.!?]/)[0].trim())
+      .filter(l => l.length > 10 && l.length < 90);
+    const verbMap = { execute: 'Executes', expertise: 'Reviews', specialist: 'Applies' };
+    const actionVerb = verbMap[activeCodexShape] || 'Applies';
+    const triggerStr = triggerCandidates.length >= 2
+      ? triggerCandidates.slice(0, 2).join('; ').toLowerCase()
+      : `${safeDomainLabel} ${activeCodexShape} operations`;
+    const safeDesc = `${actionVerb} ${safeDomainLabel} procedures from source material. Activates when: ${triggerStr}. Does not apply to out-of-scope or ambiguous requests.`;
 
     const activationSection = [
       '## When to Activate',
@@ -1169,6 +1205,10 @@ ${textToSend}`;
       '',
       principlesSection,
     ].join('\n');
+  }
+
+  if (activeTarget === 'codex') {
+    console.log('[Codex]', { sizeClass: effectiveSizeClass, shape: activeCodexShape, outcome: finalRawText ? `model:${successfulModel}` : 'fallback', elapsed: Date.now() - requestStartMs });
   }
 
   // Primary path — byte-identical to original
