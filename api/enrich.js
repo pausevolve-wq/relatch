@@ -948,9 +948,15 @@ ${textToSend}`;
   for (const modelId of modelList) {
     const controller = new AbortController();
 
-    // Per-model timeout split so both models together stay under Vercel's 60s wall.
-    // Model 0: 25s (primary), Model 1: 20s (fallback). Total ceiling: 45s < 60s limit.
-    const perModelTimeoutMs = modelIndex === 0 ? 25000 : 20000;
+    // Timeouts are sizeClass-aware so large-doc generation (1800 token output budget)
+    // is not killed mid-stream. At Gemini's degraded throughput floor (~55 tok/s),
+    // 1800 tokens takes ~33s + ~5s overhead = ~38s. Model 1 on large gets 35s (covers
+    // the vast majority of degraded cases). Model 2 always stays short — by the time
+    // model 2 runs, the budget is lower (1400 tokens) and remaining Vercel time is used.
+    // Total ceiling: large = 35+18 = 53s, small/medium = 25+20 = 45s. Both < 60s limit.
+    const perModelTimeoutMs = modelIndex === 0
+      ? (effectiveSizeClass === 'large' ? 35000 : 25000)
+      : (effectiveSizeClass === 'large' ? 18000 : 20000);
     const timeoutId = setTimeout(() => controller.abort(), perModelTimeoutMs);
 
     // V2 ADAPTIVE: per-model output token budget driven by sizeClass.
@@ -1011,7 +1017,7 @@ ${textToSend}`;
     } catch (err) {
       clearTimeout(timeoutId);
       // UNCHANGED — exact same error message logic as before
-      lastGoogleError = err.name === 'AbortError' ? 'Timeout: Model took too long (45s)' : `Fetch Error: ${err.message}`;
+      lastGoogleError = err.name === 'AbortError' ? `Timeout: Model took too long (${perModelTimeoutMs / 1000}s)` : `Fetch Error: ${err.message}`;
       modelIndex++;
       continue;
     }
