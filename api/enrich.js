@@ -213,6 +213,28 @@ module.exports = async function handler(req, res) {
     // v2.1: Codex scoring path — closes over activeCodexShape (declared in handler scope).
     // v2.2: three shape-aware branches with different required anchors and component bonuses.
     // All return 0-9 to match the Claude scoring scale used by the qualityThreshold gate.
+
+    // Template E: Structured financial data scoring
+    if (tmpl === 'E') {
+      let score = 0;
+      // +2: required anchors present
+      if (text.includes('## Data Scope') && text.includes('## Key Metrics')) score += 2;
+      // +2: YAML frontmatter intact
+      if (text.includes('name:') && text.includes('domain:')) score += 2;
+      // +1: Core Entities present
+      if (text.includes('## Core Entities')) score += 1;
+      // +1: table structure (explicitly requested for E)
+      if (text.includes('|')) score += 1;
+      // +1: Decision Rules or Quality Bar present
+      if (text.includes('## Decision Rules') || text.includes('## Quality Bar')) score += 1;
+      // +1: length floor (scales with sizeClass)
+      const eFloor = docSizeClass === 'large' ? 900 : docSizeClass === 'medium' ? 600 : 400;
+      if (text.length >= eFloor) score += 1;
+      // +1: not all conditional sections are "Not present in source" (capped at 4 allowed)
+      if ((text.split('Not present in source').length - 1) <= 4) score += 1;
+      return Math.min(score, 9);
+    }
+
     if (tmpl === 'CODEX') {
       let score = 0;
 
@@ -436,7 +458,7 @@ Markdown table with concrete conditions:
 ANTI-HALLUCINATION RULE: every row must map to a condition explicitly present in the source. If the source yields fewer than 4 distinguishable conditions, provide fewer rows rather than fabricating. Use "Yes" / "No" / "If unclear" in the Escalate column. Each action must be concrete (name a file, command, or output), not a vague directive.
 
 ## Templates
-SKIP ENTIRELY unless you can identify at least one reusable, fill-in-the-blank structure directly in the source. If it exists, render it with `[PLACEHOLDER]` markers. Do NOT synthesize templates from general domain knowledge — only extract them from what the source actually provides.
+SKIP ENTIRELY unless you can identify at least one reusable, fill-in-the-blank structure directly in the source. If it exists, render it with \`[PLACEHOLDER]\` markers. Do NOT synthesize templates from general domain knowledge — only extract them from what the source actually provides.
 
 ## Escalation Rules
 3-5 specific cases when Codex must surface to a human. Each rule names a concrete trigger, not a vague category.
@@ -665,6 +687,68 @@ Otherwise use bullets. Domain-specific rules only — no generic professional ad
 CONTENT:
 ${textToSend}`;
 
+  } else if (activeTemplate === 'E') {
+    // ── TEMPLATE E: Structured Financial Data ────────────────────────────────────
+    // Purpose-built for CSVs, spreadsheet exports, and numeric-dense financial tables.
+    // Extracts schema, metrics, and analytical logic — NOT generic finance advice.
+    // Conditional sections must be skipped when source does not contain them.
+    prompt = `${documentContext}You are a Financial Data Intelligence Engine. Analyze the provided structured financial data (CSV exports, spreadsheet rows, financial tables, budget models, KPI dashboards) and extract the schema, metrics, assumptions, and analytical logic into a Claude Skill File.
+
+DO NOT produce generic financial advice. Extract ONLY what is actually present in the source data.
+DO NOT invent metrics, assumptions, scenarios, or rules that are not grounded in the source.
+Focus on: ${focus}
+Domain: ${safeDomainLabel}
+
+RULES:
+- Prefer TABLES and matrices over prose whenever the source has column/row structure.
+- Use bullet lists for assumptions, controls, and exceptions.
+- Use flowcharts ONLY when the source has real conditional branching paths.
+- For every CONDITIONAL section below: if the source has no clear signal for it, write exactly "Not present in source." and nothing else for that section body.
+- You MUST start your response exactly with the YAML block below, no code fences, no backticks, no preamble.
+- You MUST enclose all YAML values in double quotes.
+- The "name" field MUST be exactly: "${skillName}"
+
+FORMAT:
+---
+name: "${skillName}"
+domain: "${safeDomainLabel}"
+content_type: "behavioral skill"
+use_cases: ["financial analysis", "data interpretation", "reporting"]
+---
+
+## Data Scope
+[What the dataset covers: time period, entities, geography, source system. What it can and cannot support analytically. 2-4 sentences grounded in the actual data.]
+
+## Core Entities
+[The main objects: accounts, line items, categories, periods, segments, columns, metrics. Use a TABLE with columns Entity | Type | Description if 3 or more entities exist with consistent attributes. Use bullets otherwise.]
+
+## Key Metrics
+[The financial measures and KPIs present. Use a TABLE with columns Metric | Unit | What It Represents if 3+ metrics exist. Include: percentages, ratios, totals, deltas, and any calculated fields visible in the source.]
+
+## Assumption Register
+[CONDITIONAL — implied definitions, formula dependencies, period conventions, sign conventions, or model assumptions embedded in the data. Use bullets. If none are detectable, write "Not present in source."]
+
+## Scenario Analysis
+[CONDITIONAL — base / actual / budget / forecast / upside / downside comparisons. Use a TABLE or matrix if multiple scenario columns exist. If no scenarios are present, write "Not present in source."]
+
+## Variance / Sensitivity Table
+[CONDITIONAL — what changes and what it affects. Use a TABLE if the source shows variance, delta, or change columns. If no variance data is present, write "Not present in source."]
+
+## Decision Rules
+[CONDITIONAL — numeric or condition-based rules that can be inferred from the data (thresholds, flags, tier criteria, approval limits). Use bullets or a TABLE with Condition | Action format. If no rules are detectable, write "Not present in source."]
+
+## Risk Controls
+[CONDITIONAL — validation points, reconciliation checks, sign conventions, data quality controls, or audit flags visible in the source. Use bullets. If not present, write "Not present in source."]
+
+## Exceptions
+[CONDITIONAL — outliers, missing values, unusual rows, ambiguous categories, or broken patterns in the data. Use bullets. If no anomalies are detectable, write "Not present in source."]
+
+## Quality Bar
+[3-4 concrete, dataset-specific checks: how to verify this extracted skill accurately represents the source data. Reference actual column names, metric names, or row counts from the source.]
+
+CONTENT:
+${textToSend}`;
+
   } else {
     // ── TEMPLATE A: Persona & Voice (default) ─────────────────────────────────
     // Original prompt preserved exactly, with enhanced format rules added before CONTENT
@@ -835,6 +919,7 @@ ${textToSend}`;
       B: '## Role & Capability',
       C: '## Domain Role',
       D: '## Domain Role',
+      E: '## Data Scope',
     };
     const anchor = templateAnchors[tmpl] || templateAnchors.A;
     if (!text.includes(anchor)) {
@@ -863,8 +948,10 @@ ${textToSend}`;
   for (const modelId of modelList) {
     const controller = new AbortController();
 
-    // UNCHANGED — exact same 45s timeout as before
-    const timeoutId = setTimeout(() => controller.abort(), 45000);
+    // Per-model timeout split so both models together stay under Vercel's 60s wall.
+    // Model 0: 25s (primary), Model 1: 20s (fallback). Total ceiling: 45s < 60s limit.
+    const perModelTimeoutMs = modelIndex === 0 ? 25000 : 20000;
+    const timeoutId = setTimeout(() => controller.abort(), perModelTimeoutMs);
 
     // V2 ADAPTIVE: per-model output token budget driven by sizeClass.
     // modelIndex 0 = Flash Lite (full window), modelIndex 1 = 2.5 Flash (fallback, capped lower).
@@ -890,12 +977,13 @@ ${textToSend}`;
 
       clearTimeout(timeoutId);
 
-      // UNCHANGED — exact same HTTP error handling as before
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
         lastGoogleError = `HTTP ${response.status}: ${errorData.error?.message || 'Unknown'}`;
 
-        if (response.status === 429 || response.status === 503 || response.status === 504) {
+        // Retry on transient failures only. 400/401/403/404 are configuration or
+        // request errors that won't be fixed by switching models.
+        if (response.status === 429 || response.status === 500 || response.status === 502 || response.status === 503 || response.status === 504) {
           modelIndex++;
           continue;
         }
