@@ -882,7 +882,30 @@ ${textToSend}`;
         }
         fm = kept.join('\n');
         if (!/^description:/m.test(fm)) {
-          fm += `\ndescription: ${skillName.replace(/-/g, ' ')} skill.`;
+          // Gemini omitted the description field. Instead of a generic placeholder,
+          // extract the trigger phrases Gemini already wrote in ## When to Activate
+          // / ### Must Use and construct a real 2-sentence description from them.
+          let resolvedDesc = null;
+          try {
+            const bodyText = text.slice(fmMatchCodex[0].length);
+            const mustUseBlock = bodyText.match(/###\s*Must Use\s*\n([\s\S]*?)(?=\n###|\n##|$)/i);
+            if (mustUseBlock) {
+              const triggers = mustUseBlock[1]
+                .split('\n')
+                .filter(l => /^\s*-\s*/.test(l))
+                .map(l => l.replace(/^\s*-\s*/, '').replace(/^["']|["']$/g, '').trim())
+                .filter(l => l.length > 5 && l.length < 90)
+                .slice(0, 3);
+              if (triggers.length >= 2) {
+                const verbMap = { execute: 'Executes', expertise: 'Reviews', specialist: 'Applies' };
+                const verb = verbMap[activeCodexShape] || 'Applies';
+                const domain = safeDomainLabel || skillName.replace(/-/g, ' ');
+                const trigStr = triggers.slice(0, 2).map(t => t.toLowerCase()).join('; ');
+                resolvedDesc = `${verb} ${domain} tasks from source material. Activates when: ${trigStr}. Does not apply to out-of-scope requests.`;
+              }
+            }
+          } catch (_) {}
+          fm += `\ndescription: "${(resolvedDesc || `${skillName.replace(/-/g, ' ')} skill.`).replace(/"/g, '\\"')}"`;
         }
         // Normalize description to a single-line quoted string so downstream regex
         // parsers (both frontend and Codex loader) never see indented continuations.
@@ -897,6 +920,7 @@ ${textToSend}`;
             .trim();
           fm = (beforeDesc ? beforeDesc + '\n' : '') + `description: "${descValue.replace(/"/g, '\\"')}"`;
         }
+        console.log('[Codex:desc]', fm.match(/^description:\s*(.+)$/m)?.[1]?.slice(0, 100) || '(none)');
         text = `---\n${fm.trim()}\n---` + text.slice(fmMatchCodex[0].length);
       }
       if (!text.includes('## When to Activate')) {
