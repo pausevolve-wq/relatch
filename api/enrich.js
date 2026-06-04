@@ -852,6 +852,17 @@ ${textToSend}`;
       if (yamlStartCodex > 0) text = text.slice(yamlStartCodex);
       if (!text.startsWith('---')) text = '---\n' + text;
 
+      // Gemini often writes an opening --- block without the closing ---.
+      // The fmMatchCodex regex below requires a closing --- to match at all.
+      // If the opening is present but the closing is absent, insert it
+      // immediately before the first ## section heading so the regex fires.
+      if (text.startsWith('---\n') && !/^---\n[\s\S]*?\n---/.test(text)) {
+        const headingIdx = text.indexOf('\n## ');
+        if (headingIdx > 4) {
+          text = text.slice(0, headingIdx) + '\n---' + text.slice(headingIdx);
+        }
+      }
+
       const fmMatchCodex = text.match(/^---\n([\s\S]*?)\n---/);
       if (fmMatchCodex) {
         let fm = fmMatchCodex[1];
@@ -923,6 +934,31 @@ ${textToSend}`;
         console.log('[Codex:desc]', fm.match(/^description:\s*(.+)$/m)?.[1]?.slice(0, 100) || '(none)');
         text = `---\n${fm.trim()}\n---` + text.slice(fmMatchCodex[0].length);
       }
+
+      // Safety net: if fmMatchCodex was still null after preprocessing (heading too close
+      // to opener, or no ## heading at all), inject a complete frontmatter directly.
+      // Extracts triggers from ### Must Use so the description is real, not a placeholder.
+      if (!fmMatchCodex) {
+        console.log('[Codex:desc]', '(fmMatch null after preprocessing — direct injection)');
+        let emergencyDesc = `${skillName.replace(/-/g, ' ')} skill.`;
+        try {
+          const mb = text.match(/###\s*Must Use\s*\n([\s\S]*?)(?=\n###|\n##|$)/i);
+          if (mb) {
+            const trig = mb[1].split('\n')
+              .filter(l => /^\s*-\s*/.test(l))
+              .map(l => l.replace(/^\s*-\s*/, '').replace(/^["']|["']$/g, '').trim())
+              .filter(l => l.length > 5 && l.length < 90)
+              .slice(0, 2);
+            if (trig.length >= 2) {
+              const v = ({ execute: 'Executes', expertise: 'Reviews', specialist: 'Applies' })[activeCodexShape] || 'Applies';
+              emergencyDesc = `${v} ${safeDomainLabel || skillName.replace(/-/g, ' ')} tasks. Activates when: ${trig.map(t => t.toLowerCase()).join('; ')}. Does not apply to out-of-scope requests.`;
+            }
+          }
+        } catch (_) {}
+        const bodyOnly = text.replace(/^---\n/, '').trim();
+        text = `---\nname: ${skillName}\ndescription: "${emergencyDesc.replace(/"/g, '\\"')}"\n---\n\n${bodyOnly}`;
+      }
+
       if (!text.includes('## When to Activate')) {
         text += '\n\n## When to Activate\n[Review source document and define activation contexts.]';
       }
