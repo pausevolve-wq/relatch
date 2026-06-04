@@ -861,11 +861,41 @@ ${textToSend}`;
           fm = `name: ${skillName}\n` + fm;
         }
         // Strip every non-spec YAML field — Codex frontmatter accepts ONLY name + description.
-        fm = fm.split('\n')
-          .filter(line => /^(name:|description:)/.test(line.trim()) || line.trim() === '')
-          .join('\n');
+        // Block-aware pass: preserves multi-line description continuation lines that the
+        // old line-by-line filter was silently dropping (causing the generic fallback to fire).
+        const fmLines = fm.split('\n');
+        const kept = [];
+        let inDescription = false;
+        for (const line of fmLines) {
+          const trimmed = line.trim();
+          if (/^name:/.test(trimmed)) {
+            inDescription = false;
+            kept.push(line);
+          } else if (/^description:/.test(trimmed)) {
+            inDescription = true;
+            kept.push(line);
+          } else if (inDescription && (line.startsWith('  ') || line.startsWith('\t'))) {
+            kept.push(line);
+          } else {
+            inDescription = false;
+          }
+        }
+        fm = kept.join('\n');
         if (!/^description:/m.test(fm)) {
           fm += `\ndescription: ${skillName.replace(/-/g, ' ')} skill.`;
+        }
+        // Normalize description to a single-line quoted string so downstream regex
+        // parsers (both frontend and Codex loader) never see indented continuations.
+        const descIdx = fm.search(/^description:/m);
+        if (descIdx !== -1) {
+          const beforeDesc = fm.slice(0, descIdx).replace(/\n+$/, '');
+          const descValue = fm.slice(descIdx)
+            .replace(/^description:\s*/m, '')
+            .replace(/^["']|["']$/g, '')
+            .replace(/\n\s*/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+          fm = (beforeDesc ? beforeDesc + '\n' : '') + `description: "${descValue.replace(/"/g, '\\"')}"`;
         }
         text = `---\n${fm.trim()}\n---` + text.slice(fmMatchCodex[0].length);
       }
