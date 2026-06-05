@@ -1,4 +1,5 @@
-const { verifyToken } = require('@clerk/backend');
+const { verifyToken, createClerkClient } = require('@clerk/backend');
+const clerkClient = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
 
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', 'https://app.relatch.online');
@@ -12,8 +13,11 @@ module.exports = async function handler(req, res) {
   if (!authHeader?.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
+  let userId;
   try {
-    await verifyToken(authHeader.slice(7), { secretKey: process.env.CLERK_SECRET_KEY });
+    const payload = await verifyToken(authHeader.slice(7), { secretKey: process.env.CLERK_SECRET_KEY });
+    userId = payload.sub;
+    if (!userId) throw new Error('No userId in token');
   } catch {
     return res.status(401).json({ error: 'Invalid session' });
   }
@@ -22,7 +26,7 @@ module.exports = async function handler(req, res) {
   // Old fields remain exactly the same — backward compatible if frontend hasn't updated yet
   // richFormats: consumed by Claude prompt templates only. Codex path uses codexSourceHint
   // pre-scan (v2.2.1) for dynamic structure detection — intentionally unused on Codex path.
-  const { rawText, category, fileName, domainLabel, domainRole, domainFrame, template, richFormats, charCap, sizeClass, target = 'claude', codexShape = 'execute' } = req.body;
+  const { rawText, category, fileName, domainLabel, domainRole, domainFrame, template, richFormats, charCap, sizeClass, target = 'claude', codexShape = 'execute', sessionId } = req.body;
   if (!rawText || !category || !fileName) return res.status(400).json({ error: 'Missing required fields' });
 
   const CODEX_POLICY = {
@@ -39,6 +43,74 @@ module.exports = async function handler(req, res) {
     model2ReserveMs: 8000,
   };
   const requestStartMs = Date.now();
+
+  // ─── QUOTA GATE ──────────────────────────────────────────────────────────────
+  const DAILY_LIMIT  = 5;
+  const WEEKLY_LIMIT = 35;
+
+  function getDateKey(now) {
+    return now.toISOString().slice(0, 10);
+  }
+
+  function getIsoWeekKey(date) {
+    const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+    const dayNum = d.getUTCDay() || 7;
+    d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+    const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+    const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+    return `${d.getUTCFullYear()}-W${String(weekNo).padStart(2, '0')}`;
+  }
+
+  let quotaUsage = null;
+  let quotaUser  = null;
+
+  try {
+    quotaUser = await clerkClient.users.getUser(userId);
+    const now = new Date();
+    const currentDayKey  = getDateKey(now);
+    const currentWeekKey = getIsoWeekKey(now);
+
+    const stored = quotaUser.privateMetadata?.relatchUsage ?? {};
+    quotaUsage = {
+      dailyCount:    stored.dailyCount    ?? 0,
+      weeklyCount:   stored.weeklyCount   ?? 0,
+      lastDayKey:    stored.lastDayKey    ?? currentDayKey,
+      lastWeekKey:   stored.lastWeekKey   ?? currentWeekKey,
+      lastSessionId: stored.lastSessionId ?? null,
+    };
+
+    if (quotaUsage.lastDayKey !== currentDayKey) {
+      quotaUsage.dailyCount = 0;
+      quotaUsage.lastDayKey = currentDayKey;
+    }
+
+    if (quotaUsage.lastWeekKey !== currentWeekKey) {
+      quotaUsage.weeklyCount = 0;
+      quotaUsage.lastWeekKey = currentWeekKey;
+    }
+
+    const isSameSession = sessionId && quotaUsage.lastSessionId === sessionId;
+
+    if (!isSameSession) {
+      if (quotaUsage.dailyCount >= DAILY_LIMIT || quotaUsage.weeklyCount >= WEEKLY_LIMIT) {
+        const limitType  = quotaUsage.dailyCount >= DAILY_LIMIT ? 'daily' : 'weekly';
+        const limitValue = limitType === 'daily' ? DAILY_LIMIT : WEEKLY_LIMIT;
+        return res.status(429).json({
+          error: 'QUOTA_REACHED',
+          limitType,
+          limitValue,
+          weeklyCount: quotaUsage.weeklyCount,
+          weeklyLimit: WEEKLY_LIMIT,
+          message: `You have used all ${limitValue} free generations for this ${limitType === 'daily' ? 'day' : 'week'}. Your quota resets automatically ${limitType === 'daily' ? 'tomorrow' : 'next week'}.`,
+        });
+      }
+    }
+  } catch (quotaErr) {
+    console.error('[quota] Clerk read failed:', quotaErr?.message || quotaErr);
+    quotaUsage = null;
+    quotaUser  = null;
+  }
+  // ─── END QUOTA GATE ──────────────────────────────────────────────────────────
 
   const processedText = rawText.length > 15000 ? rawText.slice(0, 15000) : rawText;
 
@@ -1313,12 +1385,27 @@ ${textToSend}`;
     console.log('[Codex]', { sizeClass: effectiveSizeClass, shape: activeCodexShape, outcome: finalRawText ? `model:${successfulModel}` : 'fallback', elapsed: Date.now() - requestStartMs });
   }
 
-  // Primary path — byte-identical to original
+  // Primary path — Gemini model succeeded; count the generation and respond.
   if (finalRawText) {
-    return res.status(200).json({
-      enriched: sanitize(finalRawText, activeTarget === 'codex' ? codexSlug : skillName, effectiveTemplate),
-      model: successfulModel
-    });
+    const enrichedOutput = sanitize(finalRawText, activeTarget === 'codex' ? codexSlug : skillName, effectiveTemplate);
+
+    if (quotaUsage && quotaUser) {
+      try {
+        const isSameSession = sessionId && quotaUsage.lastSessionId === sessionId;
+        if (!isSameSession) {
+          quotaUsage.dailyCount  += 1;
+          quotaUsage.weeklyCount += 1;
+          if (sessionId) quotaUsage.lastSessionId = sessionId;
+        }
+        await clerkClient.users.updateUserMetadata(userId, {
+          privateMetadata: { relatchUsage: quotaUsage },
+        });
+      } catch (writeErr) {
+        console.error('[quota] Clerk write failed:', writeErr?.message || writeErr);
+      }
+    }
+
+    return res.status(200).json({ enriched: enrichedOutput, model: successfulModel });
   }
 
   // v2.4: Codex deterministic fallback — fires only when target === 'codex' AND all Gemini
