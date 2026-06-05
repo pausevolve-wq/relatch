@@ -62,8 +62,10 @@ module.exports = async function handler(req, res) {
   // exactly as before. v2.2.1 adds a Codex-only branch that preserves code-shaped
   // lines (declarations, control flow, syntax-marker chars, comments) — these have
   // no digits / no action verbs / no colons and would otherwise be dropped, hurting
-  // EXECUTE-shape output on code-heavy sources. The added clause is gated on
-  // `target === 'codex'` so the Claude filter behavior is byte-for-byte identical.
+  // EXECUTE-shape output on code-heavy sources. v2.3 (Template B) adds an identical
+  // clause for the Claude path when template === 'B' so structural code lines survive
+  // the filter and reach the Codebase Intelligence prompt. Uses `template` (from
+  // req.body, line 25) rather than `activeTemplate` which is not yet in scope here.
   const allLines = rawText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
   const signalLines = allLines.filter(line =>
     line.length > 20 && (
@@ -73,6 +75,11 @@ module.exports = async function handler(req, res) {
       /^[-•*#>]/.test(line) ||
       /^(\d+[.)]\s|#{1,3}\s)/.test(line) ||
       line.endsWith('.') || line.endsWith('!') || line.endsWith('?') ||
+      (template === 'B' && target !== 'codex' && (
+        /^\s*(const|let|var|function|class|interface|type|import|export|async|await|return|def|fn|fun|impl|use|struct|enum|trait|public|private|protected)\b/.test(line) ||
+        /[{};]|=>|::/.test(line) ||
+        /^\s*(\/\/|\/\*|\*\s)/.test(line)
+      )) ||
       (target === 'codex' && (
         /^\s*(const|let|var|function|class|interface|type|import|export|async|await|return|def|fn|fun|impl|use|struct|enum|trait|public|private|protected|namespace|module|require|template|throw|throws|try|catch|finally|new|this|super|extends|implements|abstract|static|virtual)\b/.test(line) ||
         /[{};]|=>|::|->/.test(line) ||
@@ -301,7 +308,7 @@ module.exports = async function handler(req, res) {
     // +2: Required sections present (hard requirement)
     const requiredSections = {
       A: ['## Identity & Role', '## Voice & Language'],
-      B: ['## Role & Capability', '## Example Patterns'],
+      B: ['## Role & Capability', '## Example Patterns', '## What to Always Write'],
       C: ['## Domain Role', '## Decision Process'],
       D: ['## Domain Role', '## Decision Framework'],
     };
@@ -537,58 +544,63 @@ ${textToSend}`;
     }
 
   } else if (activeTemplate === 'B') {
-    // ── TEMPLATE B: Code & Technical ──────────────────────────────────────────
-    prompt = `${documentContext}You are a Code Pattern Extraction Engine. Analyze the provided code or technical content and extract the developer's patterns, conventions, and architectural decisions into a Claude Skill File. Do not summarize — extract the actual behavioral DNA of how this developer writes code.
+    // ── TEMPLATE B: Codebase Intelligence ──────────────────────────────────────
+    prompt = `${documentContext}You are a Codebase Intelligence Engine. Analyze the provided source code and extract the architectural patterns, conventions, and structural decisions into a Claude Skill File. Do not summarize — extract the behavioral and structural DNA of how this codebase is built.
 Focus on: ${focus}
 Domain: Software Engineering
 Role: ${safeDomainRole}
 
 RULES:
-- Extract ACTUAL patterns visible in the code — never invent patterns not present in source.
-- Identify naming conventions, async style, error handling approach, file structure habits.
-- NEVER copy-paste raw code lines — identify the PATTERN they represent.
+- Extract ACTUAL patterns visible in the source — never invent patterns not present.
+- Identify naming conventions, async style, error handling, typing discipline, import structure, and component/module boundaries.
+- Extract architectural decisions: what the code does and does not do, and what that implies.
+- NEVER copy-paste raw code lines — identify the PATTERN they represent, then show one canonical example.
 - You MUST start your response exactly with the YAML block below, no code fences, no backticks, no preamble.
 - You MUST enclose all YAML values in double quotes.
 - The "name" field MUST be exactly: "${skillName}"
-- Use "software engineering" for the "domain" field by default, but if the content clearly belongs to a different domain, replace it with the most accurate domain instead.
+- Use "software engineering" for the "domain" field unless the source clearly belongs to a different technical domain.
 
 FORMAT:
 ---
 name: "${skillName}"
 domain: "software engineering"
 content_type: "behavioral skill"
-use_cases: ["code generation", "code review", "technical writing"]
+use_cases: ["code generation", "code review", "refactoring", "architecture alignment"]
 ---
 
 ## Role & Capability
-[2 sentences. What kind of developer Claude becomes. Be specific to this codebase's patterns.]
+[2 sentences. What kind of developer Claude becomes when using this skill. Name the language, framework, or domain visible in the source. Be specific — not "a skilled developer" but "a React/TypeScript engineer who uses hook-based state and async/await throughout."]
 
-## Code Patterns & Conventions
-[Use a markdown TABLE with columns Pattern | This Codebase's Approach if 3 or more patterns
-exist with consistent attributes. Otherwise use structured bullets.
-Cover: naming conventions, async style, error handling, typing, imports.]
+## Codebase Conventions
+[Use a markdown TABLE with columns Pattern | This Codebase's Approach when 3 or more patterns exist with consistent attributes. Otherwise use structured bullets.
+Cover as many of these as the source supports: naming conventions, async style, error handling, typing approach, import organization, component/function structure, state management style.
+Extract only what is visible — skip any row where the source provides no signal.]
 
-## Architecture Decisions
-[Use an ASCII flowchart inside a triple-backtick codeblock ONLY if the source shows
-branching logic or decision trees. Use prose if source describes architectural philosophy.
-Format for flowchart: plain ASCII with → ↓ ├── └── characters only.]
+## Architecture & Structure
+[Describe what architectural decisions are visible in the source. What does the code clearly commit to? What does it deliberately avoid?
+Use an ASCII flowchart inside a triple-backtick code fence ONLY if the source shows real branching logic or data flow between modules. Use prose if the source describes architectural philosophy or module boundaries without branching.
+Format for flowchart: plain ASCII with → ↓ ├── └── characters only. No boxes or decorative borders.]
 
 ## What to Always Write
-[5 specific coding behaviors extracted from source. Start each with an action verb.]
+[5 to 7 specific coding behaviors extracted directly from the source. Start each with an action verb. Every item must be grounded in something visible in the source — not generic software advice.]
 
 ## What to Never Write
-[4 antipatterns visible in or clearly avoided by the source. Start each with "Never".]
+[4 to 5 anti-patterns that are visibly absent from or actively avoided by the source. Start each with "Never". Every item must be specific to this codebase's choices — not generic best practices.]
 
 ## Example Patterns
-[ALWAYS include at least one triple-backtick code block here showing a preferred pattern.
-Use the actual language from the source. Add the language name after the opening backticks.
-Example: \`\`\`typescript
-// preferred pattern here
-\`\`\`
-Base this on actual code from the source — do not fabricate.]
+[ALWAYS include at least one triple-backtick code block showing a canonical pattern extracted from the source.
+Use the actual language from the source. Add the language tag after the opening backticks (e.g. \`\`\`typescript).
+If the source shows multiple distinct patterns worth preserving, show up to 3 blocks.
+Each block must represent a reusable pattern, not a one-off snippet. Add a one-line comment above the block explaining what pattern it demonstrates.
+Base every block on actual code from the source — do not fabricate.]
+
+## Dependency Intelligence
+[If the source reveals which libraries, frameworks, or external tools are in use, list them here as a TABLE with columns Library | Role in This Codebase.
+If fewer than 3 are identifiable from the source, use a brief bullet list instead.
+Skip this section entirely if the source gives no signal about dependencies — write exactly "Not present in source." and nothing else.]
 
 ## Quality Bar
-[How to know the code output matches this developer's exact style and conventions.]
+[3 to 4 concrete, codebase-specific checks for knowing output matches this developer's exact style. Do not use generic phrases. Reference the actual conventions extracted above.]
 
 CONTENT:
 ${textToSend}`;
