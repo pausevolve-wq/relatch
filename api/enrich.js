@@ -895,6 +895,7 @@ RULES:
 - You MUST enclose all YAML values in double quotes.
 - The "name" field MUST be exactly: "${skillName}"
 - Use "${safeDomainLabel}" for the "domain" field by default. Per the rule above, if the text is clearly not about the Suggested Domain, replace it with the most accurate domain instead.
+- NEVER skip ## Identity & Role under any circumstance. For instructional, pedagogical, or reference documents where no personal author voice is present, define the professional role Claude takes on: name the domain, the output type, and the primary behavioral constraint this skill enforces.
 
 ANTI-ABSTRACTION RULE: Before writing any bullet or principle, ask: "Could this apply to most other authors in this domain?" If yes — discard it and go deeper into the source until you find what is unique.
 
