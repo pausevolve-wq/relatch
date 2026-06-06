@@ -147,6 +147,16 @@ module.exports = async function handler(req, res) {
       /^[-•*#>]/.test(line) ||
       /^(\d+[.)]\s|#{1,3}\s)/.test(line) ||
       line.endsWith('.') || line.endsWith('!') || line.endsWith('?') ||
+      // ─── v2.4 (Template A): Persona-signal clause ────────────────────────────
+      // Captures structural habit descriptors and voice marker lines that carry
+      // none of the standard filter signals (no digits, action verbs, colons, or
+      // terminal punctuation). These are the primary evidence for ## Signature
+      // Patterns extraction. Gate: A + claude path only.
+      // Uses `template` from req.body (line 29), NOT `activeTemplate` (temporal dead zone).
+      (template === 'A' && target !== 'codex' && (
+        /\b(tone|voice|style|pattern|habit|rhythm|vocabulary|phrasing|phrase|structure|framework|principle|belief|value|tendency|emphasis|contrast|inversion|compression|aphorism|metaphor|narrative|persona|trait|characteristic|approach|method|technique|rhetoric|argument|logic|reasoning|analysis|observation|insight|analogy|cadence)\b/i.test(line)
+      )) ||
+      // ─────────────────────────────────────────────────────────────────────────
       (template === 'B' && target !== 'codex' && (
         /^\s*(const|let|var|function|class|interface|type|import|export|async|await|return|def|fn|fun|impl|use|struct|enum|trait|public|private|protected)\b/.test(line) ||
         /[{};]|=>|::/.test(line) ||
@@ -370,19 +380,27 @@ module.exports = async function handler(req, res) {
     // Small floors are identical to legacy values — no regression on small documents.
     // Medium ~1.5× small; large ~2.3× small — matches the per-sizeClass token budgets.
     const lengthFloors = {
-      small:  { A: 600,  B: 500,  C: 500,  D: 700  },
-      medium: { A: 900,  B: 800,  C: 800,  D: 1000 },
-      large:  { A: 1400, B: 1200, C: 1200, D: 1600 },
+      // v2.4: Template A floors raised to account for two new sections
+      // (## Decision Frameworks, ## Signature Patterns) and the Evidence
+      // format in Core Principles. B/C/D floors unchanged.
+      small:  { A: 700,  B: 500,  C: 500,  D: 700  },
+      medium: { A: 1100, B: 800,  C: 800,  D: 1000 },
+      large:  { A: 1600, B: 1200, C: 1200, D: 1600 },
     };
     const floorMap = lengthFloors[docSizeClass] || lengthFloors.small;
     if (text.length >= (floorMap[tmpl] || 600)) score += 2;
 
     // +2: Required sections present (hard requirement)
     const requiredSections = {
-      A: ['## Identity & Role', '## Voice & Language'],
-      B: ['## Role & Capability', '## Example Patterns', '## What to Always Write'],
-      C: ['## Domain Role', '## Decision Process'],
-      D: ['## Domain Role', '## Decision Framework'],
+      // v2.4: Template A raised from 2 to 4 required anchors.
+      // ## Signature Patterns forces uniqueness extraction — hardest to fake generically.
+      // ## What to Always Do forces source-grounded behavioral specificity.
+      // ## Voice & Language table is now required (not just present as prose).
+      // ## Identity & Role retained — it is also the sanitize() anchor, must be first.
+      A: ['## Identity & Role', '## Signature Patterns', '## Voice & Language', '## What to Always Do'],
+      B: ['## Role & Capability', '## Example Patterns', '## What to Always Write'],  // unchanged
+      C: ['## Domain Role', '## Decision Process'],  // unchanged
+      D: ['## Domain Role', '## Decision Framework'],  // unchanged
     };
     const required = requiredSections[tmpl] || requiredSections.A;
     if (required.every(s => text.includes(s))) score += 2;
@@ -417,8 +435,13 @@ module.exports = async function handler(req, res) {
     } else if (tmpl === 'B') {
       if (text.includes('```')) score += 1;
     } else {
-      // Template A — no rich format requirement, award the point freely
-      score += 1;
+      // Template A V2: require Voice & Language table or at least one Example block.
+      // The V2 prompt instructs a TABLE for ## Voice & Language — this soft check rewards
+      // compliance. > **Example:** block also earns the point for sparse sources.
+      // Still a SOFT check — failing drops score by 1 but does not block passing.
+      if (text.includes('| Element |') || text.includes('| Tone |') || text.includes('| Sentence') || text.includes('> **Example:')) {
+        score += 1;
+      }
     }
 
     return score;
@@ -849,69 +872,108 @@ CONTENT:
 ${textToSend}`;
 
   } else {
-    // ── TEMPLATE A: Persona & Voice (default) ─────────────────────────────────
-    // Original prompt preserved exactly, with enhanced format rules added before CONTENT
-    prompt = `${documentContext}You are a Persona Simulation Engine. Do not act like an AI summarizing a text. Instead, analyze the Tonal DNA of the provided content and generate a Claude Skill File that perfectly mimics the author's voice, constraints, and structural habits.
+    // ── TEMPLATE A V2: Persona Intelligence (default) ─────────────────────────
+    // v2.4: Full rewrite. Philosophy shift: from persona simulation to persona
+    // intelligence. Adds: Decision Frameworks section, Signature Patterns section,
+    // evidence requirement in Core Principles, anti-abstraction rule throughout,
+    // Voice & Language upgraded to structured table format.
+    // Backward compatible: YAML schema (name, domain, content_type, use_cases) unchanged.
+    // sanitize() anchor (## Identity & Role) unchanged.
+    prompt = `${documentContext}You are a Persona Intelligence Engine. Do not summarize this person. Reverse-engineer their operating system.
+
+Analyze the provided content and extract the author's decision-making frameworks, signature behavioral patterns, voice mechanics, and thinking architecture into a Claude Skill File. The goal is not to describe the person — it is to build an operational model of how they think, decide, communicate, and create.
 Focus on: ${focus}
 Suggested Domain: ${safeDomainLabel}
 Suggested Role: ${safeDomainRole}
 
 RULES:
 - Identify the actual domain of the text. If the text is clearly not about the Suggested Domain, you MUST ignore the suggestion and define the most accurate domain yourself.
-- Extract Signature Moves (recurring phrases, punctuation habits, structural patterns).
-- NEVER copy-paste raw lines. Synthesize the core behavioral patterns.
+- Extract OBSERVABLE, SPECIFIC patterns only. Every principle must be grounded in evidence visible in the source.
+- NEVER write generic content. "Focus on users", "Think long term", "Communicate clearly" are rejectable output — they could apply to any professional.
+- NEVER copy-paste raw lines. Synthesize the behavioral architecture behind them.
 - You MUST start your response exactly with the YAML block below, no code fences, no backticks, no preamble.
 - You MUST enclose all YAML values in double quotes.
 - The "name" field MUST be exactly: "${skillName}"
 - Use "${safeDomainLabel}" for the "domain" field by default. Per the rule above, if the text is clearly not about the Suggested Domain, replace it with the most accurate domain instead.
+
+ANTI-ABSTRACTION RULE: Before writing any bullet or principle, ask: "Could this apply to most other authors in this domain?" If yes — discard it and go deeper into the source until you find what is unique.
 
 FORMAT:
 ---
 name: "${skillName}"
 domain: "${safeDomainLabel}"
 content_type: "behavioral skill"
-use_cases: ["case 1", "case 2"]
+use_cases: ["case 1", "case 2", "case 3"]
 ---
 
 ## Identity & Role
-[2 sentences. Who Claude becomes. Use the tone of the original author. Be highly specific.]
+[2 sentences. Who Claude becomes when using this skill. Use the specific vocabulary and tone of this author — not a description of them, but a precise definition of the role they occupy. Name the actual domain, the actual output type, and the most distinctive behavioral constraint. Not "an expert communicator" — name the specific thing this person does and the specific way they do it.]
 
 ## Core Principles
-[4 to 5 fundamental beliefs extracted from the text. Write these as if the author is speaking.]
+[4 to 5 fundamental beliefs extracted from the text. Write as if the author is speaking.
+REQUIRED FORMAT for each principle — use this exact structure:
+**[Principle statement — specific, not generic]**
+Evidence: [1 line showing the source signal that grounds this principle — a phrase they use, a structural habit they demonstrate, or a repeated behavior visible in the text]
+ANTI-GENERIC CHECK: Reject any principle that could appear in a generic motivational document. Each must be specific enough to identify this author.]
+
+## Decision Frameworks
+[How does this person make decisions? Extract the actual decision-making logic from the source — the rules they apply when choosing between options.
+Use a markdown TABLE with columns Situation | Decision Rule when 3 or more distinct decision patterns exist with consistent attributes.
+Use a numbered list if decision logic is purely sequential.
+Skip this section with "Not detectable in source." ONLY if the source contains zero decision language. Do not skip if the source contains any preference, prioritization, or conditional logic.]
+
+## Signature Patterns
+[THIS IS THE MOST IMPORTANT SECTION. These are the recurring behaviors that make this author distinct — observable, specific, verifiable.
+Extract patterns across these categories wherever the source provides signal:
+- Structural: How they open, develop, and close arguments or outputs.
+- Linguistic: Specific phrases, punctuation habits, sentence length tendencies, words they repeat or avoid.
+- Reasoning: Inversion, contrast, first-principles compression, analogy before abstraction.
+- Emphasis: What they bold, capitalize, repeat, or return to.
+4 to 6 patterns minimum. Each must be specific enough that it cannot apply to most other authors.
+ANTI-GENERIC: "Writes clearly" is not a signature pattern. "Opens with a single observation, then expands into implication before arriving at the principle" is.
+ANTI-HALLUCINATION: Extract only what is visible in the source. Do not invent patterns the source does not contain.]
 
 ## How to Think
-[The specific mental process, reasoning pattern, and constraints extracted from the text.]
+[The specific mental process and reasoning constraints extracted from the source.
+Be specific: What does the author consider FIRST when approaching a problem? What do they explicitly reject as a starting point? What mental moves are visible in the way they develop an argument or creative piece?]
 
 ## How to Create
-[Specific craft instructions. Detail the structure, format, length constraints, and vocabulary.]
+[Specific craft instructions grounded entirely in the source.
+Structure: What always comes first, second, last in their outputs?
+Length: What typical length or density signals are present?
+Vocabulary: Which specific domain terms, phrases, or words are used? Which are avoided?
+Format: Bullets vs prose, headers or not, numbered lists or flowing text — what does the source show?]
 
 ## What to Always Do
-[5 specific behaviors. Start each with an action verb.]
+[5 specific behaviors. Start each with an action verb. Domain-specific — not generic professional advice. Every item must be recognizable as specific to this author, not transferable to any professional in this domain.]
 
 ## What to Never Do
-[4 things clearly avoided in the text. Start each with "Never".]
+[4 prohibitions. Start each with "Never". These must be specific to what THIS source visibly avoids. Not generic — "Never be vague" is rejectable. "Never open with the conclusion before the observation that earns it" is specific.]
 
 ## Voice & Language
-[Detail the exact signature moves. Include specific words, phrases, tone, and formatting quirks like avoiding certain punctuation.]
+[Use a markdown TABLE with columns Element | Observed Pattern.
+REQUIRED rows: Tone | Vocabulary | Sentence Structure | Emphasis Style | What They Avoid.
+Add additional rows if the source provides clear signal for them (e.g. Paragraph Length, Punctuation Habits, Storytelling Approach, Use of Data).
+Keep every entry in the Observed Pattern column specific and verifiable — an observed behavior, not an aspiration.
+ANTI-GENERIC: "Direct and clear" is not an observed pattern. "Short declarative sentences (3–10 words) followed by a longer unpacking sentence" is.]
 
 ## Quality Bar
-[How to know when output is done right and matches the author's DNA.]
+[3 to 4 concrete, source-specific checks. How to verify that output actually matches this author's operational model — not just sounds similar.
+Reference actual patterns from ## Signature Patterns above.
+Not "sounds natural" — specific verifiable checks like "opens with observation before principle" or "uses contrast in at least one argument per output."]
 
 ENHANCED FORMAT RULES (use judgment — do not force):
-Within any section above, you MAY use one of these formats ONLY when content genuinely requires it:
+Within any section above, you MAY use these additional formats ONLY when content genuinely requires it:
 
-1. EXAMPLE BLOCK — only if source contains a template, before/after pattern, or signature
-   phrase worth preserving exactly.
+1. EXAMPLE BLOCK — only if source contains a template, before/after pair, or signature phrase worth preserving exactly.
    Format: > **Example:** on one line, then the example on the next line.
    DO NOT use for general principles or rules.
 
-2. ASCII FLOWCHART IN CODEBLOCK — only if source describes a process with real branching
-   decisions (if/then, yes/no outcomes that change the path).
+2. ASCII FLOWCHART IN CODEBLOCK — only if source describes a process with real branching decisions (if/then, yes/no outcomes that change the path).
    Format: triple backtick block, plain ASCII: → ↓ ├── └──
    DO NOT use for linear steps — use a numbered list instead.
 
-DEFAULT: When in doubt use prose. A plain text file about writing rules does NOT need
-special formatting. Never force a format onto content that does not naturally have it.
+DEFAULT: When in doubt use prose. A brand voice guide does NOT need an ASCII flowchart. A personal essay does NOT need a decision table. Never force a format onto content that does not naturally support it.
 
 CONTENT:
 ${textToSend}`;
@@ -1113,6 +1175,15 @@ ${textToSend}`;
     const anchor = templateAnchors[tmpl] || templateAnchors.A;
     if (!text.includes(anchor)) {
       text += `\n\n${anchor}\n[Content could not be extracted from source. Review document and retry.]`;
+    }
+
+    // v2.4: Template A secondary safety net.
+    // If ## Signature Patterns is missing, inject a placeholder so the skill file
+    // is not structurally broken. scoreOutput() will penalize placeholder text (-2),
+    // incentivizing the primary model to populate it correctly on the first pass.
+    // Scope: Template A Claude path only. All other templates untouched.
+    if (tmpl === 'A' && !text.includes('## Signature Patterns')) {
+      text += '\n\n## Signature Patterns\n[Review source document and extract 4 to 6 recurring behavioral patterns specific to this author.]';
     }
 
     // UNCHANGED — exact same line ending and whitespace cleanup as before
