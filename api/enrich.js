@@ -896,6 +896,7 @@ RULES:
 - The "name" field MUST be exactly: "${skillName}"
 - Use "${safeDomainLabel}" for the "domain" field by default. Per the rule above, if the text is clearly not about the Suggested Domain, replace it with the most accurate domain instead.
 - NEVER skip ## Identity & Role under any circumstance. For instructional, pedagogical, or reference documents where no personal author voice is present, define the professional role Claude takes on: name the domain, the output type, and the primary behavioral constraint this skill enforces.
+- Generate ALL sections in the EXACT ORDER listed in the FORMAT block below. Do not reorder, skip, or omit any section.
 
 ANTI-ABSTRACTION RULE: Before writing any bullet or principle, ask: "Could this apply to most other authors in this domain?" If yes — discard it and go deeper into the source until you find what is unique.
 
@@ -924,7 +925,7 @@ Use a numbered list if decision logic is purely sequential.
 Skip this section with "Not detectable in source." ONLY if the source contains zero decision language. Do not skip if the source contains any preference, prioritization, or conditional logic.]
 
 ## Signature Patterns
-[THIS IS THE MOST IMPORTANT SECTION. These are the recurring behaviors that make this author distinct — observable, specific, verifiable.
+[Extract this section with maximum depth and specificity — this is what makes the skill file non-generic and uniquely useful. These are the recurring behaviors that make this author distinct — observable, specific, verifiable.
 Extract patterns across these categories wherever the source provides signal:
 - Structural: How they open, develop, and close arguments or outputs.
 - Linguistic: Specific phrases, punctuation habits, sentence length tendencies, words they repeat or avoid.
