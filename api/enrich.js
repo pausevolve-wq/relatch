@@ -908,22 +908,6 @@ content_type: "behavioral skill"
 use_cases: ["case 1", "case 2", "case 3"]
 ---
 
-## Identity & Role
-[2 sentences. Who Claude becomes when using this skill. Use the specific vocabulary and tone of this author — not a description of them, but a precise definition of the role they occupy. Name the actual domain, the actual output type, and the most distinctive behavioral constraint. Not "an expert communicator" — name the specific thing this person does and the specific way they do it.]
-
-## Core Principles
-[4 to 5 fundamental beliefs extracted from the text. Write as if the author is speaking.
-REQUIRED FORMAT for each principle — use this exact structure:
-**[Principle statement — specific, not generic]**
-Evidence: [1 line showing the source signal that grounds this principle — a phrase they use, a structural habit they demonstrate, or a repeated behavior visible in the text]
-ANTI-GENERIC CHECK: Reject any principle that could appear in a generic motivational document. Each must be specific enough to identify this author.]
-
-## Decision Frameworks
-[How does this person make decisions? Extract the actual decision-making logic from the source — the rules they apply when choosing between options.
-Use a markdown TABLE with columns Situation | Decision Rule when 3 or more distinct decision patterns exist with consistent attributes.
-Use a numbered list if decision logic is purely sequential.
-Skip this section with "Not detectable in source." ONLY if the source contains zero decision language. Do not skip if the source contains any preference, prioritization, or conditional logic.]
-
 ## Signature Patterns
 [Extract this section with maximum depth and specificity — this is what makes the skill file non-generic and uniquely useful. These are the recurring behaviors that make this author distinct — observable, specific, verifiable.
 Extract patterns across these categories wherever the source provides signal:
@@ -934,6 +918,12 @@ Extract patterns across these categories wherever the source provides signal:
 4 to 6 patterns minimum. Each must be specific enough that it cannot apply to most other authors.
 ANTI-GENERIC: "Writes clearly" is not a signature pattern. "Opens with a single observation, then expands into implication before arriving at the principle" is.
 ANTI-HALLUCINATION: Extract only what is visible in the source. Do not invent patterns the source does not contain.]
+
+## Decision Frameworks
+[How does this person make decisions? Extract the actual decision-making logic from the source — the rules they apply when choosing between options.
+Use a markdown TABLE with columns Situation | Decision Rule when 3 or more distinct decision patterns exist with consistent attributes.
+Use a numbered list if decision logic is purely sequential.
+Skip this section with "Not detectable in source." ONLY if the source contains zero decision language. Do not skip if the source contains any preference, prioritization, or conditional logic.]
 
 ## How to Think
 [The specific mental process and reasoning constraints extracted from the source.
@@ -963,6 +953,16 @@ ANTI-GENERIC: "Direct and clear" is not an observed pattern. "Short declarative 
 [3 to 4 concrete, source-specific checks. How to verify that output actually matches this author's operational model — not just sounds similar.
 Reference actual patterns from ## Signature Patterns above.
 Not "sounds natural" — specific verifiable checks like "opens with observation before principle" or "uses contrast in at least one argument per output."]
+
+## Identity & Role
+[2 sentences. Who Claude becomes when using this skill. Use the specific vocabulary and tone of this author — not a description of them, but a precise definition of the role they occupy. Name the actual domain, the actual output type, and the most distinctive behavioral constraint. Not "an expert communicator" — name the specific thing this person does and the specific way they do it.]
+
+## Core Principles
+[4 to 5 fundamental beliefs extracted from the text. Write as if the author is speaking.
+REQUIRED FORMAT for each principle — use this exact structure:
+**[Principle statement — specific, not generic]**
+Evidence: [1 line showing the source signal that grounds this principle — a phrase they use, a structural habit they demonstrate, or a repeated behavior visible in the text]
+ANTI-GENERIC CHECK: Reject any principle that could appear in a generic motivational document. Each must be specific enough to identify this author.]
 
 ENHANCED FORMAT RULES (use judgment — do not force):
 Within any section above, you MAY use these additional formats ONLY when content genuinely requires it:
