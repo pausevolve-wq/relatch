@@ -606,7 +606,7 @@ ${textToSend}`;
 
     } else {
       // ── CODEX-EXECUTE: direct execution playbook (default shape) ──────────────
-      prompt = `${documentContext}You are a Skill Architect for OpenAI Codex CLI generating an EXECUTION skill. Codex is an autonomous coding agent — when this skill activates, Codex reads it and STARTS WORKING immediately. Convert the source into a direct execution playbook Codex can follow: concrete files, commands, checks, and artifacts. If the source is conceptual, translate it into an action sequence Codex can run. Prefer concrete checks over abstract advice.
+      prompt = `${documentContext}You are a Skill Architect for OpenAI Codex CLI generating an EXECUTION skill. Codex is an autonomous coding agent — when this skill activates, Codex reads it and STARTS WORKING immediately. Convert the source into a direct execution playbook Codex can follow: concrete steps, checks, and artifacts grounded in the source. NEVER invent tool names, CLI commands, or file paths not present in the source — if the source is conceptual, derive verifiable checklist actions from its actual domain content rather than fabricating specifics. Prefer concrete source-grounded checks over abstract advice.
 Focus on: ${focus}
 Domain: ${safeDomainLabel}
 Role: ${safeDomainRole}
@@ -614,7 +614,7 @@ Role: ${safeDomainRole}
 CRITICAL FRONTMATTER RULES:
 - Frontmatter MUST contain ONLY two fields: name and description. No other YAML fields whatsoever.
 - The "name" field MUST be exactly: "${codexSlug}"
-- Description: 2-3 sentences. Sentence 1: what this skill executes. Sentence 2: trigger contexts — include 1-2 phrases that appear literally in the source AND 2-4 real user-intent phrases a Codex user would naturally type (e.g. "refactor this component", "run the migration", "set up the test suite"). Sentence 3 (optional): explicit exclusions.
+- Description: 2-3 sentences. Sentence 1: what this skill executes (name the actual domain and action type from the source). Sentence 2: trigger contexts — include 1-2 phrases that appear LITERALLY in the source text AND 2-4 user-intent phrases a Codex user would type to invoke this exact skill — every phrase MUST be grounded in the actual source content, never generic placeholders. Sentence 3 (optional): explicit exclusions.
 - Do NOT wrap in code fences. Start your response with --- on line 1.
 - Do NOT add domain, origin, content_type, use_cases, or any other YAML field.
 
@@ -631,7 +631,7 @@ REQUIRED SECTIONS (in this order):
 - 2-3 explicit exclusions
 
 ## Implementation Workflow
-5-10 numbered steps. Each step MUST reference actual files, paths, commands, flags, tools, or checkable artifacts — no abstract steps. Embed fenced \`\`\`lang code blocks where the source shows code patterns. Use language tags (\`\`\`typescript, \`\`\`bash, \`\`\`python, etc.). Do NOT use ASCII flowcharts here — use numbered steps.
+5-10 numbered steps. Each step MUST reference concrete actions grounded in the source — actual files, paths, commands, flags, or tools ONLY if they appear in the source; for non-code sources use domain-appropriate verifiable actions with descriptive placeholders like [config-file], [runbook-section], [ticket-id] — NEVER invent CLI tool names or file paths. Embed fenced \`\`\`lang code blocks where the source shows code patterns. Use language tags (\`\`\`typescript, \`\`\`bash, \`\`\`python, etc.). Do NOT use ASCII flowcharts here — use numbered steps.
 
 ## Code Patterns
 Fenced code blocks showing preferred patterns lifted from or grounded in the source. Include the language tag. Skip this section entirely if the source contains no code patterns — do not invent code.
@@ -643,7 +643,7 @@ Fenced code blocks showing preferred patterns lifted from or grounded in the sou
 3-5 verification steps Codex should run before considering the task done. Format at least one as a runnable shell command (e.g. \`$ npm test\`, \`$ python -m pytest\`, \`$ grep -r "pattern" ./src\`) when the source is code-related. Always include at least one boundary check — a file, directory, interface, or architecture constraint to verify before shipping. Each check must be independently runnable and concrete, not a vague "ensure everything works."
 
 ## Key Principles
-4-6 non-negotiable executable rules (e.g. "always run pnpm install before pnpm test"). Not abstract values — verifiable actions. Lift these directly from the source.
+4-6 non-negotiable executable rules lifted directly from the source — domain-specific and verifiable. Not abstract values, not generic coding conventions.
 
 FORBIDDEN: ASCII flowcharts, judgment/taste prose, "human review" or pause sections, decision tables (this is an execution playbook — no branching deliberation).
 
