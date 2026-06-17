@@ -364,14 +364,26 @@ module.exports = async function handler(req, res) {
         if (text.includes('## Review Workflow')) score += 1;
         if (text.includes('## Key Principles')) score += 1;
       } else {
-        // SPECIALIST rewards: scope + operating mode + workflow/decision structure + escalation.
-        if (text.includes('## When to Activate') && text.includes('## Scope Boundaries') && text.includes('## Workflow')) score += 2;
+        // SPECIALIST scoring: independent credit per section so partial compliance is visible
+        // to retry pressure. Scoring the +2 conjunction (Activate+Scope+Workflow) collapsed
+        // all 2 points when any one was missing — even for non-[REQUIRED] sections on linear
+        // sources. Now each section earns its own +1.
+        // Activation + Scope always injected by sanitize(); +1 confirms structural integrity.
+        if (text.includes('## When to Activate') && text.includes('## Scope Boundaries')) score += 1;
+        // Workflow scored alone so omitting it on linear/conceptual sources doesn't cancel
+        // adjacent section credit.
+        if (text.includes('## Workflow')) score += 1;
         if (text.includes('## Decision Matrix') && text.includes('|')) score += 1;
         if (text.includes('## Operating Mode')) score += 1;
-        if (text.includes('## Escalation Rules') && text.includes('## Common Mistakes to Avoid')) score += 1;
+        // Enforcement sections scored independently — one missing no longer hides the other.
+        if (text.includes('## Escalation Rules')) score += 1;
+        if (text.includes('## Common Mistakes to Avoid')) score += 1;
+        // Key Principles: required in SPECIALIST prompt but previously unscored; adding here
+        // creates retry pressure to populate it.
+        if (text.includes('## Key Principles')) score += 1;
       }
 
-      return score;
+      return Math.min(score, 9);
     }
 
     let score = 0;
@@ -566,25 +578,26 @@ Three short sub-sections defining Codex's behavioral envelope in this role:
 **Escalate:** situations requiring human sign-off before proceeding
 **Refuse:** requests explicitly out of scope — state them clearly
 
-## Workflow
-If the source has branching multi-step logic, render it as an ASCII flowchart inside a triple-backtick code fence using ONLY → ↓ ├── └── characters. Then list numbered steps with checkable outcomes. If the workflow is purely linear, skip the ASCII chart and use numbered steps only.
+## Workflow   [REQUIRED]
+ALWAYS include 3-7 numbered steps with checkable outcomes — required even when no flowchart is rendered. If the source has branching multi-step logic, ALSO render an ASCII flowchart inside a triple-backtick code fence using ONLY → ↓ ├── └── characters, placed before the numbered steps. If the workflow is purely linear or the source is conceptual, skip the ASCII chart and use numbered steps only. Translate conceptual policies into actionable procedural steps — do not leave this section empty.
 
 ## Decision Matrix
 Markdown table with concrete conditions:
 | Condition | Action | Escalate? |
-ANTI-HALLUCINATION RULE: every row must map to a condition explicitly present in the source. If the source yields fewer than 4 distinguishable conditions, provide fewer rows rather than fabricating. Use "Yes" / "No" / "If unclear" in the Escalate column. Each action must be concrete (name a file, command, or output), not a vague directive.
+ANTI-HALLUCINATION RULE: every row must map to a condition explicitly present in the source. If the source yields fewer than 4 distinguishable conditions, provide fewer rows rather than fabricating. Use "Yes" / "No" / "If unclear" in the Escalate column — no other values. Each action must be role-specific and concrete (a named procedure, contact, escalation path, or explicit refusal) — not a vague directive. Do not use file paths or shell commands for non-code domains such as compliance, legal, or ops.
+SKIP ENTIRELY if the source contains no detectable conditions, branching logic, or distinguishable trigger states (follow codexSourceHint guidance). When skipping, omit this section header entirely — do not write a placeholder.
 
 ## Templates
 SKIP ENTIRELY unless you can identify at least one reusable, fill-in-the-blank structure directly in the source. If it exists, render it with \`[PLACEHOLDER]\` markers. Do NOT synthesize templates from general domain knowledge — only extract them from what the source actually provides.
 
-## Escalation Rules
-3-5 specific cases when Codex must surface to a human. Each rule names a concrete trigger, not a vague category.
+## Escalation Rules   [REQUIRED]
+3-5 specific cases when Codex must surface to a human before proceeding. Each rule names a concrete trigger and what specifically requires human judgment — not a vague category.
 
 ## Common Mistakes to Avoid   [REQUIRED]
-4-6 domain-specific anti-patterns as prose bullets. Each anti-pattern is role-specific, not generic professional advice.
+4-6 domain-specific anti-patterns as prose bullets. Each anti-pattern is role-specific to this constrained domain — not generic professional advice.
 
-## Key Principles
-4-6 non-negotiable role rules that define the constraint.
+## Key Principles   [REQUIRED]
+4-6 non-negotiable role rules extracted directly from the source. Each must be specific to this domain role — not generic professional advice. State what Codex will and will not do within this constrained role.
 
 FORBIDDEN: Long judgment-prose paragraphs (use the decision matrix instead), code anti-pattern pairs unless the source itself is code, generic professional advice.
 
@@ -1136,6 +1149,15 @@ ${textToSend}`;
         if (!text.includes('## Operating Mode')) {
           text += '\n\n## Operating Mode\n**Autonomous:** [tasks Codex can complete without checking in]\n**Escalate:** [situations requiring human sign-off]\n**Refuse:** [requests explicitly out of scope]';
         }
+        // These two sections are [REQUIRED] in the SPECIALIST prompt but had no fallback
+        // injection (unlike EXECUTE which injects both its [REQUIRED] sections). Without
+        // injections, they could be silently absent from the final output with no repair.
+        if (!text.includes('## Escalation Rules')) {
+          text += '\n\n## Escalation Rules\n[Review source document and define 3-5 specific triggers that require human review before proceeding.]';
+        }
+        if (!text.includes('## Common Mistakes to Avoid')) {
+          text += '\n\n## Common Mistakes to Avoid\n[Review source document and extract 4-6 domain-specific anti-patterns for this constrained role.]';
+        }
       }
 
       text = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n{3,}/g, '\n\n');
@@ -1422,6 +1444,31 @@ ${textToSend}`;
         ? buckets.workflow.slice(0, 6)
         : fill([...buckets.workflow, ...buckets.constraints], 4, `Execute ${safeDomainLabel} procedure`);
 
+      // Decision Matrix: extract condition/action pairs from escalate + refuse buckets.
+      // Uses .slice() not fill() so it doesn't drain buckets.other before escalation/mistakes.
+      // Rows are grounded in source signals — anti-hallucination preserved in fallback.
+      const dmEscalateRaw = buckets.escalate.slice(0, 2)
+        .map(l => l.split(/[.!?]/)[0].slice(0, 60).trim()).filter(Boolean);
+      const dmRefuseRaw   = buckets.refuse.slice(0, 2)
+        .map(l => l.split(/[.!?]/)[0].slice(0, 60).trim()).filter(Boolean);
+      const dmRows = [
+        ...dmEscalateRaw.map(c => `| ${c} | Escalate to human reviewer | Yes |`),
+        ...dmRefuseRaw.map(c => `| ${c} | Refuse and redirect out of scope | No |`),
+      ];
+      if (dmRows.length < 2) {
+        dmRows.push(`| Out-of-scope ${safeDomainLabel} request | Refuse and redirect | No |`);
+        dmRows.push(`| Ambiguous scope or authority | Pause and surface to human | Yes |`);
+      }
+
+      const escalationRulesItems = fill(
+        [...buckets.escalate, ...buckets.other.filter(l => /\b(human|review|approve|unclear|ambig)\b/i.test(l))],
+        3, 'Surface to human when scope or authority is unclear'
+      );
+      const commonMistakesItems = fill(
+        [...buckets.antiPatterns, ...buckets.constraints.slice(-2)],
+        4, `Avoid exceeding defined ${safeDomainLabel} scope boundaries`
+      );
+
       shapeBody = [
         '## Scope Boundaries',
         '**This role DOES:**',
@@ -1436,6 +1483,17 @@ ${textToSend}`;
         '',
         '## Workflow',
         ...workflowItems.map((s, i) => `${i + 1}. ${s}`),
+        '',
+        '## Decision Matrix',
+        '| Condition | Action | Escalate? |',
+        '| --- | --- | --- |',
+        ...dmRows,
+        '',
+        '## Escalation Rules',
+        ...escalationRulesItems.map(i => `- ${i}`),
+        '',
+        '## Common Mistakes to Avoid',
+        ...commonMistakesItems.map(i => `- ${i}`),
       ].join('\n');
     }
 
