@@ -31,8 +31,9 @@ module.exports = async function handler(req, res) {
 
   const CODEX_POLICY = {
     timeouts: {
-      model1: { small: 25000, medium: 25000, large: 35000 },
-      model2: { small: 20000, medium: 20000, large: 18000 },
+      model1: { small: 22000, medium: 22000, large: 28000 },
+      model2: { small: 18000, medium: 18000, large: 18000 },
+      model3: { small: 12000, medium: 12000, large: 10000 },
     },
     tokenBudgets: {
       small:  { lite: 1000, flash: 1000 },
@@ -1240,6 +1241,7 @@ ${textToSend}`;
   // UNCHANGED — exact same model list and order as before
   const modelList = [
     "gemini-3.5-flash",
+    "gemini-3.1-flash-lite",
     "gemini-2.5-flash"
   ];
 
@@ -1260,14 +1262,16 @@ ${textToSend}`;
     // model 2 runs, the budget is lower (1400 tokens) and remaining Vercel time is used.
     // Total ceiling: large = 35+18 = 53s, small/medium = 25+20 = 45s. Both < 60s limit.
     const perModelTimeoutMs = modelIndex === 0
-      ? (CODEX_POLICY.timeouts.model1[effectiveSizeClass] ?? 25000)
-      : (CODEX_POLICY.timeouts.model2[effectiveSizeClass] ?? 20000);
+      ? (CODEX_POLICY.timeouts.model1[effectiveSizeClass] ?? 22000)
+      : modelIndex === 1
+      ? (CODEX_POLICY.timeouts.model2[effectiveSizeClass] ?? 18000)
+      : (CODEX_POLICY.timeouts.model3[effectiveSizeClass] ?? 12000);
     const timeoutId = setTimeout(() => controller.abort(), perModelTimeoutMs);
 
     // V2 ADAPTIVE: per-model output token budget driven by sizeClass.
     // modelIndex 0 = Flash Lite (full window), modelIndex 1 = 2.5 Flash (fallback, capped lower).
     // Always resolves to a number because budgetForSize falls back to tokenBudgets.small.
-    const outputTokenBudget = modelIndex === 0
+    const outputTokenBudget = modelIndex < 2
       ? budgetForSize.lite
       : budgetForSize.flash;
 
@@ -1318,7 +1322,7 @@ ${textToSend}`;
       // V2: replaced old 2-condition check with template-aware quality scoring
       // Flash Lite (index 0) must score >= 6
       // Gemini 2.5 Flash (index 1) must score >= 4
-      const qualityThreshold = modelIndex === 0 ? CODEX_POLICY.qualityThresholds.lite : CODEX_POLICY.qualityThresholds.flash;
+      const qualityThreshold = modelIndex < 2 ? CODEX_POLICY.qualityThresholds.lite : CODEX_POLICY.qualityThresholds.flash;
       if (scoreOutput(candidateText, effectiveTemplate, effectiveSizeClass) >= qualityThreshold) {
         finalRawText = candidateText;
         successfulModel = modelId;
