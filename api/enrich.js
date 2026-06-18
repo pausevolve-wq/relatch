@@ -45,8 +45,9 @@ module.exports = async function handler(req, res) {
   const requestStartMs = Date.now();
 
   // ─── QUOTA GATE ──────────────────────────────────────────────────────────────
-  const DAILY_LIMIT  = 5;
-  const WEEKLY_LIMIT = 35;
+  const DAILY_LIMIT    = 5;
+  const WEEKLY_LIMIT   = 35;
+  const SESSION_TTL_MS = 10 * 60 * 1000;
 
   function getDateKey(now) {
     return now.toISOString().slice(0, 10);
@@ -61,8 +62,9 @@ module.exports = async function handler(req, res) {
     return `${d.getUTCFullYear()}-W${String(weekNo).padStart(2, '0')}`;
   }
 
-  let quotaUsage = null;
-  let quotaUser  = null;
+  let quotaUsage          = null;
+  let quotaUser           = null;
+  let quotaPreIncremented = false;
 
   try {
     quotaUser = await clerkClient.users.getUser(userId);
@@ -72,11 +74,12 @@ module.exports = async function handler(req, res) {
 
     const stored = quotaUser.privateMetadata?.relatchUsage ?? {};
     quotaUsage = {
-      dailyCount:    stored.dailyCount    ?? 0,
-      weeklyCount:   stored.weeklyCount   ?? 0,
-      lastDayKey:    stored.lastDayKey    ?? currentDayKey,
-      lastWeekKey:   stored.lastWeekKey   ?? currentWeekKey,
-      lastSessionId: stored.lastSessionId ?? null,
+      dailyCount:           stored.dailyCount           ?? 0,
+      weeklyCount:          stored.weeklyCount          ?? 0,
+      lastDayKey:           stored.lastDayKey           ?? currentDayKey,
+      lastWeekKey:          stored.lastWeekKey          ?? currentWeekKey,
+      lastSessionId:        stored.lastSessionId        ?? null,
+      lastSessionStartedAt: stored.lastSessionStartedAt ?? 0,
     };
 
     if (quotaUsage.lastDayKey !== currentDayKey) {
@@ -89,7 +92,9 @@ module.exports = async function handler(req, res) {
       quotaUsage.lastWeekKey = currentWeekKey;
     }
 
-    const isSameSession = sessionId && quotaUsage.lastSessionId === sessionId;
+    const isSameSession = sessionId &&
+      quotaUsage.lastSessionId === sessionId &&
+      (Date.now() - quotaUsage.lastSessionStartedAt) < SESSION_TTL_MS;
 
     if (!isSameSession) {
       if (quotaUsage.dailyCount >= DAILY_LIMIT || quotaUsage.weeklyCount >= WEEKLY_LIMIT) {
@@ -104,11 +109,27 @@ module.exports = async function handler(req, res) {
           message: `You have used all ${limitValue} free generations for this ${limitType === 'daily' ? 'day' : 'week'}. Your quota resets automatically ${limitType === 'daily' ? 'tomorrow' : 'next week'}.`,
         });
       }
+      // Reserve the quota slot before the Gemini call to close the TOCTOU race window.
+      // A concurrent request arriving now reads the already-incremented counter and
+      // hits the 429 gate instead of slipping through alongside this one.
+      quotaUsage.dailyCount  += 1;
+      quotaUsage.weeklyCount += 1;
+      if (sessionId) {
+        quotaUsage.lastSessionId        = sessionId;
+        quotaUsage.lastSessionStartedAt = Date.now();
+      }
+      try {
+        await clerkClient.users.updateUserMetadata(userId, {
+          privateMetadata: { relatchUsage: quotaUsage },
+        });
+        quotaPreIncremented = true;
+      } catch (preWriteErr) {
+        console.error('[quota] Clerk pre-increment failed:', preWriteErr?.message || preWriteErr);
+      }
     }
   } catch (quotaErr) {
     console.error('[quota] Clerk read failed:', quotaErr?.message || quotaErr);
-    quotaUsage = null;
-    quotaUser  = null;
+    return res.status(503).json({ error: 'SERVICE_UNAVAILABLE', message: 'Quota check unavailable. Please try again in a moment.' });
   }
   // ─── END QUOTA GATE ──────────────────────────────────────────────────────────
 
@@ -1218,7 +1239,7 @@ ${textToSend}`;
 
   // UNCHANGED — exact same model list and order as before
   const modelList = [
-    "gemini-3.1-flash-lite-preview",
+    "gemini-3.5-flash",
     "gemini-2.5-flash"
   ];
 
@@ -1516,26 +1537,9 @@ ${textToSend}`;
     console.log('[Codex]', { sizeClass: effectiveSizeClass, shape: activeCodexShape, outcome: finalRawText ? `model:${successfulModel}` : 'fallback', elapsed: Date.now() - requestStartMs });
   }
 
-  // Primary path — Gemini model succeeded; count the generation and respond.
+  // Primary path — Gemini model succeeded; quota was already reserved at the gate.
   if (finalRawText) {
     const enrichedOutput = sanitize(finalRawText, activeTarget === 'codex' ? codexSlug : skillName, effectiveTemplate);
-
-    if (quotaUsage && quotaUser) {
-      try {
-        const isSameSession = sessionId && quotaUsage.lastSessionId === sessionId;
-        if (!isSameSession) {
-          quotaUsage.dailyCount  += 1;
-          quotaUsage.weeklyCount += 1;
-          if (sessionId) quotaUsage.lastSessionId = sessionId;
-        }
-        await clerkClient.users.updateUserMetadata(userId, {
-          privateMetadata: { relatchUsage: quotaUsage },
-        });
-      } catch (writeErr) {
-        console.error('[quota] Clerk write failed:', writeErr?.message || writeErr);
-      }
-    }
-
     return res.status(200).json({ enriched: enrichedOutput, model: successfulModel });
   }
 
@@ -1544,6 +1548,15 @@ ${textToSend}`;
   // enforcement fire identically to the primary path. Returns HTTP 200 with diagnostic signal.
   // Claude target falls through to the 503 below — no safe local approximation exists for it.
   if (activeTarget === 'codex') {
+    if (quotaPreIncremented && quotaUsage && quotaUser) {
+      try {
+        quotaUsage.dailyCount  = Math.max(0, quotaUsage.dailyCount  - 1);
+        quotaUsage.weeklyCount = Math.max(0, quotaUsage.weeklyCount - 1);
+        await clerkClient.users.updateUserMetadata(userId, {
+          privateMetadata: { relatchUsage: quotaUsage },
+        });
+      } catch (_) {}
+    }
     const fallbackRaw = buildCodexFallback();
     return res.status(200).json({
       enriched: sanitize(fallbackRaw, codexSlug, 'CODEX'),
@@ -1552,7 +1565,16 @@ ${textToSend}`;
     });
   }
 
-  // Claude target or unknown — 503 unchanged
+  // Claude target or unknown — 503: refund the reserved quota slot.
+  if (quotaPreIncremented && quotaUsage && quotaUser) {
+    try {
+      quotaUsage.dailyCount  = Math.max(0, quotaUsage.dailyCount  - 1);
+      quotaUsage.weeklyCount = Math.max(0, quotaUsage.weeklyCount - 1);
+      await clerkClient.users.updateUserMetadata(userId, {
+        privateMetadata: { relatchUsage: quotaUsage },
+      });
+    } catch (_) {}
+  }
   return res.status(503).json({
     error: 'GOOGLE_API_ERROR',
     message: `Enrichment failed. Details: ${lastGoogleError}`
