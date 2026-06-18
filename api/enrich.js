@@ -47,6 +47,11 @@ module.exports = async function handler(req, res) {
   // ─── QUOTA GATE ──────────────────────────────────────────────────────────────
   const DAILY_LIMIT  = 5;
   const WEEKLY_LIMIT = 35;
+  // Session dedup window. A multi-file batch shares one client-supplied sessionId so it
+  // counts once; but sessionId is client-controlled, so an unbounded bypass is possible
+  // by replaying a fixed sessionId forever. Honour the dedup only while the session is
+  // fresh — legitimate batches finish in seconds, replay attacks do not.
+  const SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
   function getDateKey(now) {
     return now.toISOString().slice(0, 10);
@@ -77,6 +82,7 @@ module.exports = async function handler(req, res) {
       lastDayKey:    stored.lastDayKey    ?? currentDayKey,
       lastWeekKey:   stored.lastWeekKey   ?? currentWeekKey,
       lastSessionId: stored.lastSessionId ?? null,
+      lastSessionStartedAt: stored.lastSessionStartedAt ?? 0,
     };
 
     if (quotaUsage.lastDayKey !== currentDayKey) {
@@ -89,7 +95,9 @@ module.exports = async function handler(req, res) {
       quotaUsage.lastWeekKey = currentWeekKey;
     }
 
-    const isSameSession = sessionId && quotaUsage.lastSessionId === sessionId;
+    const isSameSession = sessionId
+      && quotaUsage.lastSessionId === sessionId
+      && (now.getTime() - quotaUsage.lastSessionStartedAt) < SESSION_TTL_MS;
 
     if (!isSameSession) {
       if (quotaUsage.dailyCount >= DAILY_LIMIT || quotaUsage.weeklyCount >= WEEKLY_LIMIT) {
@@ -107,8 +115,14 @@ module.exports = async function handler(req, res) {
     }
   } catch (quotaErr) {
     console.error('[quota] Clerk read failed:', quotaErr?.message || quotaErr);
-    quotaUsage = null;
-    quotaUser  = null;
+    // Fail CLOSED: if we cannot verify the quota, we do not generate. Proceeding here
+    // would call Gemini with zero quota checking and zero recording (free generations
+    // during any Clerk outage/rate-limit). The frontend treats this 503 as a generic
+    // failure and serves its local deterministic fallback, so the user is not dead-ended.
+    return res.status(503).json({
+      error: 'QUOTA_UNAVAILABLE',
+      message: 'Unable to verify your usage quota right now. Please try again in a moment.',
+    });
   }
   // ─── END QUOTA GATE ──────────────────────────────────────────────────────────
 
@@ -1522,11 +1536,16 @@ ${textToSend}`;
 
     if (quotaUsage && quotaUser) {
       try {
-        const isSameSession = sessionId && quotaUsage.lastSessionId === sessionId;
+        const isSameSession = sessionId
+          && quotaUsage.lastSessionId === sessionId
+          && (Date.now() - quotaUsage.lastSessionStartedAt) < SESSION_TTL_MS;
         if (!isSameSession) {
           quotaUsage.dailyCount  += 1;
           quotaUsage.weeklyCount += 1;
-          if (sessionId) quotaUsage.lastSessionId = sessionId;
+          if (sessionId) {
+            quotaUsage.lastSessionId = sessionId;
+            quotaUsage.lastSessionStartedAt = Date.now();
+          }
         }
         await clerkClient.users.updateUserMetadata(userId, {
           privateMetadata: { relatchUsage: quotaUsage },
