@@ -6,6 +6,9 @@
     },
     "api/ocr.js": {
       "maxDuration": 60
+    },
+    "api/waitlist-check.js": {
+      "maxDuration": 60
     }
   },
   "headers": [
