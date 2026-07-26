@@ -24,9 +24,18 @@ module.exports = async function handler(req, res) {
     return res.status(400).json({ error: 'Missing required fields: base64, fileName' });
   }
 
+  // Vercel serverless functions hard-cap the request body at 4.5MB platform-wide
+  // (not configurable via vercel.json, not a Mistral/OCR.space limit — see
+  // https://vercel.com/docs/functions/limitations). Base64 inflates the original
+  // file by ~1/0.75, so a decoded-size check needs real margin under that ceiling:
+  // 3MB decoded ≈ 4MB of base64 + JSON overhead ≈ ~4.0-4.1MB actual body, leaving
+  // ~400-500KB headroom under 4.5MB. The previous 4MB decoded threshold allowed a
+  // ~5.3MB body — files between ~3.375MB-4MB decoded passed this check but were
+  // then silently killed by Vercel's platform-level 413 before ever reaching the
+  // friendly error below, since Vercel's own limit sits in front of this code.
   const estimatedBytes = base64.length * 0.75;
-  if (estimatedBytes > 4000000) {
-    return res.status(413).json({ error: 'File too large for OCR. Maximum size is ~4MB.' });
+  if (estimatedBytes > 3000000) {
+    return res.status(413).json({ error: 'File too large for OCR. Maximum size is ~3MB.' });
   }
 
   const fileMime = mimeType || 'application/pdf';
