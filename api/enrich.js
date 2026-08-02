@@ -1,5 +1,19 @@
 const { verifyToken, createClerkClient } = require('@clerk/backend');
 const clerkClient = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
+const { Axiom } = require('@axiomhq/js');
+const axiomClient = process.env.AXIOM_TOKEN
+  ? new Axiom({ token: process.env.AXIOM_TOKEN, edge: 'us-east-1.aws.edge.axiom.co' })
+  : null;
+
+async function logToAxiom(event) {
+  if (!axiomClient) return;
+  try {
+    axiomClient.ingest('relatch-security', [{ ...event, _time: new Date().toISOString() }]);
+    await axiomClient.flush();
+  } catch (err) {
+    console.log('[axiom] log failed:', err?.message || 'unknown');
+  }
+}
 
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', 'https://app.relatch.online');
@@ -11,6 +25,7 @@ module.exports = async function handler(req, res) {
 
   const authHeader = req.headers['authorization'];
   if (!authHeader?.startsWith('Bearer ')) {
+    await logToAxiom({ endpoint: 'enrich', status: 401, reason: 'missing_bearer', ip: req.headers['x-forwarded-for'] || null });
     return res.status(401).json({ error: 'Unauthorized' });
   }
   let userId;
@@ -19,6 +34,7 @@ module.exports = async function handler(req, res) {
     userId = payload.sub;
     if (!userId) throw new Error('No userId in token');
   } catch {
+    await logToAxiom({ endpoint: 'enrich', status: 401, reason: 'invalid_session', ip: req.headers['x-forwarded-for'] || null });
     return res.status(401).json({ error: 'Invalid session' });
   }
 
@@ -27,7 +43,10 @@ module.exports = async function handler(req, res) {
   // richFormats: consumed by Claude prompt templates only. Codex path uses codexSourceHint
   // pre-scan (v2.2.1) for dynamic structure detection — intentionally unused on Codex path.
   const { rawText, category, fileName, domainLabel, domainRole, domainFrame, template, richFormats, charCap, sizeClass, target = 'claude', codexShape = 'execute', sessionId } = req.body;
-  if (!rawText || !category || !fileName) return res.status(400).json({ error: 'Missing required fields' });
+  if (!rawText || !category || !fileName) {
+    await logToAxiom({ endpoint: 'enrich', status: 400, reason: 'missing_fields', userId, ip: req.headers['x-forwarded-for'] || null });
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
 
   const CODEX_POLICY = {
     timeouts: {
@@ -103,6 +122,7 @@ module.exports = async function handler(req, res) {
       if (quotaUsage.dailyCount >= DAILY_LIMIT || quotaUsage.weeklyCount >= WEEKLY_LIMIT) {
         const limitType  = quotaUsage.dailyCount >= DAILY_LIMIT ? 'daily' : 'weekly';
         const limitValue = limitType === 'daily' ? DAILY_LIMIT : WEEKLY_LIMIT;
+        await logToAxiom({ endpoint: 'enrich', status: 429, reason: 'quota_reached', limitType, userId, ip: req.headers['x-forwarded-for'] || null });
         return res.status(429).json({
           error: 'QUOTA_REACHED',
           limitType,
@@ -119,6 +139,7 @@ module.exports = async function handler(req, res) {
     // would call Gemini with zero quota checking and zero recording (free generations
     // during any Clerk outage/rate-limit). The frontend treats this 503 as a generic
     // failure and serves its local deterministic fallback, so the user is not dead-ended.
+    await logToAxiom({ endpoint: 'enrich', status: 503, reason: 'quota_unavailable', userId, ip: req.headers['x-forwarded-for'] || null });
     return res.status(503).json({
       error: 'QUOTA_UNAVAILABLE',
       message: 'Unable to verify your usage quota right now. Please try again in a moment.',
@@ -138,6 +159,7 @@ module.exports = async function handler(req, res) {
   })();
 
   if (!hasEnoughLength || !hasRealWords || isRepetitiveNoise) {
+    await logToAxiom({ endpoint: 'enrich', status: 422, reason: 'insufficient_signal', userId, ip: req.headers['x-forwarded-for'] || null });
     return res.status(422).json({
       error: 'INSUFFICIENT_SIGNAL',
       message: 'Not enough content to generate a skill file.',
@@ -1572,6 +1594,7 @@ ${textToSend}`;
   }
 
   // Claude target or unknown — 503 unchanged
+  await logToAxiom({ endpoint: 'enrich', status: 503, reason: 'google_api_error', userId, ip: req.headers['x-forwarded-for'] || null });
   return res.status(503).json({
     error: 'GOOGLE_API_ERROR',
     message: `Enrichment failed. Details: ${lastGoogleError}`
