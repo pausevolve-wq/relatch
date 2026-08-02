@@ -1,4 +1,18 @@
 const { verifyToken } = require('@clerk/backend');
+const { Axiom } = require('@axiomhq/js');
+const axiomClient = process.env.AXIOM_TOKEN
+  ? new Axiom({ token: process.env.AXIOM_TOKEN, edge: 'us-east-1.aws.edge.axiom.co' })
+  : null;
+
+async function logToAxiom(event) {
+  if (!axiomClient) return;
+  try {
+    axiomClient.ingest('relatch-security', [{ ...event, _time: new Date().toISOString() }]);
+    await axiomClient.flush();
+  } catch (err) {
+    console.log('[axiom] log failed:', err?.message || 'unknown');
+  }
+}
 
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', 'https://app.relatch.online');
@@ -10,17 +24,20 @@ module.exports = async function handler(req, res) {
 
   const authHeader = req.headers['authorization'];
   if (!authHeader?.startsWith('Bearer ')) {
+    await logToAxiom({ endpoint: 'ocr', status: 401, reason: 'missing_bearer', ip: req.headers['x-forwarded-for'] || null });
     return res.status(401).json({ error: 'Unauthorized' });
   }
   try {
     await verifyToken(authHeader.slice(7), { secretKey: process.env.CLERK_SECRET_KEY });
   } catch {
+    await logToAxiom({ endpoint: 'ocr', status: 401, reason: 'invalid_session', ip: req.headers['x-forwarded-for'] || null });
     return res.status(401).json({ error: 'Invalid session' });
   }
 
   const { base64, mimeType, fileName } = req.body;
 
   if (!base64 || !fileName) {
+    await logToAxiom({ endpoint: 'ocr', status: 400, reason: 'missing_fields', ip: req.headers['x-forwarded-for'] || null });
     return res.status(400).json({ error: 'Missing required fields: base64, fileName' });
   }
 
@@ -35,6 +52,7 @@ module.exports = async function handler(req, res) {
   // friendly error below, since Vercel's own limit sits in front of this code.
   const estimatedBytes = base64.length * 0.75;
   if (estimatedBytes > 3000000) {
+    await logToAxiom({ endpoint: 'ocr', status: 413, reason: 'file_too_large', fileName, ip: req.headers['x-forwarded-for'] || null });
     return res.status(413).json({ error: 'File too large for OCR. Maximum size is ~3MB.' });
   }
 
@@ -126,6 +144,7 @@ module.exports = async function handler(req, res) {
   }
 
   console.log(`[ocr] all OCR methods failed for: ${fileName}`);
+  await logToAxiom({ endpoint: 'ocr', status: 422, reason: 'ocr_failed', fileName, ip: req.headers['x-forwarded-for'] || null });
   return res.status(422).json({
     error: 'OCR_FAILED',
     message: 'Could not extract text from this document. It may be image-based, encrypted, or corrupted.',
