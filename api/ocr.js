@@ -78,8 +78,17 @@ module.exports = async function handler(req, res) {
             type: "document_url",
             document_url: dataUri
           },
-          include_blocks: true,
-          table_format: "html"
+          include_blocks: true
+          // table_format deliberately left at Mistral's default (markdown), NOT "html" —
+          // reverted after a live test (2026-08-08) showed HTML table markup breaking two
+          // parts of the downstream pipeline in enrich.js: the line-based signal filter
+          // (built assuming one markdown table row per line) and the effectiveCharCap slice
+          // (HTML tags are ~2-3x more verbose than markdown pipe-tables for the same data,
+          // so dense tables blew the 2500-5000 char budget where markdown wouldn't have).
+          // Real symptom: a scanned central-bank financial-statement PDF's two dense
+          // tables vanished entirely from the generated skill file. include_blocks is safe
+          // to keep — bounding boxes live in a separate response field, never touching the
+          // markdown text that gets filtered/sliced.
         })
       });
 
