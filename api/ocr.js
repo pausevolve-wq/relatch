@@ -77,17 +77,22 @@ module.exports = async function handler(req, res) {
           document: {
             type: "document_url",
             document_url: dataUri
-          }
+          },
+          include_blocks: true,
+          table_format: "html"
         })
       });
 
       if (mistralResponse.ok) {
         const data = await mistralResponse.json();
         const text = data.pages.map(p => p.markdown).join("\n\n").trim();
-        
+
         if (text.length > 50) {
+          // Block extraction requires OCR 4+ (mistral-ocr-latest resolves there as of 2026-07-26);
+          // older models silently accept include_blocks but return an empty array per page.
+          const blocks = data.pages.map(p => ({ page: p.index, blocks: p.blocks || [] }));
           console.log(`[ocr] Mistral success: ${text.length} chars from ${fileName}`);
-          return res.status(200).json({ text, source: 'mistral' });
+          return res.status(200).json({ text, source: 'mistral', blocks });
         }
       } else {
         console.log(`[ocr] Mistral HTTP ${mistralResponse.status}`);
