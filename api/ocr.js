@@ -1,4 +1,5 @@
-const { verifyToken } = require('@clerk/backend');
+const { verifyToken, createClerkClient } = require('@clerk/backend');
+const clerkClient = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
 const { Axiom } = require('@axiomhq/js');
 const axiomClient = process.env.AXIOM_TOKEN
   ? new Axiom({ token: process.env.AXIOM_TOKEN, edge: 'us-east-1.aws.edge.axiom.co' })
@@ -27,8 +28,11 @@ module.exports = async function handler(req, res) {
     await logToAxiom({ endpoint: 'ocr', status: 401, reason: 'missing_bearer', ip: req.headers['x-forwarded-for'] || null });
     return res.status(401).json({ error: 'Unauthorized' });
   }
+  let userId;
   try {
-    await verifyToken(authHeader.slice(7), { secretKey: process.env.CLERK_SECRET_KEY });
+    const payload = await verifyToken(authHeader.slice(7), { secretKey: process.env.CLERK_SECRET_KEY });
+    userId = payload.sub;
+    if (!userId) throw new Error('No userId in token');
   } catch {
     await logToAxiom({ endpoint: 'ocr', status: 401, reason: 'invalid_session', ip: req.headers['x-forwarded-for'] || null });
     return res.status(401).json({ error: 'Invalid session' });
@@ -58,20 +62,27 @@ module.exports = async function handler(req, res) {
 
   const fileMime = mimeType || 'application/pdf';
   const mistralKey = process.env.MISTRALOCR_API_KEY;
+  const datalabKey = process.env.DATALAB_API_KEY;
   const ocrSpaceKey = process.env.OCRCLD_API_KEY;
 
   const dataUri = base64.startsWith('data:') ? base64 : `data:${fileMime};base64,${base64}`;
 
   if (mistralKey) {
+    // Mistral only being down is exactly the condition that sends traffic to Datalab below,
+    // so a hang here (not just a fast error) would eat the time budget Datalab's poll loop
+    // needs. Bound it explicitly instead of relying solely on Vercel's 60s function ceiling.
+    const mistralController = new AbortController();
+    const mistralTimeout = setTimeout(() => mistralController.abort(), 15000);
     try {
       console.log(`[ocr] trying Mistral OCR for: ${fileName}`);
-      
+
       const mistralResponse = await fetch("https://api.mistral.ai/v1/ocr", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "Authorization": `Bearer ${mistralKey}`
         },
+        signal: mistralController.signal,
         body: JSON.stringify({
           model: "mistral-ocr-latest",
           document: {
@@ -107,7 +118,115 @@ module.exports = async function handler(req, res) {
         console.log(`[ocr] Mistral HTTP ${mistralResponse.status}`);
       }
     } catch (err) {
-      console.log(`[ocr] Mistral threw: ${err.message || 'unknown'}`);
+      console.log(`[ocr] Mistral ${err.name === 'AbortError' ? 'timed out' : 'threw'}: ${err.message || 'unknown'}`);
+    } finally {
+      clearTimeout(mistralTimeout);
+    }
+  }
+
+  const DATALAB_DAILY_LIMIT = 3;
+  let datalabAllowed = true;
+
+  if (datalabKey) {
+    try {
+      const quotaUser = await clerkClient.users.getUser(userId);
+      const todayKey = new Date().toISOString().slice(0, 10);
+      const stored = quotaUser.privateMetadata?.relatchOcrUsage ?? {};
+      const dailyCount = stored.lastDayKey === todayKey ? (stored.dailyCount ?? 0) : 0;
+
+      if (dailyCount >= DATALAB_DAILY_LIMIT) {
+        datalabAllowed = false;
+        console.log(`[ocr] Datalab daily cap reached for user ${userId} (${dailyCount}/${DATALAB_DAILY_LIMIT})`);
+        await logToAxiom({ endpoint: 'ocr', status: 200, reason: 'datalab_quota_skipped', fileName, userId, ip: req.headers['x-forwarded-for'] || null });
+      }
+    } catch (err) {
+      // Fail closed on the quota read itself — skip the paid tier rather than risk an
+      // uncapped call, same posture as enrich.js's Clerk-read fail-closed quota gate.
+      datalabAllowed = false;
+      console.log('[ocr] Datalab quota check failed, skipping paid tier:', err?.message || 'unknown');
+    }
+  }
+
+  if (datalabKey && datalabAllowed) {
+    try {
+      console.log(`[ocr] trying Datalab OCR fallback for: ${fileName}`);
+
+      const rawBase64 = dataUri.includes(',') ? dataUri.slice(dataUri.indexOf(',') + 1) : dataUri;
+      const fileBuffer = Buffer.from(rawBase64, 'base64');
+      const form = new FormData();
+      form.append('file', new Blob([fileBuffer], { type: fileMime }), fileName);
+      form.append('output_format', 'markdown');
+      form.append('mode', 'balanced'); // same $4/1000-page rate as 'fast', better quality — no reason to use 'fast'
+      form.append('max_pages', '40'); // bounds worst-case single-request cost regardless of the inbound 3MB size cap above
+
+      const submitResponse = await fetch('https://www.datalab.to/api/v1/convert', {
+        method: 'POST',
+        headers: { 'X-Api-Key': datalabKey },
+        body: form,
+      });
+
+      if (submitResponse.ok) {
+        const submitData = await submitResponse.json();
+        const checkUrl = submitData.request_check_url;
+
+        let result = null;
+        if (checkUrl) {
+          // Expected processing time for a 40-page doc at Datalab's ~3-4 pages/sec is well
+          // under this window; the cap exists so a stuck job can't starve the OCR.space
+          // tier below of the time it needs inside Vercel's 60s function ceiling.
+          const deadline = Date.now() + 30000;
+          while (Date.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, 2000));
+            const pollResponse = await fetch(checkUrl, { headers: { 'X-Api-Key': datalabKey } });
+            if (!pollResponse.ok) break;
+            const pollData = await pollResponse.json();
+            if (pollData.status === 'complete') { result = pollData; break; }
+            if (pollData.status === 'failed') break;
+          }
+        }
+
+        if (result) {
+          // Datalab bills per page once a job reaches 'complete', independent of whether the
+          // extracted text clears our own length gate below — record the spend here, not
+          // after the quality check, so the daily counter reflects what was actually billed.
+          try {
+            const quotaUser = await clerkClient.users.getUser(userId);
+            const todayKey = new Date().toISOString().slice(0, 10);
+            const stored = quotaUser.privateMetadata?.relatchOcrUsage ?? {};
+            const dailyCount = stored.lastDayKey === todayKey ? (stored.dailyCount ?? 0) : 0;
+            await clerkClient.users.updateUserMetadata(userId, {
+              privateMetadata: { relatchOcrUsage: { dailyCount: dailyCount + 1, lastDayKey: todayKey } },
+            });
+          } catch (err) {
+            console.log('[ocr] Datalab quota write failed:', err?.message || 'unknown');
+          }
+
+          await logToAxiom({
+            endpoint: 'ocr',
+            status: 200,
+            reason: result.success ? 'datalab_success' : 'datalab_processing_failed',
+            fileName,
+            userId,
+            pageCount: result.page_count ?? null,
+            cost: result.cost_breakdown ?? null,
+            ip: req.headers['x-forwarded-for'] || null,
+          });
+
+          if (result.success && result.markdown) {
+            const text = result.markdown.trim();
+            if (text.length > 50) {
+              console.log(`[ocr] Datalab success: ${text.length} chars from ${fileName}`);
+              return res.status(200).json({ text, source: 'datalab' });
+            }
+          }
+        } else {
+          console.log(`[ocr] Datalab did not complete within the poll window for: ${fileName}`);
+        }
+      } else {
+        console.log(`[ocr] Datalab HTTP ${submitResponse.status}`);
+      }
+    } catch (err) {
+      console.log(`[ocr] Datalab threw: ${err.message || 'unknown'}`);
     }
   }
 
