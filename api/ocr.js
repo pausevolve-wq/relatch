@@ -71,8 +71,16 @@ module.exports = async function handler(req, res) {
     // Mistral only being down is exactly the condition that sends traffic to Datalab below,
     // so a hang here (not just a fast error) would eat the time budget Datalab's poll loop
     // needs. Bound it explicitly instead of relying solely on Vercel's 60s function ceiling.
+    // 35s (not a shorter number): Mistral's OCR endpoint is synchronous with no documented
+    // server-side timeout, and no independently-observed per-page latency figure exists publicly
+    // (their "2000 pages/min" figure is a GPU-cluster throughput claim, not measured single-request
+    // latency for markdown+bbox generation). A too-short timeout here would misclassify a slow-but-
+    // working Mistral call as "down" and route it to the paid Datalab tier unnecessarily — the
+    // opposite of the "only when Mistral is actually down" intent. Duration is logged to Axiom below
+    // on every outcome so this number can be tuned from real production data instead of guesswork.
     const mistralController = new AbortController();
-    const mistralTimeout = setTimeout(() => mistralController.abort(), 15000);
+    const mistralTimeout = setTimeout(() => mistralController.abort(), 35000);
+    const mistralStartMs = Date.now();
     try {
       console.log(`[ocr] trying Mistral OCR for: ${fileName}`);
 
@@ -106,19 +114,27 @@ module.exports = async function handler(req, res) {
       if (mistralResponse.ok) {
         const data = await mistralResponse.json();
         const text = data.pages.map(p => p.markdown).join("\n\n").trim();
+        const mistralDurationMs = Date.now() - mistralStartMs;
 
         if (text.length > 50) {
           // Block extraction requires OCR 4+ (mistral-ocr-latest resolves there as of 2026-07-26);
           // older models silently accept include_blocks but return an empty array per page.
           const blocks = data.pages.map(p => ({ page: p.index, blocks: p.blocks || [] }));
-          console.log(`[ocr] Mistral success: ${text.length} chars from ${fileName}`);
+          console.log(`[ocr] Mistral success: ${text.length} chars from ${fileName} in ${mistralDurationMs}ms`);
+          // Real per-request latency, not published anywhere by Mistral — logged so the 35s
+          // timeout above can eventually be tuned from actual production numbers, not a guess.
+          await logToAxiom({ endpoint: 'ocr', status: 200, reason: 'mistral_success', fileName, userId, pageCount: data.pages.length, durationMs: mistralDurationMs, ip: req.headers['x-forwarded-for'] || null });
           return res.status(200).json({ text, source: 'mistral', blocks });
         }
+        await logToAxiom({ endpoint: 'ocr', status: 200, reason: 'mistral_empty_text', fileName, userId, pageCount: data.pages.length, durationMs: mistralDurationMs, ip: req.headers['x-forwarded-for'] || null });
       } else {
         console.log(`[ocr] Mistral HTTP ${mistralResponse.status}`);
+        await logToAxiom({ endpoint: 'ocr', status: 200, reason: 'mistral_http_error', fileName, userId, httpStatus: mistralResponse.status, durationMs: Date.now() - mistralStartMs, ip: req.headers['x-forwarded-for'] || null });
       }
     } catch (err) {
-      console.log(`[ocr] Mistral ${err.name === 'AbortError' ? 'timed out' : 'threw'}: ${err.message || 'unknown'}`);
+      const timedOut = err.name === 'AbortError';
+      console.log(`[ocr] Mistral ${timedOut ? 'timed out' : 'threw'}: ${err.message || 'unknown'}`);
+      await logToAxiom({ endpoint: 'ocr', status: 200, reason: timedOut ? 'mistral_timeout' : 'mistral_threw', fileName, userId, durationMs: Date.now() - mistralStartMs, ip: req.headers['x-forwarded-for'] || null });
     } finally {
       clearTimeout(mistralTimeout);
     }
@@ -171,10 +187,12 @@ module.exports = async function handler(req, res) {
 
         let result = null;
         if (checkUrl) {
-          // Expected processing time for a 40-page doc at Datalab's ~3-4 pages/sec is well
-          // under this window; the cap exists so a stuck job can't starve the OCR.space
-          // tier below of the time it needs inside Vercel's 60s function ceiling.
-          const deadline = Date.now() + 30000;
+          // Expected processing time for a 40-page doc at Datalab's stated ~3-4 pages/sec is
+          // ~10-13s, so 20s leaves real margin. Kept shorter than Mistral's 35s above (rather
+          // than symmetric) because the two stack: worst case is Mistral times out AND Datalab
+          // times out, and OCR.space still needs a real window afterward, all inside Vercel's
+          // 60s function ceiling (35 + 20 = 55s, leaving ~5s for OCR.space + response).
+          const deadline = Date.now() + 20000;
           while (Date.now() < deadline) {
             await new Promise((resolve) => setTimeout(resolve, 2000));
             const pollResponse = await fetch(checkUrl, { headers: { 'X-Api-Key': datalabKey } });
