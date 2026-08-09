@@ -33,9 +33,12 @@ module.exports = async function handler(req, res) {
     const payload = await verifyToken(authHeader.slice(7), { secretKey: process.env.CLERK_SECRET_KEY });
     userId = payload.sub;
     if (!userId) throw new Error('No userId in token');
-  } catch {
+  } catch (err) {
+    // TEMPORARY TEST DIAGNOSTIC (2026-08-09/10) — real verifyToken() error was being
+    // swallowed by a bare catch{}. DO NOT MERGE this change to the error response shape.
+    console.error('[TEST DIAG] verifyToken failed:', err?.message || err);
     await logToAxiom({ endpoint: 'enrich', status: 401, reason: 'invalid_session', ip: req.headers['x-forwarded-for'] || null });
-    return res.status(401).json({ error: 'Invalid session' });
+    return res.status(401).json({ error: 'Invalid session', debugMessage: err?.message || String(err) });
   }
 
   // V2: destructure new fields from frontend (template, richFormats, charCap)
