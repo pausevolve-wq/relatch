@@ -297,14 +297,17 @@ module.exports = async function handler(req, res) {
       formData.append('isCreateSearchablePdf', 'true');
       formData.append('isSearchablePdfHideTextLayer', 'true'); 
 
-      const response = await fetch('https://api.ocr.space/parse/image', {
+      // 8s: last tier in the chain, so cutting it short just reaches the graceful 422 below
+      // sooner (unlike Mistral/Datalab, nothing after it can be starved) — sized to fit the
+      // ~9s typically left under Vercel's 60s ceiling after Mistral + Datalab's worst case.
+      const response = await fetchWithTimeout('https://api.ocr.space/parse/image', {
         method: 'POST',
         headers: {
           'apikey': ocrSpaceKey,
           'Content-Type': 'application/x-www-form-urlencoded',
         },
         body: formData.toString()
-      });
+      }, 8000);
 
       if (response.ok) {
         const data = await response.json();
