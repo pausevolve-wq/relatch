@@ -71,6 +71,13 @@ module.exports = async function handler(req, res) {
   // by replaying a fixed sessionId forever. Honour the dedup only while the session is
   // fresh — legitimate batches finish in seconds, replay attacks do not.
   const SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes
+  // The frontend caps a single upload batch at 3 files (App.tsx FileUploadZone), so a
+  // legitimate session never needs more than 3 free (uncounted) requests. 5 gives headroom
+  // for a stray retry. Without this cap, a client that keeps replaying the same sessionId
+  // forever gets literally unlimited free Gemini calls inside every 10-minute window — this
+  // bounds the exploit to (DAILY_LIMIT/WEEKLY_LIMIT) x MAX_FREE_REQUESTS_PER_SESSION instead,
+  // since renewing the free window still costs one real counted generation each time.
+  const MAX_FREE_REQUESTS_PER_SESSION = 5;
 
   function getDateKey(now) {
     return now.toISOString().slice(0, 10);
@@ -102,6 +109,7 @@ module.exports = async function handler(req, res) {
       lastWeekKey:   stored.lastWeekKey   ?? currentWeekKey,
       lastSessionId: stored.lastSessionId ?? null,
       lastSessionStartedAt: stored.lastSessionStartedAt ?? 0,
+      sessionRequestCount: stored.sessionRequestCount ?? 0,
     };
 
     if (quotaUsage.lastDayKey !== currentDayKey) {
@@ -116,7 +124,8 @@ module.exports = async function handler(req, res) {
 
     const isSameSession = sessionId
       && quotaUsage.lastSessionId === sessionId
-      && (now.getTime() - quotaUsage.lastSessionStartedAt) < SESSION_TTL_MS;
+      && (now.getTime() - quotaUsage.lastSessionStartedAt) < SESSION_TTL_MS
+      && quotaUsage.sessionRequestCount < MAX_FREE_REQUESTS_PER_SESSION;
 
     if (!isSameSession) {
       if (quotaUsage.dailyCount >= DAILY_LIMIT || quotaUsage.weeklyCount >= WEEKLY_LIMIT) {
@@ -1560,14 +1569,18 @@ ${textToSend}`;
       try {
         const isSameSession = sessionId
           && quotaUsage.lastSessionId === sessionId
-          && (Date.now() - quotaUsage.lastSessionStartedAt) < SESSION_TTL_MS;
+          && (Date.now() - quotaUsage.lastSessionStartedAt) < SESSION_TTL_MS
+          && quotaUsage.sessionRequestCount < MAX_FREE_REQUESTS_PER_SESSION;
         if (!isSameSession) {
           quotaUsage.dailyCount  += 1;
           quotaUsage.weeklyCount += 1;
           if (sessionId) {
             quotaUsage.lastSessionId = sessionId;
             quotaUsage.lastSessionStartedAt = Date.now();
+            quotaUsage.sessionRequestCount = 1;
           }
+        } else {
+          quotaUsage.sessionRequestCount += 1;
         }
         await clerkClient.users.updateUserMetadata(userId, {
           privateMetadata: { relatchUsage: quotaUsage },
