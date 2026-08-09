@@ -1300,9 +1300,11 @@ ${textToSend}`;
     // V2 ADAPTIVE: per-model output token budget driven by sizeClass.
     // modelIndex 0 = Flash Lite (full window), modelIndex 1 = 2.5 Flash (fallback, capped lower).
     // Always resolves to a number because budgetForSize falls back to tokenBudgets.small.
-    const outputTokenBudget = modelIndex === 0
-      ? budgetForSize.lite
-      : budgetForSize.flash;
+    // TEMPORARY TEST PADDING (2026-08-09/10): first real run truncated the Codex output
+    // right before the end (hit exactly 1400). +700 headroom for this test only — GPT-OSS
+    // via OpenRouter appears to need more budget than Gemini for the same task even with
+    // reasoning effort set to low. DO NOT MERGE this padding into the real Gemini path.
+    const outputTokenBudget = (modelIndex === 0 ? budgetForSize.lite : budgetForSize.flash) + 700;
 
     // Codex-only: skip model 2 if insufficient time remains for a useful response.
     // Prevents spending the last few seconds on a weak attempt likely to timeout.
