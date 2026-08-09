@@ -1054,7 +1054,13 @@ ${textToSend}`;
     // v2.1: Codex sanitize path — strict spec, frontmatter has ONLY name + description.
     // When called for Codex, `skillName` param holds the kebab-case codexSlug (see call site).
     if (tmpl === 'CODEX') {
-      const yamlStartCodex = text.indexOf('---');
+      // Fix (2026-08-09/10): indexOf('---') matched the FIRST occurrence of that
+      // substring anywhere in the text — including inside a markdown table separator
+      // row (e.g. "--- | :--- |"), which silently truncated everything before it,
+      // eating the real frontmatter. A genuine YAML delimiter is always alone on its
+      // own line; anchoring to that shape excludes table syntax, which always has
+      // additional characters (pipes, colons) on the same line.
+      const yamlStartCodex = text.search(/^---\s*$/m);
       if (yamlStartCodex > 0) text = text.slice(yamlStartCodex);
       if (!text.startsWith('---')) text = '---\n' + text;
 
@@ -1209,8 +1215,12 @@ ${textToSend}`;
       return text.trim();
     }
 
-    // UNCHANGED — exact same YAML positioning as before
-    const yamlStart = text.indexOf('---');
+    // Fix (2026-08-09/10): see the identical fix + explanation above in the CODEX
+    // branch of this same function — indexOf('---') was matching markdown table
+    // separator rows and silently eating the real frontmatter before them. Confirmed
+    // live in production: 1 of 4 real Gemini calls in a same-day test came back as a
+    // 200 "success" with no name:/domain: fields at all because of this exact bug.
+    const yamlStart = text.search(/^---\s*$/m);
     if (yamlStart > 0) text = text.slice(yamlStart);
     if (!text.startsWith('---')) text = '---\n' + text;
 
@@ -1261,10 +1271,16 @@ ${textToSend}`;
     return text.trim();
   }
 
-  // UNCHANGED — exact same model list and order as before
+  // Fallback tier (index 1) moved off Gemini to OpenRouter's openai/gpt-oss-120b, pinned
+  // to Groq (2026-08-09/10) — cross-provider redundancy, so a full Gemini outage no
+  // longer takes out both tiers at once (same single-provider fragility pattern already
+  // fixed elsewhere in this org's infra). Live-tested via a real Vercel preview
+  // deployment across 8 real generations (both targets, 2 different source documents):
+  // 4.5-6.8s latency, comparable output quality/format compliance to Gemini on identical
+  // inputs. Primary model (index 0) is unchanged.
   const modelList = [
-    "gemini-3.1-flash-lite-preview",
-    "gemini-2.5-flash"
+    { provider: 'gemini', id: 'gemini-3.1-flash-lite-preview' },
+    { provider: 'openrouter', id: 'openai/gpt-oss-120b' },
   ];
 
   let finalRawText = null;
@@ -1274,7 +1290,7 @@ ${textToSend}`;
   // V2: track model index for quality threshold (Lite >= 6, Flash >= 5)
   let modelIndex = 0;
 
-  for (const modelId of modelList) {
+  for (const { provider, id: modelId } of modelList) {
     const controller = new AbortController();
 
     // Timeouts are sizeClass-aware so large-doc generation (1800 token output budget)
@@ -1283,17 +1299,22 @@ ${textToSend}`;
     // the vast majority of degraded cases). Model 2 always stays short — by the time
     // model 2 runs, the budget is lower (1400 tokens) and remaining Vercel time is used.
     // Total ceiling: large = 35+18 = 53s, small/medium = 25+20 = 45s. Both < 60s limit.
+    // Groq (behind OpenRouter, model 2's new provider) responded in 4.5-6.8s across
+    // every live test — well inside this budget already, no widening needed here.
     const perModelTimeoutMs = modelIndex === 0
       ? (CODEX_POLICY.timeouts.model1[effectiveSizeClass] ?? 25000)
       : (CODEX_POLICY.timeouts.model2[effectiveSizeClass] ?? 20000);
     const timeoutId = setTimeout(() => controller.abort(), perModelTimeoutMs);
 
     // V2 ADAPTIVE: per-model output token budget driven by sizeClass.
-    // modelIndex 0 = Flash Lite (full window), modelIndex 1 = 2.5 Flash (fallback, capped lower).
+    // modelIndex 0 = Flash Lite (full window), modelIndex 1 = fallback (capped lower).
     // Always resolves to a number because budgetForSize falls back to tokenBudgets.small.
-    const outputTokenBudget = modelIndex === 0
-      ? budgetForSize.lite
-      : budgetForSize.flash;
+    // OpenRouter/GPT-OSS needs real extra headroom vs Gemini at the same nominal budget —
+    // live testing showed truncated output at budgetForSize.lite (1400) on a Codex-shape
+    // generation even with reasoning effort set to low; +700 fixed it in testing. Applied
+    // only to this provider — Gemini's own budget is unchanged.
+    const baseTokenBudget = modelIndex === 0 ? budgetForSize.lite : budgetForSize.flash;
+    const outputTokenBudget = provider === 'openrouter' ? baseTokenBudget + 700 : baseTokenBudget;
 
     // Codex-only: skip model 2 if insufficient time remains for a useful response.
     // Prevents spending the last few seconds on a weak attempt likely to timeout.
@@ -1307,19 +1328,46 @@ ${textToSend}`;
     }
 
     try {
-      const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${process.env.GEMINI_API_KEY}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: prompt }] }],
-            // V2 ADAPTIVE: ceiling per (sizeClass, model) — temperature unchanged.
-            generationConfig: { maxOutputTokens: outputTokenBudget, temperature: 0.7 }
-          }),
-          signal: controller.signal
-        }
-      );
+      const response = provider === 'gemini'
+        ? await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${process.env.GEMINI_API_KEY}`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                contents: [{ parts: [{ text: prompt }] }],
+                // V2 ADAPTIVE: ceiling per (sizeClass, model) — temperature unchanged.
+                generationConfig: { maxOutputTokens: outputTokenBudget, temperature: 0.7 }
+              }),
+              signal: controller.signal
+            }
+          )
+        : await fetch(
+            'https://openrouter.ai/api/v1/chat/completions',
+            {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+                'HTTP-Referer': 'https://app.relatch.online',
+                'X-Title': 'Relatch',
+              },
+              body: JSON.stringify({
+                model: modelId,
+                messages: [{ role: 'user', content: prompt }],
+                max_tokens: outputTokenBudget,
+                temperature: 0.7,
+                // Low reasoning effort — this model burns its output budget on hidden
+                // reasoning tokens by default; low effort plus the +700 pad above keeps
+                // real content from being truncated or crowded out entirely.
+                reasoning: { effort: 'low' },
+                // Pinned to Groq specifically for its throughput; allow_fallbacks:false
+                // so a slower backend never silently substitutes.
+                provider: { order: ['groq'], allow_fallbacks: false },
+              }),
+              signal: controller.signal
+            }
+          );
 
       clearTimeout(timeoutId);
 
@@ -1327,9 +1375,12 @@ ${textToSend}`;
         const errorData = await response.json().catch(() => ({}));
         lastGoogleError = `HTTP ${response.status}: ${errorData.error?.message || 'Unknown'}`;
 
-        // Retry on transient failures only. 400/401/403/404 are configuration or
-        // request errors that won't be fixed by switching models.
-        if (response.status === 429 || response.status === 500 || response.status === 502 || response.status === 503 || response.status === 504) {
+        // Retry on transient failures, plus 404 — with a real second provider now in
+        // the chain, a 404 on the primary model (e.g. a retired model id) should fall
+        // through to it rather than aborting the whole request outright, which is the
+        // exact case cross-provider redundancy exists for. 400/401/403 still break —
+        // narrower change, scoped to what this session's testing actually covered.
+        if (response.status === 429 || response.status === 404 || response.status === 500 || response.status === 502 || response.status === 503 || response.status === 504) {
           modelIndex++;
           continue;
         }
@@ -1337,11 +1388,13 @@ ${textToSend}`;
       }
 
       const data = await response.json();
-      const candidateText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      const candidateText = provider === 'gemini'
+        ? (data.candidates?.[0]?.content?.parts?.[0]?.text || '')
+        : (data.choices?.[0]?.message?.content || '');
 
       // V2: replaced old 2-condition check with template-aware quality scoring
       // Flash Lite (index 0) must score >= 6
-      // Gemini 2.5 Flash (index 1) must score >= 4
+      // Fallback tier (index 1, GPT-OSS-120B via OpenRouter) must score >= 4
       const qualityThreshold = modelIndex === 0 ? CODEX_POLICY.qualityThresholds.lite : CODEX_POLICY.qualityThresholds.flash;
       if (scoreOutput(candidateText, effectiveTemplate, effectiveSizeClass) >= qualityThreshold) {
         finalRawText = candidateText;
