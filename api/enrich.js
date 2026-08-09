@@ -1261,10 +1261,16 @@ ${textToSend}`;
     return text.trim();
   }
 
-  // UNCHANGED — exact same model list and order as before
+  // ===================================================================
+  // TEMPORARY LIVE TEST (2026-08-09/10) — DO NOT MERGE THIS BRANCH.
+  // Swapped from Gemini to OpenRouter's openai/gpt-oss-120b (pinned to
+  // Groq) to test real latency + output quality before launch. Original,
+  // to revert to: ["gemini-3.1-flash-lite-preview", "gemini-2.5-flash"].
+  // Full snapshot of the original call: see scratchpad
+  // EXISTING-GEMINI-INFRA-SNAPSHOT.md from this same session.
+  // ===================================================================
   const modelList = [
-    "gemini-3.1-flash-lite-preview",
-    "gemini-2.5-flash"
+    "openai/gpt-oss-120b"
   ];
 
   let finalRawText = null;
@@ -1307,21 +1313,39 @@ ${textToSend}`;
     }
 
     try {
+      // TEMPORARY LIVE TEST — OpenRouter instead of Gemini. See marker above modelList.
+      const testStartMs = Date.now();
       const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${process.env.GEMINI_API_KEY}`,
+        'https://openrouter.ai/api/v1/chat/completions',
         {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+            'HTTP-Referer': 'https://app.relatch.online',
+            'X-Title': 'Relatch (temporary GPT-OSS live test)',
+          },
           body: JSON.stringify({
-            contents: [{ parts: [{ text: prompt }] }],
-            // V2 ADAPTIVE: ceiling per (sizeClass, model) — temperature unchanged.
-            generationConfig: { maxOutputTokens: outputTokenBudget, temperature: 0.7 }
+            model: modelId,
+            messages: [{ role: 'user', content: prompt }],
+            max_tokens: outputTokenBudget,
+            temperature: 0.7,
+            // Low reasoning effort — the earlier NVIDIA-direct test showed this model
+            // burns its entire output budget on hidden reasoning tokens by default,
+            // producing empty responses. This is the exact lesson applied here.
+            reasoning: { effort: 'low' },
+            // Pin to Groq specifically — Groq's own docs claim ~500 tok/s for this
+            // model, which is the only reason this is worth testing over the
+            // NVIDIA free-tier result. allow_fallbacks:false so a slower backend
+            // never silently substitutes and muddies the latency numbers.
+            provider: { order: ['groq'], allow_fallbacks: false },
           }),
           signal: controller.signal
         }
       );
 
       clearTimeout(timeoutId);
+      console.log(`[TEST openrouter] ${modelId} responded in ${Date.now() - testStartMs}ms, status ${response.status}`);
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
@@ -1337,7 +1361,7 @@ ${textToSend}`;
       }
 
       const data = await response.json();
-      const candidateText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      const candidateText = data.choices?.[0]?.message?.content || '';
 
       // V2: replaced old 2-condition check with template-aware quality scoring
       // Flash Lite (index 0) must score >= 6
