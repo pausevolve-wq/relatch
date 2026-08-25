@@ -1643,7 +1643,7 @@ ${textToSend}`;
       }
     }
 
-    return res.status(200).json({ enriched: enrichedOutput, model: successfulModel });
+    return res.status(200).json({ enriched: enrichedOutput, model: successfulModel, sessionId });
   }
 
   // v2.4: Codex deterministic fallback — fires only when target === 'codex' AND all Gemini
@@ -1656,6 +1656,7 @@ ${textToSend}`;
       enriched: sanitize(fallbackRaw, codexSlug, 'CODEX'),
       model: 'deterministic-fallback',
       fallbackReason: lastGoogleError,
+      sessionId,
     });
   }
 
