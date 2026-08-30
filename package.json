@@ -4,6 +4,7 @@
   "private": true,
   "dependencies": {
     "@clerk/backend": "^1",
-    "@axiomhq/js": "^1"
+    "@axiomhq/js": "^1",
+    "@upstash/redis": "^1"
   }
 }

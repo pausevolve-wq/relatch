@@ -1,5 +1,9 @@
 const { verifyToken, createClerkClient } = require('@clerk/backend');
 const clerkClient = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
+const { Redis } = require('@upstash/redis');
+const redis = (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN)
+  ? new Redis({ url: process.env.UPSTASH_REDIS_REST_URL, token: process.env.UPSTASH_REDIS_REST_TOKEN })
+  : null;
 const { Axiom } = require('@axiomhq/js');
 const axiomClient = process.env.AXIOM_TOKEN
   ? new Axiom({ token: process.env.AXIOM_TOKEN, edge: 'us-east-1.aws.edge.axiom.co' })
@@ -18,24 +22,78 @@ async function logToAxiom(event) {
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', 'https://app.relatch.online');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Anon-Token');
 
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
+  // Auth: a Bearer header ALWAYS takes precedence and is verified through the unchanged
+  // Clerk path, full stop — this is deliberate, not an oversight. An earlier version of
+  // this branch checked X-Anon-Token first regardless of Authorization, which meant any
+  // signed-in user (or anyone who noticed the header) could bypass their own Clerk
+  // daily/weekly quota just by also sending a freshly self-minted X-Anon-Token. Caught in
+  // review before shipping. X-Anon-Token is now only even considered when there is no
+  // Bearer header at all — never as a way to override or supplement one that is present,
+  // valid or not. See relatch-main/api/anon-token.js for issuance.
   const authHeader = req.headers['authorization'];
-  if (!authHeader?.startsWith('Bearer ')) {
+  const anonToken = req.headers['x-anon-token'];
+  let userId = null;
+  let isAnonymousRequest = false;
+
+  if (authHeader?.startsWith('Bearer ')) {
+    try {
+      const payload = await verifyToken(authHeader.slice(7), { secretKey: process.env.CLERK_SECRET_KEY });
+      userId = payload.sub;
+      if (!userId) throw new Error('No userId in token');
+    } catch {
+      await logToAxiom({ endpoint: 'enrich', status: 401, reason: 'invalid_session', ip: req.headers['x-forwarded-for'] || null });
+      return res.status(401).json({ error: 'Invalid session' });
+    }
+  } else if (anonToken) {
+    if (!redis) {
+      await logToAxiom({ endpoint: 'enrich', status: 401, reason: 'anon_redis_unconfigured', ip: req.headers['x-forwarded-for'] || null });
+      return res.status(401).json({ error: 'ANON_TOKEN_INVALID' });
+    }
+    // NOT single-use (GETDEL) — a real "run" is not one HTTP call: a multi-file batch
+    // sends one /api/enrich per file (App.tsx's Promise.allSettled over allFiles, same
+    // pattern the authenticated sessionId dedup below already exists to bundle), and any
+    // file needing OCR calls /api/ocr first. A strict single-consume token dies on the
+    // second file or the post-OCR call, breaking the anonymous trial for exactly those
+    // cases. Instead this mirrors the free-session generosity already granted to signed-in
+    // users just below (SESSION_TTL_MS / MAX_FREE_REQUESTS_PER_SESSION) — see the call-count
+    // cap right after this block for the compensating bound that generosity needs.
+    // Deliberately a literal, not a reference to MAX_FREE_REQUESTS_PER_SESSION below — that
+    // const is declared later in this function (inside the quota-gate section) and referencing
+    // it here would throw a TDZ ReferenceError on every anonymous request. Keep this value in
+    // sync with MAX_FREE_REQUESTS_PER_SESSION by hand if that one ever changes.
+    const ANON_MAX_ENRICH_CALLS = 5;
+    try {
+      const validToken = await redis.get(`anon:${anonToken}`);
+      if (validToken === null) {
+        await logToAxiom({ endpoint: 'enrich', status: 401, reason: 'anon_token_invalid', ip: req.headers['x-forwarded-for'] || null });
+        return res.status(401).json({ error: 'ANON_TOKEN_INVALID' });
+      }
+      // Without a single-use delete, the token alone no longer bounds spend — cap real
+      // generation calls per token explicitly instead (a plain TTL window would otherwise
+      // let one token drive unlimited Gemini calls for its full 10 minutes). OCR calls are
+      // deliberately NOT counted here — this counter is specifically about the expensive,
+      // real generation resource, not the OCR preprocessing step.
+      const callCount = await redis.incr(`anon:${anonToken}:calls`);
+      if (callCount === 1) await redis.expire(`anon:${anonToken}:calls`, 600);
+      if (callCount > ANON_MAX_ENRICH_CALLS) {
+        await logToAxiom({ endpoint: 'enrich', status: 401, reason: 'anon_call_cap_reached', ip: req.headers['x-forwarded-for'] || null });
+        return res.status(401).json({ error: 'ANON_TOKEN_INVALID' });
+      }
+    } catch (redisErr) {
+      // Fail closed, matching every other external-call posture in this file.
+      console.error('[anon] Redis check failed:', redisErr?.message || redisErr);
+      await logToAxiom({ endpoint: 'enrich', status: 401, reason: 'anon_redis_error', ip: req.headers['x-forwarded-for'] || null });
+      return res.status(401).json({ error: 'ANON_TOKEN_INVALID' });
+    }
+    isAnonymousRequest = true;
+  } else {
     await logToAxiom({ endpoint: 'enrich', status: 401, reason: 'missing_bearer', ip: req.headers['x-forwarded-for'] || null });
     return res.status(401).json({ error: 'Unauthorized' });
-  }
-  let userId;
-  try {
-    const payload = await verifyToken(authHeader.slice(7), { secretKey: process.env.CLERK_SECRET_KEY });
-    userId = payload.sub;
-    if (!userId) throw new Error('No userId in token');
-  } catch {
-    await logToAxiom({ endpoint: 'enrich', status: 401, reason: 'invalid_session', ip: req.headers['x-forwarded-for'] || null });
-    return res.status(401).json({ error: 'Invalid session' });
   }
 
   // V2: destructure new fields from frontend (template, richFormats, charCap)
@@ -95,6 +153,11 @@ module.exports = async function handler(req, res) {
   let quotaUsage = null;
   let quotaUser  = null;
 
+  // Anonymous requests never touch Clerk-backed quota — there is no userId to look up,
+  // and the one-time anon token already bounds usage to exactly one run by construction.
+  // quotaUsage/quotaUser stay null, which the post-generation write below (`if (quotaUsage
+  // && quotaUser)`) already treats as "nothing to record."
+  if (!isAnonymousRequest) {
   try {
     quotaUser = await clerkClient.users.getUser(userId);
     const now = new Date();
@@ -153,6 +216,7 @@ module.exports = async function handler(req, res) {
       error: 'QUOTA_UNAVAILABLE',
       message: 'Unable to verify your usage quota right now. Please try again in a moment.',
     });
+  }
   }
   // ─── END QUOTA GATE ──────────────────────────────────────────────────────────
 
