@@ -62,22 +62,60 @@ module.exports = async function handler(req, res) {
     // cases. Instead this mirrors the free-session generosity already granted to signed-in
     // users just below (SESSION_TTL_MS / MAX_FREE_REQUESTS_PER_SESSION) — see the call-count
     // cap right after this block for the compensating bound that generosity needs.
+    //
+    // 2026-08-30 fix: the above (allowing repeated use within the token's TTL, bounded only
+    // by a call count) was itself too permissive — live-tested by Manas: refreshing the page
+    // and starting a completely separate second run still succeeded with the same stored
+    // token, producing two free generations instead of one. Real "one trial" is bound to a
+    // specific run, not a time window. `sessionId` (already generated once per upload batch
+    // in App.tsx's handleFiles, and already the exact mechanism the signed-in quota gate
+    // below uses for its own "same batch" dedup) is the right unit: the token's FIRST real
+    // use claims it for that sessionId; every subsequent call with that SAME sessionId still
+    // works (same run, multiple files); a call with a DIFFERENT sessionId means a genuinely
+    // new/second run and is rejected — that's the actual one-time boundary.
     // Deliberately a literal, not a reference to MAX_FREE_REQUESTS_PER_SESSION below — that
     // const is declared later in this function (inside the quota-gate section) and referencing
     // it here would throw a TDZ ReferenceError on every anonymous request. Keep this value in
     // sync with MAX_FREE_REQUESTS_PER_SESSION by hand if that one ever changes.
     const ANON_MAX_ENRICH_CALLS = 5;
+    const requestSessionId = req.body?.sessionId;
+    if (!requestSessionId) {
+      // No sessionId means this call can't be bound/tracked as belonging to a specific run —
+      // reject rather than risk granting an untracked anonymous generation. Every real upload
+      // batch always sends one (App.tsx handleFiles generates it unconditionally).
+      await logToAxiom({ endpoint: 'enrich', status: 401, reason: 'anon_missing_session_id', ip: req.headers['x-forwarded-for'] || null });
+      return res.status(401).json({ error: 'ANON_TOKEN_INVALID' });
+    }
     try {
       const validToken = await redis.get(`anon:${anonToken}`);
       if (validToken === null) {
         await logToAxiom({ endpoint: 'enrich', status: 401, reason: 'anon_token_invalid', ip: req.headers['x-forwarded-for'] || null });
         return res.status(401).json({ error: 'ANON_TOKEN_INVALID' });
       }
-      // Without a single-use delete, the token alone no longer bounds spend — cap real
-      // generation calls per token explicitly instead (a plain TTL window would otherwise
-      // let one token drive unlimited Gemini calls for its full 10 minutes). OCR calls are
-      // deliberately NOT counted here — this counter is specifically about the expensive,
-      // real generation resource, not the OCR preprocessing step.
+      // Claim atomically via SET NX (same primitive anon-token.js already uses to issue the
+      // token itself) rather than GET-then-conditional-SET — a plain read-then-write here
+      // would race: two concurrent requests carrying the same token but different sessionIds
+      // could both read "unclaimed" before either write lands, and both slip through as
+      // "first use." SET NX makes the claim itself atomic; only the loser needs a follow-up
+      // read to find out who won.
+      const claimedSessionKey = `anon:${anonToken}:session`;
+      const claimResult = await redis.set(claimedSessionKey, requestSessionId, { nx: true, ex: 600 });
+      if (claimResult === null) {
+        // Key already existed — this token was already claimed (by this same request race,
+        // a genuine earlier call, or a concurrent one). Read back and compare as strings:
+        // Upstash's REST client auto-JSON-parses GET results, so a purely-numeric sessionId
+        // would come back as a JS number and silently fail a strict !== against the current
+        // request's string — coercing both sides avoids that entirely, not just today's
+        // sessionId format (always non-numeric-prefixed, but not guaranteed to stay that way).
+        const claimedSessionId = await redis.get(claimedSessionKey);
+        if (String(claimedSessionId) !== String(requestSessionId)) {
+          // Claimed by a genuinely different run — this IS the one-trial-ever boundary.
+          await logToAxiom({ endpoint: 'enrich', status: 401, reason: 'anon_session_mismatch', ip: req.headers['x-forwarded-for'] || null });
+          return res.status(401).json({ error: 'ANON_TOKEN_INVALID' });
+        }
+        // else: claimed by OUR OWN sessionId — a legitimate second file in the same batch.
+      }
+      // Bounds spend within one legitimate run (a multi-file batch calls this per file).
       const callCount = await redis.incr(`anon:${anonToken}:calls`);
       if (callCount === 1) await redis.expire(`anon:${anonToken}:calls`, 600);
       if (callCount > ANON_MAX_ENRICH_CALLS) {
