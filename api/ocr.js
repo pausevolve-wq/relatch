@@ -1,5 +1,9 @@
 const { verifyToken, createClerkClient } = require('@clerk/backend');
 const clerkClient = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
+const { Redis } = require('@upstash/redis');
+const redis = (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN)
+  ? new Redis({ url: process.env.UPSTASH_REDIS_REST_URL, token: process.env.UPSTASH_REDIS_REST_TOKEN })
+  : null;
 const { Axiom } = require('@axiomhq/js');
 const axiomClient = process.env.AXIOM_TOKEN
   ? new Axiom({ token: process.env.AXIOM_TOKEN, edge: 'us-east-1.aws.edge.axiom.co' })
@@ -48,24 +52,54 @@ async function fetchWithTimeout(url, options, timeoutMs) {
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', 'https://app.relatch.online');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Anon-Token');
 
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
+  // Auth: a Bearer header ALWAYS takes precedence over X-Anon-Token, same fix and same
+  // reason as enrich.js — checked there first (a signed-in user must never be able to
+  // bypass their own Clerk quota by also sending a self-minted anon token). X-Anon-Token
+  // is only considered when there is no Bearer header at all. Not single-use: this only
+  // peeks (GET) to verify the token is live within its TTL — a run can call /api/ocr for
+  // some files and not others, ahead of /api/enrich; a strict single-consume token would
+  // die here before the run's real work even starts. See enrich.js and anon-token.js for
+  // the full model (enrich.js is also where the per-token call-count cap lives — OCR
+  // preprocessing calls are deliberately not counted against it).
   const authHeader = req.headers['authorization'];
-  if (!authHeader?.startsWith('Bearer ')) {
+  const anonToken = req.headers['x-anon-token'];
+  let userId = null;
+  let isAnonymousRequest = false;
+
+  if (authHeader?.startsWith('Bearer ')) {
+    try {
+      const payload = await verifyToken(authHeader.slice(7), { secretKey: process.env.CLERK_SECRET_KEY });
+      userId = payload.sub;
+      if (!userId) throw new Error('No userId in token');
+    } catch {
+      await logToAxiom({ endpoint: 'ocr', status: 401, reason: 'invalid_session', ip: req.headers['x-forwarded-for'] || null });
+      return res.status(401).json({ error: 'Invalid session' });
+    }
+  } else if (anonToken) {
+    if (!redis) {
+      await logToAxiom({ endpoint: 'ocr', status: 401, reason: 'anon_redis_unconfigured', ip: req.headers['x-forwarded-for'] || null });
+      return res.status(401).json({ error: 'ANON_TOKEN_INVALID' });
+    }
+    try {
+      const validToken = await redis.get(`anon:${anonToken}`);
+      if (validToken === null) {
+        await logToAxiom({ endpoint: 'ocr', status: 401, reason: 'anon_token_invalid', ip: req.headers['x-forwarded-for'] || null });
+        return res.status(401).json({ error: 'ANON_TOKEN_INVALID' });
+      }
+    } catch (redisErr) {
+      console.error('[anon] Redis check failed:', redisErr?.message || redisErr);
+      await logToAxiom({ endpoint: 'ocr', status: 401, reason: 'anon_redis_error', ip: req.headers['x-forwarded-for'] || null });
+      return res.status(401).json({ error: 'ANON_TOKEN_INVALID' });
+    }
+    isAnonymousRequest = true;
+  } else {
     await logToAxiom({ endpoint: 'ocr', status: 401, reason: 'missing_bearer', ip: req.headers['x-forwarded-for'] || null });
     return res.status(401).json({ error: 'Unauthorized' });
-  }
-  let userId;
-  try {
-    const payload = await verifyToken(authHeader.slice(7), { secretKey: process.env.CLERK_SECRET_KEY });
-    userId = payload.sub;
-    if (!userId) throw new Error('No userId in token');
-  } catch {
-    await logToAxiom({ endpoint: 'ocr', status: 401, reason: 'invalid_session', ip: req.headers['x-forwarded-for'] || null });
-    return res.status(401).json({ error: 'Invalid session' });
   }
 
   const { base64, mimeType, fileName } = req.body;
@@ -167,7 +201,12 @@ module.exports = async function handler(req, res) {
   const DATALAB_DAILY_LIMIT = 3;
   let datalabAllowed = true;
 
-  if (datalabKey) {
+  // Anonymous requests skip the paid Datalab tier entirely — it's gated by a per-Clerk-user
+  // daily quota, and there's no userId to track for an anonymous request. Anonymous OCR
+  // still gets Mistral (above) and OCR.space (below), neither of which are user-quota-gated.
+  if (isAnonymousRequest) datalabAllowed = false;
+
+  if (datalabKey && !isAnonymousRequest) {
     try {
       const { dailyCount } = await getDatalabDailyCount(userId);
 
