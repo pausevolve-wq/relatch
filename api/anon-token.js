@@ -41,10 +41,12 @@ module.exports = async function handler(req, res) {
   
   try {
     const ipCount = await redis.incr(ipKey);
-    if (ipCount === 1) {
-      await redis.expire(ipKey, ANON_TOKEN_RATE_LIMIT_WINDOW);
-    }
-    
+    // NX: only sets a TTL if the key doesn't already have one. Self-healing if a
+    // previous request's expire call failed after its incr succeeded (which would
+    // otherwise leave this key permanently un-expiring and lock the IP out forever);
+    // a no-op once the window's TTL is already set, so this stays a fixed window.
+    await redis.expire(ipKey, ANON_TOKEN_RATE_LIMIT_WINDOW, 'NX');
+
     if (ipCount > ANON_TOKEN_RATE_LIMIT_MAX) {
       await logToAxiom({ endpoint: 'anon-token', status: 429, reason: 'ip_rate_limit_exceeded', ip });
       return res.status(429).json({ error: 'ANON_TOKEN_RATE_LIMITED' });
