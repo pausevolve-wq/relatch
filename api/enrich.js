@@ -8,6 +8,9 @@ const { Axiom } = require('@axiomhq/js');
 const axiomClient = process.env.AXIOM_TOKEN
   ? new Axiom({ token: process.env.AXIOM_TOKEN, edge: 'us-east-1.aws.edge.axiom.co' })
   : null;
+// Jev planning layer (2026-09-26): fail-open typed decisions about the document before
+// template routing. See lib/planner.js - every export is a no-op on a null plan.
+const { planDocument, routeTemplate, routeCodexShape, buildPlanDirectives, buildFacetModules, summarizePlan } = require('../lib/planner');
 
 async function logToAxiom(event) {
   if (!axiomClient) return;
@@ -144,10 +147,14 @@ module.exports = async function handler(req, res) {
     return res.status(400).json({ error: 'Missing required fields' });
   }
 
+  // 2026-09-26 (Jev planning layer): timeouts widened for the 300s function window.
+  // The old 60s wall was self-imposed by vercel.json, not a Vercel limit - Hobby with
+  // Fluid Compute allows 300s (verified live via the Vercel API 2026-09-24). Was model1
+  // 25/25/35s and model2 20/20/18s; the 60s-era sizing notes further down are history.
   const CODEX_POLICY = {
     timeouts: {
-      model1: { small: 25000, medium: 25000, large: 35000 },
-      model2: { small: 20000, medium: 20000, large: 18000 },
+      model1: { small: 45000, medium: 60000, large: 75000 },
+      model2: { small: 40000, medium: 40000, large: 40000 },
     },
     tokenBudgets: {
       small:  { lite: 1000, flash: 1000 },
@@ -158,6 +165,9 @@ module.exports = async function handler(req, res) {
     model2ReserveMs: 8000,
   };
   const requestStartMs = Date.now();
+  // Internal budget inside vercel.json's maxDuration (300s), leaving 20s for sanitize,
+  // the Clerk quota write and response serialization. Replaces the old hardcoded 58000.
+  const FUNCTION_BUDGET_MS = 280000;
 
   // ─── QUOTA GATE ──────────────────────────────────────────────────────────────
   const DAILY_LIMIT  = 5;
@@ -409,8 +419,14 @@ module.exports = async function handler(req, res) {
   const codexSlug = skillName.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '') || 'my-skill';
   const activeTarget = target === 'codex' ? 'codex' : 'claude';
 
+  // Jev planning layer (2026-09-26): one fan-out call, <=4s, fail-open. Placed after auth,
+  // the quota gate and the 422 validation so no Jev call is spent on rejected requests.
+  // Receives rawText (not the signal-filtered text) so it judges the whole document.
+  const plan = await planDocument({ text: rawText, fileName, category, sizeClass: effectiveSizeClass, target: activeTarget });
+
   // V2: determine active template — default to 'A' if not provided (backward compatible)
-  const activeTemplate = template || 'A';
+  // Jev may override A/C/D on a confident doc-type answer; B and E are never touched.
+  const activeTemplate = routeTemplate(template || 'A', plan, activeTarget);
   // v2.1: when targeting Codex, override template selection to the CODEX prompt + scoring path
   const effectiveTemplate = activeTarget === 'codex' ? 'CODEX' : activeTemplate;
 
@@ -420,7 +436,12 @@ module.exports = async function handler(req, res) {
   // SPECIALIST = constrained domain role (compliance, legal, ops) — flowcharts + decision matrices
   // Backward-compatible: defaults to 'execute' when not provided (the 70% bet).
   const allowedShapes = ['execute', 'expertise', 'specialist'];
-  const activeCodexShape = allowedShapes.includes(codexShape) ? codexShape : 'execute';
+  const clientCodexShape = allowedShapes.includes(codexShape) ? codexShape : 'execute';
+  // Jev may override the regex-derived shape on a confident answer (Codex target only).
+  const activeCodexShape = routeCodexShape(clientCodexShape, plan, activeTarget);
+  // Depth boost: x1.5 output tokens only when Jev is confident the source is dense.
+  // Claude only - Codex prompts keep a deliberate word budget. No plan = exactly today's budgets.
+  const planTokenMultiplier = plan && plan.depth && plan.depth.dense && activeTarget === 'claude' ? 1.5 : 1;
 
   // v2.2.1: Source-structure pre-scan — detect which rich components the source
   // actually supports, so Codex prompts can tell Gemini what to render vs skip.
@@ -1141,6 +1162,22 @@ CONTENT:
 ${textToSend}`;
   }
 
+  // Jev planning layer (2026-09-26): both edits are no-ops when plan is null, so the
+  // prompt stays byte-identical to the pre-Jev path.
+  // 1. Facet modules (Claude A/C/D only) go right before the template's CONTENT marker,
+  //    telling the model to append them AFTER ## Quality Bar - existing section order is
+  //    untouched. Replacer FUNCTION, not a string: a replacement string would treat any
+  //    `$` in it as a special pattern.
+  const facetModules = buildFacetModules(plan, activeTemplate, activeTarget);
+  if (facetModules) prompt = prompt.replace('\nCONTENT:\n', () => `\n${facetModules}\nCONTENT:\n`);
+  // 2. The plan block leads the prompt, ahead of documentContext.
+  const planDirectives = buildPlanDirectives(plan, activeTarget);
+  if (planDirectives) prompt = planDirectives + prompt;
+  const planSummary = plan
+    ? summarizePlan(plan, { clientTemplate: template || 'A', template: activeTemplate, clientShape: clientCodexShape, codexShape: activeCodexShape, target: activeTarget })
+    : null;
+  if (planSummary) console.log('[plan]', planSummary);
+
   // ─────────────────────────────────────────────────────────────────────────────
   // SANITIZE FUNCTION
   // UNCHANGED: all YAML repair logic preserved exactly
@@ -1415,13 +1452,14 @@ ${textToSend}`;
     // live testing showed truncated output at budgetForSize.lite (1400) on a Codex-shape
     // generation even with reasoning effort set to low; +700 fixed it in testing. Applied
     // only to this provider — Gemini's own budget is unchanged.
-    const baseTokenBudget = modelIndex === 0 ? budgetForSize.lite : budgetForSize.flash;
+    // planTokenMultiplier is 1 unless Jev judged the source dense (Claude target only).
+    const baseTokenBudget = Math.round((modelIndex === 0 ? budgetForSize.lite : budgetForSize.flash) * planTokenMultiplier);
     const outputTokenBudget = provider === 'openrouter' ? baseTokenBudget + 700 : baseTokenBudget;
 
     // Codex-only: skip model 2 if insufficient time remains for a useful response.
     // Prevents spending the last few seconds on a weak attempt likely to timeout.
     if (activeTarget === 'codex' && modelIndex > 0) {
-      const remainingMs = 58000 - (Date.now() - requestStartMs);
+      const remainingMs = FUNCTION_BUDGET_MS - (Date.now() - requestStartMs);
       if (remainingMs < CODEX_POLICY.model2ReserveMs) {
         clearTimeout(timeoutId);
         lastGoogleError = `timeout_model_2 (skipped: only ${Math.round(remainingMs / 1000)}s remaining)`;
@@ -1745,7 +1783,8 @@ ${textToSend}`;
       }
     }
 
-    return res.status(200).json({ enriched: enrichedOutput, model: successfulModel, sessionId });
+    // `plan` only appears when Jev answered - the frontend ignores unknown fields.
+    return res.status(200).json({ enriched: enrichedOutput, model: successfulModel, sessionId, ...(planSummary ? { plan: planSummary } : {}) });
   }
 
   // v2.4: Codex deterministic fallback — fires only when target === 'codex' AND all Gemini
@@ -1759,6 +1798,7 @@ ${textToSend}`;
       model: 'deterministic-fallback',
       fallbackReason: lastGoogleError,
       sessionId,
+      ...(planSummary ? { plan: planSummary } : {}),
     });
   }
 

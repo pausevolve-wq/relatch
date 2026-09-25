@@ -2,7 +2,7 @@
   "version": 2,
   "functions": {
     "api/enrich.js": {
-      "maxDuration": 60
+      "maxDuration": 300
     },
     "api/ocr.js": {
       "maxDuration": 60
