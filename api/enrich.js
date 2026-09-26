@@ -1385,6 +1385,17 @@ ${textToSend}`;
     if (yamlStart > 0) text = text.slice(yamlStart);
     if (!text.startsWith('---')) text = '---\n' + text;
 
+    // 2026-09-26: close an unclosed frontmatter block. Gemini omits the closing --- in about
+    // half of all Claude outputs (every saved bake-off result back to the pre-Jev baseline),
+    // and then fmMatch below never matches, so none of the YAML repairs run and the API output
+    // keeps an unterminated frontmatter. Same repair the CODEX branch above applies, except
+    // "closed" is judged only up to the first ## heading, so a --- horizontal rule later in
+    // the body is never mistaken for the closing delimiter.
+    const firstHeadingIdx = text.indexOf('\n## ');
+    if (firstHeadingIdx > 3 && !text.slice(0, firstHeadingIdx).split('\n').slice(1).some((l) => l.trim() === '---')) {
+      text = text.slice(0, firstHeadingIdx) + '\n---\n' + text.slice(firstHeadingIdx);
+    }
+
     // UNCHANGED — exact same YAML field repair as before
     const fmMatch = text.match(/^---\n([\s\S]*?)\n---/);
     if (fmMatch) {
