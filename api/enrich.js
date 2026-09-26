@@ -153,7 +153,10 @@ module.exports = async function handler(req, res) {
   // 25/25/35s and model2 20/20/18s; the 60s-era sizing notes further down are history.
   const CODEX_POLICY = {
     timeouts: {
-      model1: { small: 45000, medium: 60000, large: 75000 },
+      // 2026-09-26 truncation fix: model1 45/60/75s -> 60/75/90s so the raised token caps
+      // (tokenBudgets below, up to 2600 x 1.5 = 3900 on a dense large doc) still finish at
+      // Gemini's ~55 tok/s degraded floor (~71s). Worst case 4 + 90 + 40 + ~5 = ~139s < 280s.
+      model1: { small: 60000, medium: 75000, large: 90000 },
       model2: { small: 40000, medium: 40000, large: 40000 },
     },
     tokenBudgets: {
@@ -349,10 +352,17 @@ module.exports = async function handler(req, res) {
   // Derived from Vercel 60s gateway + 45s internal timeout + Gemini throughput rates.
   // Flash Lite: 55 tok/s degraded floor × 35s window = 1925 ceiling → 1800 safe.
   // 2.5 Flash: fallback only, shorter effective window → capped lower.
+  // 2026-09-26 truncation fix: the lines above describe the old 60s window. With 300s
+  // (Hobby + Fluid, vercel.json maxDuration) the caps were raised because the 1000-token
+  // small cap was cutting complete skill files off mid-sentence: 3/3 small Template A files
+  // in the 2026-09-25 bake-off ended mid-sentence (a complete small A file is ~1000-1200
+  // tokens), and scoreOutput still scored them 9/9. These are ceilings, not targets - the
+  // model stops when the file is done, so raising them adds no length and no cost by itself.
+  // The Jev depth boost (x1.5) still applies on top. flash keeps its +700 OpenRouter pad below.
   const tokenBudgets = {
-    small:  { lite: 1000, flash: 1000 },
-    medium: { lite: 1400, flash: 1200 },
-    large:  { lite: 1800, flash: 1400 },
+    small:  { lite: 1600, flash: 1600 },
+    medium: { lite: 2000, flash: 1800 },
+    large:  { lite: 2600, flash: 2200 },
   };
   const budgetForSize = tokenBudgets[effectiveSizeClass] || tokenBudgets.small;
   // ─────────────────────────────────────────────────────────────────────────
@@ -1531,6 +1541,14 @@ ${textToSend}`;
       const candidateText = provider === 'gemini'
         ? (data.candidates?.[0]?.content?.parts?.[0]?.text || '')
         : (data.choices?.[0]?.message?.content || '');
+
+      // 2026-09-26 truncation telemetry: the provider's own stop reason is the only reliable
+      // truncation signal (scoreOutput can't see it - it scored cut-off files 9/9). Log only;
+      // acceptance and fallback behaviour are unchanged.
+      const stopReason = provider === 'gemini' ? data.candidates?.[0]?.finishReason : data.choices?.[0]?.finish_reason;
+      if (stopReason === 'MAX_TOKENS' || stopReason === 'length') {
+        console.log('[enrich] hit output cap', { model: modelId, template: effectiveTemplate, sizeClass: effectiveSizeClass, cap: outputTokenBudget, chars: candidateText.length });
+      }
 
       // V2: replaced old 2-condition check with template-aware quality scoring
       // Flash Lite (index 0) must score >= 6
