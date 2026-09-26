@@ -10,7 +10,7 @@ const axiomClient = process.env.AXIOM_TOKEN
   : null;
 // Jev planning layer (2026-09-26): fail-open typed decisions about the document before
 // template routing. See lib/planner.js - every export is a no-op on a null plan.
-const { planDocument, routeTemplate, routeCodexShape, buildPlanDirectives, buildFacetModules, summarizePlan } = require('../lib/planner');
+const { planDocument, routeTemplate, routeCodexShape, buildPlanDirectives, buildFacetModules, summarizePlan, mapContent, spreadSelect, SPREAD_NOTE, summarizeContent } = require('../lib/planner');
 
 async function logToAxiom(event) {
   if (!axiomClient) return;
@@ -290,6 +290,32 @@ module.exports = async function handler(req, res) {
     });
   }
 
+  // ── JEV LAYER (2026-09-26 content fidelity) ──────────────────────────────────
+  // The plan and the content map run as ONE parallel step here, before the signal filter, so
+  // page furniture (menus, sign-in prompts, footers, TOC, repeated headers) is removed before
+  // anything is filtered or truncated. Placed after auth, the quota gate and the 422 validation
+  // so no Jev call is spent on rejected requests. Both are fail-open: with no key or on any
+  // failure they return null and every step below is exactly the pre-Jev path.
+  // effectiveSizeClass moved up here from the ADAPTIVE OUTPUT BUDGET block (unchanged; it only
+  // reads sizeClass and charCap) because the planner needs it before the filter.
+  // Derive sizeClass from frontend signal. If frontend is old and didn't send
+  // sizeClass, reconstruct from charCap with same thresholds as App.tsx profiler.
+  const effectiveSizeClass =
+    sizeClass === 'large' || sizeClass === 'medium' || sizeClass === 'small'
+      ? sizeClass
+      : charCap >= 8000
+        ? 'large'
+        : charCap >= 5000
+          ? 'medium'
+          : 'small';
+  const [plan, contentMap] = await Promise.all([
+    planDocument({ text: rawText, fileName, category, sizeClass: effectiveSizeClass, target: target === 'codex' ? 'codex' : 'claude' }),
+    mapContent({ text: rawText, fileName, template }),
+  ]);
+  // Furniture removed (whole original lines, original order); rawText when no map.
+  const sourceText = contentMap ? contentMap.text : rawText;
+  // ─────────────────────────────────────────────────────────────────────────────
+
   // Signal-line filter. Claude path uses the original behavioral-keyword criteria
   // exactly as before. v2.2.1 adds a Codex-only branch that preserves code-shaped
   // lines (declarations, control flow, syntax-marker chars, comments) — these have
@@ -298,7 +324,9 @@ module.exports = async function handler(req, res) {
   // clause for the Claude path when template === 'B' so structural code lines survive
   // the filter and reach the Codebase Intelligence prompt. Uses `template` (from
   // req.body, line 25) rather than `activeTemplate` which is not yet in scope here.
-  const allLines = rawText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+  // 2026-09-26: reads sourceText (rawText with page furniture removed by the content map, or
+  // rawText itself when there is no map) - see the JEV LAYER block above.
+  const allLines = sourceText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
   const signalLines = allLines.filter(line =>
     line.length > 20 && (
       /\d/.test(line) ||
@@ -330,25 +358,20 @@ module.exports = async function handler(req, res) {
     )
   );
 
-  const filteredText = signalLines.length >= 5 ? signalLines.join('\n') : rawText;
+  const filteredText = signalLines.length >= 5 ? signalLines.join('\n') : sourceText;
 
   // V2: use charCap from profiler if provided, otherwise fall back to original logic
   const effectiveCharCap = charCap || (signalLines.length >= 5 ? 2500 : 3500);
   // `let`, not `const`, since 2026-09-26: when Jev routes a non-B request INTO Template B,
   // this is replaced with the unfiltered source further down (see activeTemplate).
-  let textToSend = filteredText.slice(0, effectiveCharCap);
+  // Content fidelity (2026-09-26): with a content map, an over-cap text is no longer cut to its
+  // head - whole-line chunks are picked evenly from start to end (spreadSelect). No map = the
+  // original head slice, byte for byte.
+  const selection = contentMap ? spreadSelect(filteredText, effectiveCharCap) : { text: filteredText.slice(0, effectiveCharCap), spread: false };
+  let textToSend = selection.text;
 
   // ── ADAPTIVE OUTPUT BUDGET ────────────────────────────────────────────────
-  // Derive sizeClass from frontend signal. If frontend is old and didn't send
-  // sizeClass, reconstruct from charCap with same thresholds as App.tsx profiler.
-  const effectiveSizeClass =
-    sizeClass === 'large' || sizeClass === 'medium' || sizeClass === 'small'
-      ? sizeClass
-      : charCap >= 8000
-        ? 'large'
-        : charCap >= 5000
-          ? 'medium'
-          : 'small';
+  // (effectiveSizeClass is derived in the JEV LAYER block above since 2026-09-26.)
 
   // Token budgets per model, per sizeClass.
   // Derived from Vercel 60s gateway + 45s internal timeout + Gemini throughput rates.
@@ -434,7 +457,8 @@ module.exports = async function handler(req, res) {
   // Jev planning layer (2026-09-26): one fan-out call, <=4s, fail-open. Placed after auth,
   // the quota gate and the 422 validation so no Jev call is spent on rejected requests.
   // Receives rawText (not the signal-filtered text) so it judges the whole document.
-  const plan = await planDocument({ text: rawText, fileName, category, sizeClass: effectiveSizeClass, target: activeTarget });
+  // (Content fidelity, 2026-09-26: `plan` is now computed in the JEV LAYER block above, in
+  // parallel with the content map and before the signal filter - same inputs as before.)
 
   // V2: determine active template — default to 'A' if not provided (backward compatible)
   // Jev may override A/C/D on a confident doc-type answer; B and E are never touched.
@@ -444,7 +468,8 @@ module.exports = async function handler(req, res) {
   // Routed INTO B: the signal-line filter above ran with the client's template (it must read
   // `template`, not `activeTemplate` - TDZ rule) and drops most code-shaped lines on A/C/D.
   // Give B the unfiltered source instead, capped the same way. The filter itself is untouched.
-  if (activeTemplate === 'B' && template !== 'B') textToSend = rawText.slice(0, effectiveCharCap);
+  // (2026-09-26: from sourceText, so removed page furniture stays removed.)
+  if (activeTemplate === 'B' && template !== 'B') textToSend = sourceText.slice(0, effectiveCharCap);
   // v2.1: when targeting Codex, override template selection to the CODEX prompt + scoring path
   const effectiveTemplate = activeTarget === 'codex' ? 'CODEX' : activeTemplate;
 
@@ -1194,11 +1219,16 @@ ${textToSend}`;
   if (facetModules) prompt = prompt.replace('\nCONTENT:\n', () => `\n${facetModules}\nCONTENT:\n`);
   // 2. The plan block leads the prompt, ahead of documentContext.
   const planDirectives = buildPlanDirectives(plan, activeTarget, activeTemplate);
+  // 3. Content fidelity (2026-09-26): say so when the source is a spread excerpt. Only when
+  //    spreadSelect actually applied, i.e. only with a content map.
+  if (selection.spread && textToSend === selection.text) prompt = SPREAD_NOTE + prompt;
   if (planDirectives) prompt = planDirectives + prompt;
   const planSummary = plan
     ? summarizePlan(plan, { clientTemplate: template || 'A', template: activeTemplate, clientShape: clientCodexShape, codexShape: activeCodexShape, target: activeTarget })
     : null;
   if (planSummary) console.log('[plan]', planSummary);
+  const contentSummary = contentMap ? summarizeContent(contentMap, selection.spread && textToSend === selection.text) : null;
+  if (contentSummary) console.log('[content]', contentSummary);
 
   // ─────────────────────────────────────────────────────────────────────────────
   // SANITIZE FUNCTION
@@ -1829,7 +1859,7 @@ ${textToSend}`;
     }
 
     // `plan` only appears when Jev answered - the frontend ignores unknown fields.
-    return res.status(200).json({ enriched: enrichedOutput, model: successfulModel, sessionId, ...(planSummary ? { plan: planSummary } : {}) });
+    return res.status(200).json({ enriched: enrichedOutput, model: successfulModel, sessionId, ...(planSummary ? { plan: planSummary } : {}), ...(contentSummary ? { content: contentSummary } : {}) });
   }
 
   // v2.4: Codex deterministic fallback — fires only when target === 'codex' AND all Gemini
@@ -1844,6 +1874,7 @@ ${textToSend}`;
       fallbackReason: lastGoogleError,
       sessionId,
       ...(planSummary ? { plan: planSummary } : {}),
+      ...(contentSummary ? { content: contentSummary } : {}),
     });
   }
 
