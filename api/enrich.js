@@ -1397,7 +1397,11 @@ ${textToSend}`;
       if (!/^domain:/m.test(fm))       fm += `\ndomain: "General"`;
       if (!/^content_type:/m.test(fm)) fm += `\ncontent_type: "behavioral skill"`;
       if (!/^use_cases:/m.test(fm))    fm += `\nuse_cases: ["general use"]`;
-      fm = fm.replace(/^(name|domain|content_type):\s*(?!")(.+)$/gm, (_, key, val) => `${key}: "${val.trim()}"`);
+      // 2026-09-26: `(?![\s"])`, was `(?!")`. With `(?!")`, `\s*` backtracked to zero width so
+      // the lookahead saw the space instead of the quote, and every already-quoted value was
+      // quoted again (`name: ""X""`, invalid YAML). The frontend's multi-file SKILL.md then
+      // read an empty domain from it (App.tsx `^domain:` regex).
+      fm = fm.replace(/^(name|domain|content_type):\s*(?![\s"])(.+)$/gm, (_, key, val) => `${key}: "${val.trim()}"`);
       text = `---\n${fm.trim()}\n---` + text.slice(fmMatch[0].length);
     }
 
