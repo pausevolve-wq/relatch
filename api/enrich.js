@@ -331,7 +331,9 @@ module.exports = async function handler(req, res) {
 
   // V2: use charCap from profiler if provided, otherwise fall back to original logic
   const effectiveCharCap = charCap || (signalLines.length >= 5 ? 2500 : 3500);
-  const textToSend = filteredText.slice(0, effectiveCharCap);
+  // `let`, not `const`, since 2026-09-26: when Jev routes a non-B request INTO Template B,
+  // this is replaced with the unfiltered source further down (see activeTemplate).
+  let textToSend = filteredText.slice(0, effectiveCharCap);
 
   // ── ADAPTIVE OUTPUT BUDGET ────────────────────────────────────────────────
   // Derive sizeClass from frontend signal. If frontend is old and didn't send
@@ -426,7 +428,13 @@ module.exports = async function handler(req, res) {
 
   // V2: determine active template — default to 'A' if not provided (backward compatible)
   // Jev may override A/C/D on a confident doc-type answer; B and E are never touched.
+  // 2026-09-26: B now joins routing behind a double lock (Jev >= 0.9 AND code-like lines
+  // counted in code) - see routeTemplate in lib/planner.js. E is still never touched.
   const activeTemplate = routeTemplate(template || 'A', plan, activeTarget);
+  // Routed INTO B: the signal-line filter above ran with the client's template (it must read
+  // `template`, not `activeTemplate` - TDZ rule) and drops most code-shaped lines on A/C/D.
+  // Give B the unfiltered source instead, capped the same way. The filter itself is untouched.
+  if (activeTemplate === 'B' && template !== 'B') textToSend = rawText.slice(0, effectiveCharCap);
   // v2.1: when targeting Codex, override template selection to the CODEX prompt + scoring path
   const effectiveTemplate = activeTarget === 'codex' ? 'CODEX' : activeTemplate;
 
@@ -441,7 +449,9 @@ module.exports = async function handler(req, res) {
   const activeCodexShape = routeCodexShape(clientCodexShape, plan, activeTarget);
   // Depth boost: x1.5 output tokens only when Jev is confident the source is dense.
   // Claude only - Codex prompts keep a deliberate word budget. No plan = exactly today's budgets.
-  const planTokenMultiplier = plan && plan.depth && plan.depth.dense && activeTarget === 'claude' ? 1.5 : 1;
+  // 2026-09-26: both targets now. The token cap is only a ceiling - Codex's prompt word budget
+  // still governs its length - and Codex needs the headroom once modules are appended.
+  const planTokenMultiplier = plan && plan.depth && plan.depth.dense ? 1.5 : 1;
 
   // v2.2.1: Source-structure pre-scan — detect which rich components the source
   // actually supports, so Codex prompts can tell Gemini what to render vs skip.
@@ -1168,10 +1178,12 @@ ${textToSend}`;
   //    telling the model to append them AFTER ## Quality Bar - existing section order is
   //    untouched. Replacer FUNCTION, not a string: a replacement string would treat any
   //    `$` in it as a special pattern.
-  const facetModules = buildFacetModules(plan, activeTemplate, activeTarget);
+  //    2026-09-26: per-surface module map - Claude A/B/C/D (E none), and Codex shapes as
+  //    bullet lists appended AFTER ## Key Principles. See MODULES in lib/planner.js.
+  const facetModules = buildFacetModules(plan, activeTemplate, activeTarget, activeCodexShape);
   if (facetModules) prompt = prompt.replace('\nCONTENT:\n', () => `\n${facetModules}\nCONTENT:\n`);
   // 2. The plan block leads the prompt, ahead of documentContext.
-  const planDirectives = buildPlanDirectives(plan, activeTarget);
+  const planDirectives = buildPlanDirectives(plan, activeTarget, activeTemplate);
   if (planDirectives) prompt = planDirectives + prompt;
   const planSummary = plan
     ? summarizePlan(plan, { clientTemplate: template || 'A', template: activeTemplate, clientShape: clientCodexShape, codexShape: activeCodexShape, target: activeTarget })
