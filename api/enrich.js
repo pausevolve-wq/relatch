@@ -11,6 +11,9 @@ const axiomClient = process.env.AXIOM_TOKEN
 // Jev planning layer (2026-09-26): fail-open typed decisions about the document before
 // template routing. See lib/planner.js - every export is a no-op on a null plan.
 const { planDocument, routeTemplate, routeCodexShape, buildPlanDirectives, buildFacetModules, summarizePlan, mapContent, spreadSelect, SPREAD_NOTE, summarizeContent } = require('../lib/planner');
+// Parachute Gating (2026-09-28): deterministic quality gate, SHADOW mode only for now (see the
+// PARACHUTE block before the model loop). Pure functions; lib/parachute.js has no I/O.
+const parachute = require('../lib/parachute');
 
 async function logToAxiom(event) {
   if (!axiomClient) return;
@@ -1497,6 +1500,13 @@ ${textToSend}`;
     { provider: 'openrouter', id: 'openai/gpt-oss-120b' },
   ];
 
+  // PARACHUTE (2026-09-28, vault "Relatch Parachute Gating - Plan (2026-09-27)", phase P2):
+  // PARACHUTE_MODE=shadow records every candidate below and, at each exit, logs the gate's
+  // verdicts to Axiom (logGateShadow). Nothing served changes. Unset or any other value = off:
+  // no candidate is recorded, no gate runs, byte-identical to before (regress.js asserts it).
+  const gateShadow = process.env.PARACHUTE_MODE === 'shadow';
+  const gateCandidates = gateShadow ? [] : null;
+
   let finalRawText = null;
   let successfulModel = null;
   let lastGoogleError = "No models responded";
@@ -1538,6 +1548,7 @@ ${textToSend}`;
       if (remainingMs < CODEX_POLICY.model2ReserveMs) {
         clearTimeout(timeoutId);
         lastGoogleError = `timeout_model_2 (skipped: only ${Math.round(remainingMs / 1000)}s remaining)`;
+        if (gateCandidates) gateCandidates.push({ model: modelId, outcome: 'skipped_no_time' });
         break;
       }
     }
@@ -1593,6 +1604,7 @@ ${textToSend}`;
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
         lastGoogleError = `HTTP ${response.status}: ${errorData.error?.message || 'Unknown'}`;
+        if (gateCandidates) gateCandidates.push({ model: modelId, outcome: `http_${response.status}` });
 
         // Retry on transient failures, plus 404 — with a real second provider now in
         // the chain, a 404 on the primary model (e.g. a retired model id) should fall
@@ -1630,10 +1642,12 @@ ${textToSend}`;
       if (scoreOutput(candidateText, effectiveTemplate, effectiveSizeClass) >= qualityThreshold) {
         finalRawText = candidateText;
         successfulModel = modelId;
+        if (gateCandidates) gateCandidates.push({ model: modelId, outcome: 'accepted', stop: stopReason, text: candidateText });
         break;
       } else {
         // Output did not pass quality check — try next model
         lastGoogleError = `Quality check failed (score: ${scoreOutput(candidateText, effectiveTemplate, effectiveSizeClass)}/${qualityThreshold} required) for model: ${modelId}`;
+        if (gateCandidates) gateCandidates.push({ model: modelId, outcome: 'score_rejected', stop: stopReason, text: candidateText });
         modelIndex++;
         continue;
       }
@@ -1642,8 +1656,41 @@ ${textToSend}`;
       clearTimeout(timeoutId);
       // UNCHANGED — exact same error message logic as before
       lastGoogleError = err.name === 'AbortError' ? `Timeout: Model took too long (${perModelTimeoutMs / 1000}s)` : `Fetch Error: ${err.message}`;
+      if (gateCandidates) gateCandidates.push({ model: modelId, outcome: err.name === 'AbortError' ? 'timeout' : 'error' });
       modelIndex++;
       continue;
+    }
+  }
+
+  // PARACHUTE shadow log: one Axiom event per request, endpoint 'enrich-gate' (same dataset as
+  // the security events; Watchtower's anomaly scan excludes this endpoint). It carries finding
+  // CODES, tiers, stop reasons and model ids only - never document or output text. `would` is
+  // what enforce mode would have done: 'accept_best' (serve a usable candidate instead of the
+  // protocol fallback, P3), 'repair' (P3), 'escalate' / 'keep' (P4; keep = no model left),
+  // 'fallback' (nothing usable either way), else 'pass'. The Axiom write is capped at 800ms, so
+  // a slow Axiom never delays a reply by more. Never throws.
+  function logGateShadow(servedText, served) {
+    try {
+      const t0 = Date.now();
+      const ctx = { template: effectiveTemplate, shape: activeCodexShape, source: textToSend, vocab: [prompt, fileName, domainLabel, domainRole, domainFrame].filter(Boolean).join('\n') };
+      const brief = (r) => ({ tier: r.tier, codes: [...new Set(r.findings.map((f) => f.code))] });
+      const candidates = gateCandidates.map((c) => ({ model: c.model, outcome: c.outcome, stop: c.stop || null, ...(typeof c.text === 'string' ? brief(parachute.inspect({ text: c.text, stopReason: c.stop }, ctx)) : {}) }));
+      const accepted = gateCandidates.find((c) => c.outcome === 'accepted');
+      const servedReport = typeof servedText === 'string' ? brief(parachute.inspect({ text: servedText, stopReason: accepted && accepted.stop }, ctx)) : null;
+      let would = 'pass';
+      if (!servedReport) would = candidates.some((c) => c.tier && c.tier !== 'UNUSABLE') ? 'accept_best' : 'fallback';
+      else if (servedReport.tier === 'HARD') would = accepted && modelList.findIndex((m) => m.id === accepted.model) < modelList.length - 1 ? 'escalate' : 'keep';
+      else if (servedReport.tier === 'SOFT') would = 'repair';
+      const event = {
+        endpoint: 'enrich-gate', mode: 'shadow', target: activeTarget, template: effectiveTemplate,
+        shape: activeTarget === 'codex' ? activeCodexShape : null, sizeClass: effectiveSizeClass,
+        served, servedTier: servedReport ? servedReport.tier : null, servedCodes: servedReport ? servedReport.codes : [],
+        would, candidates, gateMs: Date.now() - t0,
+      };
+      return Promise.race([logToAxiom(event), new Promise((resolve) => { const t = setTimeout(resolve, 800); if (t.unref) t.unref(); })]);
+    } catch (err) {
+      console.log('[gate] shadow failed:', err?.message || 'unknown');
+      return null;
     }
   }
 
@@ -1848,6 +1895,8 @@ ${textToSend}`;
   // Primary path — Gemini model succeeded; count the generation and respond.
   if (finalRawText) {
     const enrichedOutput = sanitize(finalRawText, activeTarget === 'codex' ? codexSlug : skillName, effectiveTemplate);
+    // PARACHUTE shadow: started here so its Axiom write overlaps the quota write below.
+    const gateLog = gateShadow ? logGateShadow(enrichedOutput, 'model') : null;
 
     if (quotaUsage && quotaUser) {
       try {
@@ -1874,6 +1923,7 @@ ${textToSend}`;
       }
     }
 
+    if (gateLog) await gateLog;
     // `plan` only appears when Jev answered - the frontend ignores unknown fields.
     return res.status(200).json({ enriched: enrichedOutput, model: successfulModel, sessionId, ...(planSummary ? { plan: planSummary } : {}), ...(contentSummary ? { content: contentSummary } : {}) });
   }
@@ -1883,6 +1933,7 @@ ${textToSend}`;
   // enforcement fire identically to the primary path. Returns HTTP 200 with diagnostic signal.
   // Claude target falls through to the 503 below — no safe local approximation exists for it.
   if (activeTarget === 'codex') {
+    if (gateShadow) await logGateShadow(null, 'protocol_fallback');
     const fallbackRaw = buildCodexFallback();
     return res.status(200).json({
       enriched: sanitize(fallbackRaw, codexSlug, 'CODEX'),
@@ -1895,6 +1946,7 @@ ${textToSend}`;
   }
 
   // Claude target or unknown — 503 unchanged
+  if (gateShadow) await logGateShadow(null, 'error_503');
   await logToAxiom({ endpoint: 'enrich', status: 503, reason: 'google_api_error', userId, ip: req.headers['x-forwarded-for'] || null });
   return res.status(503).json({
     error: 'GOOGLE_API_ERROR',
