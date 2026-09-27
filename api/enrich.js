@@ -1483,9 +1483,17 @@ ${textToSend}`;
   // fixed elsewhere in this org's infra). Live-tested via a real Vercel preview
   // deployment across 8 real generations (both targets, 2 different source documents):
   // 4.5-6.8s latency, comparable output quality/format compliance to Gemini on identical
-  // inputs. Primary model (index 0) is unchanged.
+  // inputs. Primary model (index 0) is unchanged (by that 2026-08 move; see 2026-09-27 below).
+  // 2026-09-27: primary moved gemini-3.1-flash-lite-preview -> gemini-3.5-flash-lite (Manas
+  // approved). The preview id was already a Google alias for gemini-3.1-flash-lite (its
+  // modelVersion said so) and is past its documented shutdown date. 3.5 Flash-Lite at its
+  // default thinking level was run through this code path at production token budgets:
+  // 15/15 STOP, 0 MAX_TOKENS, 0 thinking tokens, and it outscored the 3.1 arms under blind
+  // judging. The explicit 'minimal' pin below was checked separately (HTTP 200 on 3.5).
+  // A 400/404 on this id falls through to GPT-OSS below. Vault: Relatch Model Provider
+  // Routing - Plan (2026-09-27).
   const modelList = [
-    { provider: 'gemini', id: 'gemini-3.1-flash-lite-preview' },
+    { provider: 'gemini', id: 'gemini-3.5-flash-lite' },
     { provider: 'openrouter', id: 'openai/gpt-oss-120b' },
   ];
 
@@ -1544,7 +1552,11 @@ ${textToSend}`;
               body: JSON.stringify({
                 contents: [{ parts: [{ text: prompt }] }],
                 // V2 ADAPTIVE: ceiling per (sizeClass, model) — temperature unchanged.
-                generationConfig: { maxOutputTokens: outputTokenBudget, temperature: 0.7 }
+                // 2026-09-27: thinking pinned to 'minimal', which Google documents as 3.5
+                // Flash-Lite's default. Thinking tokens count against maxOutputTokens, so if
+                // Google ever changes the default, unpinned thinking would eat the budget and
+                // cut files off.
+                generationConfig: { maxOutputTokens: outputTokenBudget, temperature: 0.7, thinkingConfig: { thinkingLevel: 'minimal' } }
               }),
               signal: controller.signal
             }
@@ -1587,7 +1599,11 @@ ${textToSend}`;
         // through to it rather than aborting the whole request outright, which is the
         // exact case cross-provider redundancy exists for. 400/401/403 still break —
         // narrower change, scoped to what this session's testing actually covered.
-        if (response.status === 429 || response.status === 404 || response.status === 500 || response.status === 502 || response.status === 503 || response.status === 504) {
+        // 2026-09-27: 400 now falls through too. The Gemini request carries a thinkingConfig,
+        // and Google answers an unsupported value (and an invalid API key) with 400, which
+        // would otherwise end the chain as a full outage instead of reaching GPT-OSS on its
+        // own key. 401/403 still break.
+        if (response.status === 400 || response.status === 429 || response.status === 404 || response.status === 500 || response.status === 502 || response.status === 503 || response.status === 504) {
           modelIndex++;
           continue;
         }
