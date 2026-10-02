@@ -13,6 +13,7 @@ const axiomClient = process.env.AXIOM_TOKEN
 const { planDocument, routeTemplate, routeCodexShape, buildPlanDirectives, buildFacetModules, summarizePlan, mapContent, spreadSelect, SPREAD_NOTE, summarizeContent } = require('../lib/planner');
 // Parachute Gating (2026-09-28): deterministic quality gate, SHADOW mode only for now (see the
 // PARACHUTE block before the model loop). Pure functions; lib/parachute.js has no I/O.
+// 2026-10-03: P3 (PARACHUTE_MODE=enforce) and P4 (=escalate) let it act on what is served.
 const parachute = require('../lib/parachute');
 // Shadow events go through their OWN Axiom client: the SDK serializes flushes per client, so
 // a slow gate flush on the shared client would hold up the security logs queued behind it
@@ -26,7 +27,7 @@ const gateAxiom = process.env.AXIOM_TOKEN
 // simply runs.
 const waitUntil = (promise) => globalThis[Symbol.for('@vercel/request-context')]?.get?.()?.waitUntil?.(promise);
 // Once per cold start, so a mis-set PARACHUTE_MODE shows in the logs instead of silently doing nothing.
-if (process.env.PARACHUTE_MODE) console.log('[gate] PARACHUTE_MODE', JSON.stringify(process.env.PARACHUTE_MODE), gateAxiom ? 'axiom on' : 'no AXIOM_TOKEN: shadow disabled');
+if (process.env.PARACHUTE_MODE) console.log('[gate] PARACHUTE_MODE', JSON.stringify(process.env.PARACHUTE_MODE), gateAxiom ? 'axiom on' : 'no AXIOM_TOKEN: shadow disabled, enforce/escalate act without events');
 
 async function logToAxiom(event) {
   if (!axiomClient) return;
@@ -546,6 +547,12 @@ module.exports = async function handler(req, res) {
     // v2.1: Codex scoring path — closes over activeCodexShape (declared in handler scope).
     // v2.2: three shape-aware branches with different required anchors and component bonuses.
     // All return 0-9 to match the Claude scoring scale used by the qualityThreshold gate.
+
+    // 2026-10-03 (Parachute P3 code review): an empty or whitespace-only reply is never a skill
+    // file. The Claude branches' no-penalty points used to add up to 4 for it, exactly GPT-OSS's
+    // threshold, so it was served as a placeholder file and charged quota. Rejecting it here
+    // fixes that in every PARACHUTE_MODE, off included. (The Codex branch already scored it low.)
+    if (!text || !text.trim()) return 0;
 
     // Template E: Structured financial data scoring
     if (tmpl === 'E') {
@@ -1518,9 +1525,87 @@ ${textToSend}`;
   // to run AFTER the reply (shadowGate). Nothing served changes, not even its timing. Unset or
   // any other value = off: no candidate is recorded, no gate runs, byte-identical to before
   // (regress.js asserts it). Shadow also needs AXIOM_TOKEN, since without it nothing is recorded.
-  const gateShadow = (process.env.PARACHUTE_MODE || '').trim() === 'shadow' && Boolean(gateAxiom);
-  const gateCandidates = gateShadow ? [] : null;
-  const gateId = gateShadow ? require('crypto').randomUUID() : null;
+  //
+  // 2026-10-03, phases P3 + P4 (Manas: complete Parachute before wiring up more models):
+  // PARACHUTE_MODE=enforce (P3) gates every candidate INSIDE the loop and acts on it:
+  //   - REPAIR: the served file's two ends are fixed by parachute.repair() (an open code fence,
+  //     an unclosed frontmatter, and a cut tail only when the stop reason proves truncation).
+  //   - An accepted candidate is never discarded (code review: an UNUSABLE verdict means under
+  //     200 chars, which can be a terse but real file). The empty/whitespace reply that used to
+  //     be accepted is now rejected by scoreOutput() itself, in every mode.
+  //   - ACCEPT_BEST: when no candidate is accepted, the best usable one (parachute.pickBest)
+  //     is served instead of the protocol fallback, which now runs only when nothing is usable.
+  // PARACHUTE_MODE=escalate (P4) adds: an accepted candidate with a HARD finding (cut off, 2+
+  //   required sections missing, a wrong computed claim, invented commands) goes ONCE to the
+  //   next model, whose prompt carries the findings (parachute.retryNote); the better of the
+  //   two is served. Only under the plan's time rule (the next model's timeout + 10s left).
+  //   Self-disarm: with Upstash Redis, once escalations pass 25% of the gated requests in the
+  //   current clock hour (10+ requests), escalation stops for the rest of that hour (a sticky
+  //   parachute:off:<hour> key). Each escalation is counted atomically BEFORE it happens, so a
+  //   concurrent burst sees its own escalations. Only escalation disarms, since it is the one
+  //   action that re-routes traffic; REPAIR and ACCEPT_BEST cannot. Redis not configured (e.g.
+  //   Preview): the configured mode. Redis failing or slower than 400ms: no escalation (safe).
+  // Both modes log one enrich-gate event per request after the reply, as shadow does, but
+  // `would` is what was DONE. Sources over GATE_MAX_SOURCE chars skip the gate (served as off).
+  const gateMode = (process.env.PARACHUTE_MODE || '').trim();
+  const gateShadow = gateMode === 'shadow' && Boolean(gateAxiom);
+  const gateEscalate = gateMode === 'escalate';
+  const gateEnforce = gateMode === 'enforce' || gateEscalate;
+  const gateCandidates = gateShadow || gateEnforce ? [] : null;
+  const gateId = gateCandidates ? require('crypto').randomUUID() : null;
+  const GATE_MAX_SOURCE = 100000;
+  let gateActs = gateEnforce && rawText.length <= GATE_MAX_SOURCE; // let: a gate exception turns it off
+  let gateEscalated = false;
+  let gateRetryNote = '';     // P4: appended to the escalated model's prompt only
+  let gateVerdict = null;     // decide() on the accepted candidate: PASS | REPAIR | KEEP
+  let gateDisarmedNow = null; // P4: true when the self-disarm stopped an escalation
+  let gateInlineMs = 0;       // time the gate added INSIDE the request (enforce/escalate)
+  let gateServedText = null;  // enforce/escalate: the exact text served (sanitized + repaired)
+  let gateDecided = null;     // enforce/escalate: { would, pick, repaired } for the event
+
+  // Inspected exactly as calibrated: sanitize()d text against the full source (rawText).
+  let gateCtxCache = null;
+  const gateCtx = () => gateCtxCache || (gateCtxCache = {
+    template: effectiveTemplate, shape: activeCodexShape, source: rawText,
+    // the prompt minus the document it carries (the source is already `source`)
+    vocab: [textToSend ? prompt.split(textToSend).join(' ') : prompt, fileName, domainLabel, domainRole, domainFrame].filter(Boolean).join('\n'),
+  });
+  const gateSkillArg = activeTarget === 'codex' ? codexSlug : skillName;
+  // The plan's time rule: a next model must exist AND its timeout + 10s must remain (Codex
+  // also keeps its model-2 reserve).
+  const gateCanEscalate = (modelId, atMs) => {
+    const next = modelList.findIndex((m) => m.id === modelId) + 1;
+    const remainingMs = FUNCTION_BUDGET_MS - atMs;
+    return next < modelList.length
+      && remainingMs >= (CODEX_POLICY.timeouts.model2[effectiveSizeClass] ?? 20000) + 10000
+      && (activeTarget !== 'codex' || remainingMs >= CODEX_POLICY.model2ReserveMs);
+  };
+  // P4 self-disarm. Per clock hour (UTC); the counters are written after the reply (gateLog).
+  const GATE_DISARM = { share: 0.25, minRequests: 10 };
+  const gateHour = new Date().toISOString().slice(0, 13);
+  const gateKeys = { req: `parachute:req:${gateHour}`, esc: `parachute:esc:${gateHour}`, off: `parachute:off:${gateHour}` };
+  const gateTimeout = (promise, ms) => Promise.race([promise, new Promise((_, reject) => { const t = setTimeout(() => reject(new Error('timeout')), ms); if (t.unref) t.unref(); })]);
+  // Called only when an escalation is about to happen. true = do not escalate.
+  async function gateDisarmed() {
+    if (!redis) return false; // Redis not configured (e.g. Preview): the configured mode
+    try {
+      return await gateTimeout((async () => {
+        const [req, off] = await redis.mget(gateKeys.req, gateKeys.off);
+        if (off) return true; // already tripped this hour: sticky
+        const esc = Number(await redis.incr(gateKeys.esc)) || 0; // counts this escalation, atomically
+        const r = Number(req) || 0;
+        if (r >= GATE_DISARM.minRequests && esc / r > GATE_DISARM.share) {
+          await redis.set(gateKeys.off, 1, { ex: 7200 });
+          console.log('[gate] self-disarm: escalation off for the rest of this hour', { requests: r, escalations: esc });
+          return true;
+        }
+        return false;
+      })(), 400);
+    } catch (err) {
+      console.log('[gate] self-disarm check failed, not escalating:', err?.message || 'unknown');
+      return true;
+    }
+  }
 
   let finalRawText = null;
   let successfulModel = null;
@@ -1576,7 +1661,8 @@ ${textToSend}`;
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
-                contents: [{ parts: [{ text: prompt }] }],
+                // gateRetryNote is '' except on a Parachute P4 escalation (see above).
+                contents: [{ parts: [{ text: prompt + gateRetryNote }] }],
                 // V2 ADAPTIVE: ceiling per (sizeClass, model) — temperature unchanged.
                 // 2026-09-27: thinking pinned to 'minimal', which Google documents as 3.5
                 // Flash-Lite's default. Thinking tokens count against maxOutputTokens, so if
@@ -1599,7 +1685,7 @@ ${textToSend}`;
               },
               body: JSON.stringify({
                 model: modelId,
-                messages: [{ role: 'user', content: prompt }],
+                messages: [{ role: 'user', content: prompt + gateRetryNote }],
                 max_tokens: outputTokenBudget,
                 temperature: 0.7,
                 // Low reasoning effort — this model burns its output budget on hidden
@@ -1654,15 +1740,59 @@ ${textToSend}`;
       // Flash Lite (index 0) must score >= 6
       // Fallback tier (index 1, GPT-OSS-120B via OpenRouter) must score >= 4
       const qualityThreshold = modelIndex === 0 ? CODEX_POLICY.qualityThresholds.lite : CODEX_POLICY.qualityThresholds.flash;
-      if (scoreOutput(candidateText, effectiveTemplate, effectiveSizeClass) >= qualityThreshold) {
+
+      const score = scoreOutput(candidateText, effectiveTemplate, effectiveSizeClass);
+
+      // PARACHUTE enforce/escalate (P3/P4): gate this candidate here. scoreOutput() still decides
+      // acceptance exactly as before; the gate only decides what happens to an ACCEPTED one:
+      // serve it (PASS/REPAIR), escalate it once, or KEEP it for the end-of-chain pickBest().
+      // An accepted candidate is never discarded, so the fallbacks never fire more often than
+      // before Parachute; one judged UNUSABLE (a terse but real file) is handled like HARD.
+      // An exception in the gate turns it off for the rest of the request (fail open: served as
+      // off) instead of being reported as a provider error.
+      let gate = null;
+      if (gateActs) {
+        try {
+          const g0 = Date.now();
+          const text = sanitize(candidateText, gateSkillArg, effectiveTemplate);
+          const report = parachute.inspect({ text, stopReason }, gateCtx());
+          const atMs = Date.now() - requestStartMs;
+          let verdict = null;
+          if (score >= qualityThreshold) {
+            const canEscalate = gateEscalate && !gateEscalated && gateCanEscalate(modelId, atMs);
+            verdict = parachute.decide(report.tier === 'UNUSABLE' ? { ...report, tier: 'HARD' } : report, { canEscalate });
+            if (verdict === 'ESCALATE') {
+              gateDisarmedNow = await gateDisarmed();
+              if (gateDisarmedNow) verdict = 'KEEP';
+            }
+          }
+          gate = { entry: { model: modelId, stop: stopReason, text, report, atMs }, verdict };
+          gateInlineMs += Date.now() - g0;
+        } catch (err) {
+          gateActs = false;
+          console.log('[gate] error, gate off for this request:', err?.message || 'unknown');
+        }
+      }
+
+      if (score >= qualityThreshold) {
+        if (gate && gate.verdict === 'ESCALATE') {
+          // lastGoogleError is left alone: gate wording must never reach a response body.
+          gateCandidates.push({ ...gate.entry, outcome: 'escalated' });
+          gateEscalated = true;
+          gateRetryNote = parachute.retryNote(gate.entry.report);
+          console.log('[gate] escalate', { from: modelId, codes: [...new Set(gate.entry.report.findings.filter((f) => f.tier === 'HARD' || f.tier === 'UNUSABLE').map((f) => f.code))] });
+          modelIndex++;
+          continue;
+        }
         finalRawText = candidateText;
         successfulModel = modelId;
-        if (gateCandidates) gateCandidates.push({ model: modelId, outcome: 'accepted', stop: stopReason, text: candidateText, atMs: Date.now() - requestStartMs });
+        if (gate) gateVerdict = gate.verdict;
+        if (gateCandidates) gateCandidates.push(gate ? { ...gate.entry, outcome: 'accepted' } : { model: modelId, outcome: 'accepted', stop: stopReason, text: candidateText, atMs: Date.now() - requestStartMs });
         break;
       } else {
         // Output did not pass quality check — try next model
-        lastGoogleError = `Quality check failed (score: ${scoreOutput(candidateText, effectiveTemplate, effectiveSizeClass)}/${qualityThreshold} required) for model: ${modelId}`;
-        if (gateCandidates) gateCandidates.push({ model: modelId, outcome: 'score_rejected', stop: stopReason, text: candidateText });
+        lastGoogleError = `Quality check failed (score: ${score}/${qualityThreshold} required) for model: ${modelId}`;
+        if (gateCandidates) gateCandidates.push(gate ? { ...gate.entry, outcome: 'score_rejected' } : { model: modelId, outcome: 'score_rejected', stop: stopReason, text: candidateText });
         modelIndex++;
         continue;
       }
@@ -1677,6 +1807,42 @@ ${textToSend}`;
     }
   }
 
+  // PARACHUTE enforce/escalate: choose what is served. An accepted PASS/REPAIR candidate is
+  // served; otherwise the best usable candidate (KEEP after a HARD verdict, or ACCEPT_BEST when
+  // nothing was accepted). Whatever is served goes through repair(), which changes nothing on a
+  // clean file. Nothing usable: finalRawText stays null and the protocol fallbacks run as before.
+  if (gateActs) {
+    const g0 = Date.now();
+    const accepted = gateCandidates.find((c) => c.outcome === 'accepted');
+    let pickEntry = null, would = 'fallback', repaired = false;
+    // Candidates scoreOutput() accepted (the accepted one and an escalated one). When any exist,
+    // only they compete: a draft scoreOutput rejected never replaces one it accepted (code
+    // review). pickBest() skips UNUSABLE-tier entries, so if it finds none of them usable, the
+    // first one scoreOutput accepted is served, which is what was served before Parachute.
+    const passed = gateCandidates.filter((c) => c.outcome === 'accepted' || c.outcome === 'escalated');
+    if (accepted && gateVerdict !== 'KEEP') {
+      pickEntry = accepted;
+      would = gateVerdict === 'REPAIR' ? 'repair' : 'pass';
+    } else if (passed.length) {
+      pickEntry = parachute.pickBest(passed) || passed[0];
+      would = 'keep';
+    } else {
+      pickEntry = parachute.pickBest(gateCandidates.filter((c) => c.report));
+      if (pickEntry) would = 'accept_best';
+    }
+    if (pickEntry) {
+      const fixed = parachute.repair(pickEntry.text, gateCtx(), { stopReason: pickEntry.stop });
+      gateServedText = fixed.text;
+      repaired = fixed.applied.length > 0;
+      // the model branch below serves gateServedText; finalRawText only has to be set
+      finalRawText = finalRawText || pickEntry.text;
+      successfulModel = pickEntry.model;
+    }
+    gateInlineMs += Date.now() - g0;
+    gateDecided = { would, pick: pickEntry ? gateCandidates.indexOf(pickEntry) : null, repaired };
+    if (would !== 'pass') console.log('[gate]', gateMode, { would, repaired, served: successfulModel });
+  }
+
   // PARACHUTE shadow gate: runs AFTER the reply (waitUntil) on its own Axiom client, so it can
   // never delay or change what is served. One event per request into relatch-security,
   // endpoint 'enrich-gate' (Watchtower counts only status >= 400 there). The event carries
@@ -1689,26 +1855,41 @@ ${textToSend}`;
   //   left, by the plan's "next timeout + 10s" rule) | 'unusable' (served file has no real
   //   content) | 'accept_best' (a usable candidate existed where the protocol fallback or 503
   //   fired, P3; `pick` is its index) | 'fallback' (nothing usable either way).
-  const GATE_MAX_SOURCE = 100000;
-  function shadowGate(servedText, served) {
+  // 2026-10-03: renamed gateLog; it also logs enforce/escalate requests (mode = PARACHUTE_MODE).
+  //   There `would` is what was DONE: 'pass' | 'repair' | 'keep' | 'accept_best' | 'fallback';
+  //   `pick` is the served candidate's index; servedTier is the tier of the text actually
+  //   served (after repair()); the extra keys are repaired, disarmed and inlineMs (the time the
+  //   gate added inside the request). It also writes the P4 self-disarm counters (Redis).
+  //   GATE_MAX_SOURCE moved up to the PARACHUTE block.
+  function gateLog(servedText, served) {
     const run = async () => {
       await new Promise((resolve) => setImmediate(resolve)); // let the reply go out first
+      // P4 self-disarm counters: every gated request in this clock hour. Escalations were
+      // already counted, atomically, when they happened (gateDisarmed).
+      if (gateEscalate && gateActs && redis) {
+        try {
+          await gateTimeout((async () => {
+            await redis.incr(gateKeys.req);
+            await redis.expire(gateKeys.req, 7200);
+            if (gateDisarmedNow !== null) await redis.expire(gateKeys.esc, 7200);
+          })(), 2000);
+        } catch (err) {
+          console.log('[gate] self-disarm counters failed:', err?.message || 'unknown');
+        }
+      }
+      if (!gateAxiom) return; // enforce/escalate act without AXIOM_TOKEN, they just log no event
       const t0 = Date.now();
       let skipped = null, would = 'fallback', pick = null, servedReport = null, candidates;
       if (rawText.length > GATE_MAX_SOURCE) {
         skipped = 'large_source';
         candidates = gateCandidates.map((c) => ({ model: c.model, outcome: c.outcome, stop: c.stop || null }));
       } else {
-        const ctx = {
-          template: effectiveTemplate, shape: activeCodexShape, source: rawText,
-          // the prompt minus the document it carries (the source is already `source`)
-          vocab: [textToSend ? prompt.split(textToSend).join(' ') : prompt, fileName, domainLabel, domainRole, domainFrame].filter(Boolean).join('\n'),
-        };
-        const skillArg = activeTarget === 'codex' ? codexSlug : skillName;
+        const ctx = gateCtx(); // the same context as before, now built once in the PARACHUTE block
         const reports = gateCandidates.map((c) => {
+          if (c.report) return { text: c.text, report: c.report }; // enforce/escalate: inspected in the loop
           if (typeof c.text !== 'string') return null;
           // the accepted candidate IS the served file: reuse it instead of sanitizing twice
-          const text = c.outcome === 'accepted' && typeof servedText === 'string' ? servedText : sanitize(c.text, skillArg, effectiveTemplate);
+          const text = c.outcome === 'accepted' && typeof servedText === 'string' ? servedText : sanitize(c.text, gateSkillArg, effectiveTemplate);
           return { text, report: parachute.inspect({ text, stopReason: c.stop }, ctx) };
         });
         candidates = gateCandidates.map((c, i) => {
@@ -1716,14 +1897,15 @@ ${textToSend}`;
           return { model: c.model, outcome: c.outcome, stop: c.stop || null, ...(r ? { tier: r.tier, codes: [...new Set(r.findings.map((f) => f.code))], hard: r.findings.filter((f) => f.tier === 'HARD').length, anchors: `${r.anchors.present}/${r.anchors.required}`, chars: r.chars } : {}) };
         });
         const acceptedIdx = gateCandidates.findIndex((c) => c.outcome === 'accepted');
-        if (served === 'model' && acceptedIdx !== -1 && reports[acceptedIdx]) {
+        if (gateDecided) {
+          ({ would, pick } = gateDecided);
+          // the in-loop report when nothing was repaired; re-inspect only the repaired text
+          if (pick !== null) servedReport = gateDecided.repaired && typeof servedText === 'string' ? parachute.inspect({ text: servedText, stopReason: gateCandidates[pick].stop }, ctx) : gateCandidates[pick].report;
+        } else if (served === 'model' && acceptedIdx !== -1 && reports[acceptedIdx]) {
           const accepted = gateCandidates[acceptedIdx];
           servedReport = reports[acceptedIdx].report;
-          const next = modelList.findIndex((m) => m.id === accepted.model) + 1;
-          const remainingMs = FUNCTION_BUDGET_MS - accepted.atMs;
-          const canEscalate = next < modelList.length
-            && remainingMs >= (CODEX_POLICY.timeouts.model2[effectiveSizeClass] ?? 20000) + 10000
-            && (activeTarget !== 'codex' || remainingMs >= CODEX_POLICY.model2ReserveMs);
+          // the plan's time rule, now shared with enforce/escalate (gateCanEscalate)
+          const canEscalate = gateCanEscalate(accepted.model, accepted.atMs);
           would = ({ PASS: 'pass', REPAIR: 'repair', ESCALATE: 'escalate', KEEP: 'keep', DISCARD: 'unusable' })[parachute.decide(servedReport, { canEscalate })];
         } else {
           const usable = reports.filter(Boolean);
@@ -1732,18 +1914,19 @@ ${textToSend}`;
         }
       }
       const event = {
-        endpoint: 'enrich-gate', mode: 'shadow', gateId, target: activeTarget, template: effectiveTemplate,
+        endpoint: 'enrich-gate', mode: gateShadow ? 'shadow' : gateMode, gateId, target: activeTarget, template: effectiveTemplate,
         shape: activeTarget === 'codex' ? activeCodexShape : null, sizeClass: effectiveSizeClass,
         served, servedTier: servedReport ? servedReport.tier : null,
         servedCodes: servedReport ? [...new Set(servedReport.findings.map((f) => f.code))] : [],
         would: skipped ? null : would, pick, skipped, candidates, gateMs: Date.now() - t0,
+        ...(gateEnforce ? { repaired: gateDecided ? gateDecided.repaired : null, disarmed: gateDisarmedNow, inlineMs: gateInlineMs } : {}),
       };
       gateAxiom.ingest('relatch-security', [{ ...event, _time: new Date().toISOString() }]);
       // Capped so a hanging Axiom cannot keep the function alive (and billed) under waitUntil
       // for the whole maxDuration. This is after the reply, so the cap costs no latency.
       await Promise.race([gateAxiom.flush(), new Promise((resolve) => { const t = setTimeout(resolve, 10000); if (t.unref) t.unref(); })]);
     };
-    const promise = run().catch((err) => console.log('[gate] shadow failed:', err?.message || 'unknown'));
+    const promise = run().catch((err) => console.log(`[gate] ${gateShadow ? 'shadow' : gateMode} failed:`, err?.message || 'unknown'));
     waitUntil(promise);
   }
 
@@ -1947,9 +2130,11 @@ ${textToSend}`;
 
   // Primary path — Gemini model succeeded; count the generation and respond.
   if (finalRawText) {
-    const enrichedOutput = sanitize(finalRawText, activeTarget === 'codex' ? codexSlug : skillName, effectiveTemplate);
-    // PARACHUTE shadow: scheduled here, runs after the reply.
-    if (gateShadow) shadowGate(enrichedOutput, 'model');
+    // PARACHUTE enforce/escalate: gateServedText is the chosen candidate, already sanitized and
+    // repaired. Off, shadow, or a skipped gate: null, so this is exactly the line it was.
+    const enrichedOutput = gateServedText !== null ? gateServedText : sanitize(finalRawText, activeTarget === 'codex' ? codexSlug : skillName, effectiveTemplate);
+    // PARACHUTE shadow: scheduled here, runs after the reply. (enforce/escalate log here too.)
+    if (gateCandidates) gateLog(enrichedOutput, 'model');
 
     if (quotaUsage && quotaUser) {
       try {
@@ -1985,7 +2170,7 @@ ${textToSend}`;
   // enforcement fire identically to the primary path. Returns HTTP 200 with diagnostic signal.
   // Claude target falls through to the 503 below — no safe local approximation exists for it.
   if (activeTarget === 'codex') {
-    if (gateShadow) shadowGate(null, 'protocol_fallback');
+    if (gateCandidates) gateLog(null, 'protocol_fallback');
     const fallbackRaw = buildCodexFallback();
     return res.status(200).json({
       enriched: sanitize(fallbackRaw, codexSlug, 'CODEX'),
@@ -1998,7 +2183,7 @@ ${textToSend}`;
   }
 
   // Claude target or unknown — 503 unchanged
-  if (gateShadow) shadowGate(null, 'error_503');
+  if (gateCandidates) gateLog(null, 'error_503');
   await logToAxiom({ endpoint: 'enrich', status: 503, reason: 'google_api_error', userId, ip: req.headers['x-forwarded-for'] || null, ...(gateId ? { gateId } : {}) });
   return res.status(503).json({
     error: 'GOOGLE_API_ERROR',
