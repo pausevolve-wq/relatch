@@ -1547,10 +1547,17 @@ ${textToSend}`;
     maxLowSignal: 0.7,                // boilerplate gains nothing from a stronger model
     csvMinRows: 20,                   // Template E (Claude): numeric tables, DeepSeek was best
   };
-  const HARD_LANE_TIMEOUT_MS = 45000; // each hard-lane model; worst case 45+45+40 Gemini net
-  const HARD_DEEPSEEK = { provider: 'openrouter-hard', id: 'deepseek/deepseek-v4.1-flash', reasoningOff: true, extraTokens: 1500 };
-  const HARD_GLM = { provider: 'openrouter-hard', id: 'z-ai/glm-5.3', extraTokens: 3000 };
-  const COMPLEX_CHAIN = [HARD_DEEPSEEK, HARD_GLM, { provider: 'gemini', id: 'gemini-3.5-flash-lite' }];
+  // Per chain entry (code review 2026-10-03): each hard-lane model carries its own size-scaled
+  // timeouts and token headroom. Worst case, large: Jev ~10 + 75 + 75 + Gemini net 90 = 250s
+  // < FUNCTION_BUDGET_MS 280s. DeepSeek's 5400-token ceiling (2600 x 1.5 + 1500) needs more
+  // than a flat 45s on a slow host.
+  const HARD_TIMEOUTS = { small: 45000, medium: 60000, large: 75000 };
+  const HARD_DEEPSEEK = { provider: 'openrouter-hard', id: 'deepseek/deepseek-v4.1-flash', reasoningOff: true, extraTokens: 1500, timeouts: HARD_TIMEOUTS };
+  const HARD_GLM = { provider: 'openrouter-hard', id: 'z-ai/glm-5.3', extraTokens: 3000, timeouts: HARD_TIMEOUTS };
+  // net: true = the emergency net. It runs exactly like a primary Gemini call (model-1 timeout,
+  // lite budget) so it is never weaker than today's Gemini on the same document, and Parachute
+  // never escalates INTO it (code review 2026-10-03): it is for outages, not a quality retry.
+  const COMPLEX_CHAIN = [HARD_DEEPSEEK, HARD_GLM, { provider: 'gemini', id: 'gemini-3.5-flash-lite', net: true }];
   const routingMode = (process.env.ROUTING_MODE || '').trim();
   const routeOn = routingMode === 'on';
   // Decided only when routing is shadow or on. why: a token for the log, never text.
@@ -1559,8 +1566,12 @@ ${textToSend}`;
     const rich = (planSummary.rich || []).length, lowSignal = planSummary.low_signal;
     const base = { rich, lowSignal, csvRows: null };
     if (lowSignal >= HARD_LANE_RULES.maxLowSignal) return { ...base, lane: 'normal', why: 'low_signal' };
-    if (effectiveTemplate === 'E') {
-      const csvRows = Math.max(0, rawText.trim().split(/\r?\n/).filter((l) => l.trim()).length - 1);
+    // Template E: only text that really parses as a numeric CSV table counts (code review: the
+    // client sets `template`, so 20 lines of prose sent as 'E' must not force the paid lane).
+    // Anything else falls through to the general rule below.
+    const csv = effectiveTemplate === 'E' ? parachute._internal.parseCsv(rawText) : null;
+    if (csv) {
+      const csvRows = csv.rows.length;
       return { ...base, csvRows, lane: csvRows >= HARD_LANE_RULES.csvMinRows ? 'complex' : 'normal', why: 'csv_rows' };
     }
     if (!HARD_LANE_RULES.sizeClasses.includes(effectiveSizeClass)) return { ...base, lane: 'normal', why: 'small' };
@@ -1628,13 +1639,14 @@ ${textToSend}`;
   // uses that model's own timeout.
   const escalationTarget = (modelId) => {
     if (routeOn && routeDecision.lane === 'normal' && !modelList.includes(HARD_DEEPSEEK)) return HARD_DEEPSEEK;
-    return modelList[modelList.findIndex((m) => m.id === modelId) + 1] || null;
+    const next = modelList[modelList.findIndex((m) => m.id === modelId) + 1] || null;
+    return next && next.net ? null : next; // never escalate into the emergency net
   };
   const gateCanEscalate = (modelId, atMs) => {
     const nextModel = escalationTarget(modelId);
     const remainingMs = FUNCTION_BUDGET_MS - atMs;
-    const nextTimeoutMs = nextModel && nextModel.provider === 'openrouter-hard'
-      ? HARD_LANE_TIMEOUT_MS
+    const nextTimeoutMs = nextModel && nextModel.timeouts
+      ? nextModel.timeouts[effectiveSizeClass] ?? HARD_TIMEOUTS.small
       : (CODEX_POLICY.timeouts.model2[effectiveSizeClass] ?? 20000);
     return Boolean(nextModel)
       && remainingMs >= nextTimeoutMs + 10000
@@ -1674,7 +1686,10 @@ ${textToSend}`;
   // V2: track model index for quality threshold (Lite >= 6, Flash >= 5)
   let modelIndex = 0;
 
-  for (const { provider, id: modelId, reasoningOff, extraTokens } of modelList) {
+  // Note: a Parachute escalation may splice the hard lane into modelList while this loop runs.
+  // That is deliberate and well-defined (an array iterator reads the live length), and regress
+  // section 15's escalation drills fail if the inserted model is ever skipped.
+  for (const { provider, id: modelId, reasoningOff, extraTokens, timeouts, net } of modelList) {
     const controller = new AbortController();
 
     // Timeouts are sizeClass-aware so large-doc generation (1800 token output budget)
@@ -1685,8 +1700,10 @@ ${textToSend}`;
     // Total ceiling: large = 35+18 = 53s, small/medium = 25+20 = 45s. Both < 60s limit.
     // Groq (behind OpenRouter, model 2's new provider) responded in 4.5-6.8s across
     // every live test — well inside this budget already, no widening needed here.
-    // Routing B: every hard-lane model gets its own fixed timeout, wherever it sits.
-    const perModelTimeoutMs = provider === 'openrouter-hard' ? HARD_LANE_TIMEOUT_MS : modelIndex === 0
+    // Routing B: a hard-lane model uses its own size-scaled timeouts wherever it sits; the
+    // Gemini emergency net (net) runs like a primary Gemini call (model-1 timeout, lite budget).
+    const primaryLike = modelIndex === 0 || Boolean(net);
+    const perModelTimeoutMs = timeouts ? (timeouts[effectiveSizeClass] ?? timeouts.small) : primaryLike
       ? (CODEX_POLICY.timeouts.model1[effectiveSizeClass] ?? 25000)
       : (CODEX_POLICY.timeouts.model2[effectiveSizeClass] ?? 20000);
     const timeoutId = setTimeout(() => controller.abort(), perModelTimeoutMs);
@@ -1699,10 +1716,10 @@ ${textToSend}`;
     // generation even with reasoning effort set to low; +700 fixed it in testing. Applied
     // only to this provider — Gemini's own budget is unchanged.
     // planTokenMultiplier is 1 unless Jev judged the source dense (Claude target only).
-    const baseTokenBudget = Math.round((modelIndex === 0 ? budgetForSize.lite : budgetForSize.flash) * planTokenMultiplier);
+    const baseTokenBudget = Math.round((primaryLike ? budgetForSize.lite : budgetForSize.flash) * planTokenMultiplier);
     // Routing B: hard-lane models add their own headroom (extraTokens, see HARD_DEEPSEEK/HARD_GLM).
     const outputTokenBudget = provider === 'openrouter' ? baseTokenBudget + 700
-      : provider === 'openrouter-hard' ? baseTokenBudget + extraTokens
+      : extraTokens ? baseTokenBudget + extraTokens
       : baseTokenBudget;
 
     // Codex-only: skip model 2 if insufficient time remains for a useful response.
@@ -1757,7 +1774,11 @@ ${textToSend}`;
                 messages: [{ role: 'user', content: prompt + gateRetryNote }],
                 max_tokens: outputTokenBudget,
                 temperature: 0.7,
-                provider: { zdr: true, data_collection: 'deny' },
+                // require_parameters (DeepSeek, code review 2026-10-03): only hosts that honour
+                // every parameter sent, so none can silently ignore reasoning:{enabled:false}
+                // and let hidden thinking eat the token budget. If no such ZDR host is up, the
+                // call errors and the chain falls through to GLM.
+                provider: { zdr: true, data_collection: 'deny', ...(reasoningOff ? { require_parameters: true } : {}) },
                 ...(reasoningOff ? { reasoning: { enabled: false } } : {}),
               }),
               signal: controller.signal
@@ -1794,7 +1815,16 @@ ${textToSend}`;
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
-        lastGoogleError = `HTTP ${response.status}: ${errorData.error?.message || 'Unknown'}`;
+        // Routing B (code review 2026-10-03): lastGoogleError reaches the client in the 503
+        // message and the Codex fallbackReason, so a hard-lane error stays generic there (no
+        // provider text such as "No endpoints found matching your data policy"); the detail
+        // goes to the server log only.
+        if (provider === 'openrouter-hard') {
+          console.log('[route] hard-lane error', { model: modelId, status: response.status, message: String(errorData.error?.message || 'Unknown').slice(0, 200) });
+          lastGoogleError = `HTTP ${response.status}`;
+        } else {
+          lastGoogleError = `HTTP ${response.status}: ${errorData.error?.message || 'Unknown'}`;
+        }
         if (gateCandidates) gateCandidates.push({ model: modelId, outcome: `http_${response.status}` });
 
         // Retry on transient failures, plus 404 — with a real second provider now in
@@ -1806,7 +1836,10 @@ ${textToSend}`;
         // and Google answers an unsupported value (and an invalid API key) with 400, which
         // would otherwise end the chain as a full outage instead of reaching GPT-OSS on its
         // own key. 401/403 still break.
-        if (response.status === 400 || response.status === 429 || response.status === 404 || response.status === 500 || response.status === 502 || response.status === 503 || response.status === 504) {
+        // Routing B (code review 2026-10-03): ANY error from a hard-lane model falls through.
+        // Its 401/402 (OpenRouter out of credit)/403 says nothing about the next model, and
+        // the Gemini net exists for exactly that OpenRouter failure.
+        if (provider === 'openrouter-hard' || response.status === 400 || response.status === 429 || response.status === 404 || response.status === 500 || response.status === 502 || response.status === 503 || response.status === 504) {
           modelIndex++;
           continue;
         }
