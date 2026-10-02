@@ -1515,10 +1515,71 @@ ${textToSend}`;
   // judging. The explicit 'minimal' pin below was checked separately (HTTP 200 on 3.5).
   // A 400/404 on this id falls through to GPT-OSS below. Vault: Relatch Model Provider
   // Routing - Plan (2026-09-27).
-  const modelList = [
+  const NORMAL_CHAIN = [
     { provider: 'gemini', id: 'gemini-3.5-flash-lite' },
     { provider: 'openrouter', id: 'openai/gpt-oss-120b' },
   ];
+
+  // ROUTING Phase B (2026-10-03, same vault plan, section 3): the hard lane for complex
+  // documents, both targets. ROUTING_MODE=off (unset or any other value) serves NORMAL_CHAIN,
+  // byte-identical to before. shadow computes the lane and logs it (enrich-route event) but
+  // still serves NORMAL_CHAIN. on serves complex documents with COMPLEX_CHAIN.
+  // - Models (2026-09-27 arena, blind judges from 3 families): DeepSeek V4.1 Flash first (best
+  //   overall, best on finance), GLM-5.3 as its failover. Gemini last is an EMERGENCY NET only
+  //   (Manas, 2026-10-03): both hard-lane models share one OpenRouter account and key with the
+  //   GPT-OSS fallback, so an OpenRouter outage would otherwise send every complex document to
+  //   the protocol fallbacks; Gemini is the one model on another provider and key.
+  // - Both go through OPENROUTER_API_KEY (Manas, 2026-10-03: no separate hard-lane key) and
+  //   only to hosts OpenRouter lists as zero data retention. Disclosed in relatchlp#26, which
+  //   must be live before ROUTING_MODE=on.
+  // - DeepSeek with thinking OFF ({effort:'low'} is ignored and truncated 8/15 in the arena).
+  //   GLM thinks by default (260 reasoning tokens on a tiny prompt, live 2026-10-02), so it
+  //   gets the +3000 headroom the arena ran it with; DeepSeek no-think peaked ~2.8k tokens.
+  // - The rule (HARD_LANE_RULES) was calibrated 2026-10-02 on 52 documents exactly as the
+  //   frontend sends them (jev-harness/routing-calib.js): 17% of the corpus, 26% of medium and
+  //   large documents, never small ones, and 0/35 decisions flipped on a repeat Jev run. The
+  //   draft rule (2 of 5 signals) flagged 94% of medium+large: depth_p_dense is ~1.0 on almost
+  //   everything and content-map segments only track length. doc_type_confidence sits at 0.5
+  //   and flipped between runs, so it is not used.
+  const HARD_LANE_RULES = {
+    sizeClasses: ['medium', 'large'], // small documents never route
+    minRichFacets: 5,                 // plan.rich: facets with evidence >= 2.5 (lib/planner)
+    maxLowSignal: 0.7,                // boilerplate gains nothing from a stronger model
+    csvMinRows: 20,                   // Template E (Claude): numeric tables, DeepSeek was best
+  };
+  // Per chain entry (code review 2026-10-03): each hard-lane model carries its own size-scaled
+  // timeouts and token headroom. Worst case, large: Jev ~10 + 75 + 75 + Gemini net 90 = 250s
+  // < FUNCTION_BUDGET_MS 280s. DeepSeek's 5400-token ceiling (2600 x 1.5 + 1500) needs more
+  // than a flat 45s on a slow host.
+  const HARD_TIMEOUTS = { small: 45000, medium: 60000, large: 75000 };
+  const HARD_DEEPSEEK = { provider: 'openrouter-hard', id: 'deepseek/deepseek-v4.1-flash', reasoningOff: true, extraTokens: 1500, timeouts: HARD_TIMEOUTS };
+  const HARD_GLM = { provider: 'openrouter-hard', id: 'z-ai/glm-5.3', extraTokens: 3000, timeouts: HARD_TIMEOUTS };
+  // net: true = the emergency net. It runs exactly like a primary Gemini call (model-1 timeout,
+  // lite budget) so it is never weaker than today's Gemini on the same document, and Parachute
+  // never escalates INTO it (code review 2026-10-03): it is for outages, not a quality retry.
+  const COMPLEX_CHAIN = [HARD_DEEPSEEK, HARD_GLM, { provider: 'gemini', id: 'gemini-3.5-flash-lite', net: true }];
+  const routingMode = (process.env.ROUTING_MODE || '').trim();
+  const routeOn = routingMode === 'on';
+  // Decided only when routing is shadow or on. why: a token for the log, never text.
+  const routeDecision = (routeOn || routingMode === 'shadow') ? (() => {
+    if (!planSummary) return { lane: 'normal', why: 'no_plan' };
+    const rich = (planSummary.rich || []).length, lowSignal = planSummary.low_signal;
+    const base = { rich, lowSignal, csvRows: null };
+    if (lowSignal >= HARD_LANE_RULES.maxLowSignal) return { ...base, lane: 'normal', why: 'low_signal' };
+    // Template E: only text that really parses as a numeric CSV table counts (code review: the
+    // client sets `template`, so 20 lines of prose sent as 'E' must not force the paid lane).
+    // Anything else falls through to the general rule below.
+    const csv = effectiveTemplate === 'E' ? parachute._internal.parseCsv(rawText) : null;
+    if (csv) {
+      const csvRows = csv.rows.length;
+      return { ...base, csvRows, lane: csvRows >= HARD_LANE_RULES.csvMinRows ? 'complex' : 'normal', why: 'csv_rows' };
+    }
+    if (!HARD_LANE_RULES.sizeClasses.includes(effectiveSizeClass)) return { ...base, lane: 'normal', why: 'small' };
+    return { ...base, lane: rich >= HARD_LANE_RULES.minRichFacets ? 'complex' : 'normal', why: 'rich_facets' };
+  })() : null;
+  if (routeDecision) console.log('[route]', routingMode, routeDecision);
+  // A copy, so a Parachute escalation can insert the hard lane into this request's chain only.
+  const modelList = (routeOn && routeDecision.lane === 'complex' ? COMPLEX_CHAIN : NORMAL_CHAIN).slice();
 
   // PARACHUTE (2026-09-28, vault "Relatch Parachute Gating - Plan (2026-09-27)", phase P2):
   // PARACHUTE_MODE=shadow records every candidate below and, at each exit, schedules the gate
@@ -1573,11 +1634,22 @@ ${textToSend}`;
   const gateSkillArg = activeTarget === 'codex' ? codexSlug : skillName;
   // The plan's time rule: a next model must exist AND its timeout + 10s must remain (Codex
   // also keeps its model-2 reserve).
+  // 2026-10-03 (Routing B): with ROUTING_MODE=on, a normal-lane escalation goes to the hard
+  // lane's first model (escalationTarget) instead of the next normal model, and the time rule
+  // uses that model's own timeout.
+  const escalationTarget = (modelId) => {
+    if (routeOn && routeDecision.lane === 'normal' && !modelList.includes(HARD_DEEPSEEK)) return HARD_DEEPSEEK;
+    const next = modelList[modelList.findIndex((m) => m.id === modelId) + 1] || null;
+    return next && next.net ? null : next; // never escalate into the emergency net
+  };
   const gateCanEscalate = (modelId, atMs) => {
-    const next = modelList.findIndex((m) => m.id === modelId) + 1;
+    const nextModel = escalationTarget(modelId);
     const remainingMs = FUNCTION_BUDGET_MS - atMs;
-    return next < modelList.length
-      && remainingMs >= (CODEX_POLICY.timeouts.model2[effectiveSizeClass] ?? 20000) + 10000
+    const nextTimeoutMs = nextModel && nextModel.timeouts
+      ? nextModel.timeouts[effectiveSizeClass] ?? HARD_TIMEOUTS.small
+      : (CODEX_POLICY.timeouts.model2[effectiveSizeClass] ?? 20000);
+    return Boolean(nextModel)
+      && remainingMs >= nextTimeoutMs + 10000
       && (activeTarget !== 'codex' || remainingMs >= CODEX_POLICY.model2ReserveMs);
   };
   // P4 self-disarm. Per clock hour (UTC); the counters are written after the reply (gateLog).
@@ -1614,7 +1686,10 @@ ${textToSend}`;
   // V2: track model index for quality threshold (Lite >= 6, Flash >= 5)
   let modelIndex = 0;
 
-  for (const { provider, id: modelId } of modelList) {
+  // Note: a Parachute escalation may splice the hard lane into modelList while this loop runs.
+  // That is deliberate and well-defined (an array iterator reads the live length), and regress
+  // section 15's escalation drills fail if the inserted model is ever skipped.
+  for (const { provider, id: modelId, reasoningOff, extraTokens, timeouts, net } of modelList) {
     const controller = new AbortController();
 
     // Timeouts are sizeClass-aware so large-doc generation (1800 token output budget)
@@ -1625,7 +1700,10 @@ ${textToSend}`;
     // Total ceiling: large = 35+18 = 53s, small/medium = 25+20 = 45s. Both < 60s limit.
     // Groq (behind OpenRouter, model 2's new provider) responded in 4.5-6.8s across
     // every live test — well inside this budget already, no widening needed here.
-    const perModelTimeoutMs = modelIndex === 0
+    // Routing B: a hard-lane model uses its own size-scaled timeouts wherever it sits; the
+    // Gemini emergency net (net) runs like a primary Gemini call (model-1 timeout, lite budget).
+    const primaryLike = modelIndex === 0 || Boolean(net);
+    const perModelTimeoutMs = timeouts ? (timeouts[effectiveSizeClass] ?? timeouts.small) : primaryLike
       ? (CODEX_POLICY.timeouts.model1[effectiveSizeClass] ?? 25000)
       : (CODEX_POLICY.timeouts.model2[effectiveSizeClass] ?? 20000);
     const timeoutId = setTimeout(() => controller.abort(), perModelTimeoutMs);
@@ -1638,8 +1716,11 @@ ${textToSend}`;
     // generation even with reasoning effort set to low; +700 fixed it in testing. Applied
     // only to this provider — Gemini's own budget is unchanged.
     // planTokenMultiplier is 1 unless Jev judged the source dense (Claude target only).
-    const baseTokenBudget = Math.round((modelIndex === 0 ? budgetForSize.lite : budgetForSize.flash) * planTokenMultiplier);
-    const outputTokenBudget = provider === 'openrouter' ? baseTokenBudget + 700 : baseTokenBudget;
+    const baseTokenBudget = Math.round((primaryLike ? budgetForSize.lite : budgetForSize.flash) * planTokenMultiplier);
+    // Routing B: hard-lane models add their own headroom (extraTokens, see HARD_DEEPSEEK/HARD_GLM).
+    const outputTokenBudget = provider === 'openrouter' ? baseTokenBudget + 700
+      : extraTokens ? baseTokenBudget + extraTokens
+      : baseTokenBudget;
 
     // Codex-only: skip model 2 if insufficient time remains for a useful response.
     // Prevents spending the last few seconds on a weak attempt likely to timeout.
@@ -1669,6 +1750,36 @@ ${textToSend}`;
                 // Google ever changes the default, unpinned thinking would eat the budget and
                 // cut files off.
                 generationConfig: { maxOutputTokens: outputTokenBudget, temperature: 0.7, thinkingConfig: { thinkingLevel: 'minimal' } }
+              }),
+              signal: controller.signal
+            }
+          )
+        : provider === 'openrouter-hard'
+        // Routing B hard lane (DeepSeek / GLM): the same OpenRouter key as GPT-OSS, but none of
+        // GPT-OSS's Groq pin or reasoning effort. zdr + data_collection 'deny' restrict OpenRouter
+        // to hosts that neither retain nor train on prompts (verified live 2026-10-02: CoreWeave
+        // for DeepSeek, SiliconFlow for GLM). DeepSeek's thinking is disabled outright.
+        ? await fetch(
+            'https://openrouter.ai/api/v1/chat/completions',
+            {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+                'HTTP-Referer': 'https://app.relatch.online',
+                'X-Title': 'Relatch',
+              },
+              body: JSON.stringify({
+                model: modelId,
+                messages: [{ role: 'user', content: prompt + gateRetryNote }],
+                max_tokens: outputTokenBudget,
+                temperature: 0.7,
+                // require_parameters (DeepSeek, code review 2026-10-03): only hosts that honour
+                // every parameter sent, so none can silently ignore reasoning:{enabled:false}
+                // and let hidden thinking eat the token budget. If no such ZDR host is up, the
+                // call errors and the chain falls through to GLM.
+                provider: { zdr: true, data_collection: 'deny', ...(reasoningOff ? { require_parameters: true } : {}) },
+                ...(reasoningOff ? { reasoning: { enabled: false } } : {}),
               }),
               signal: controller.signal
             }
@@ -1704,7 +1815,16 @@ ${textToSend}`;
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
-        lastGoogleError = `HTTP ${response.status}: ${errorData.error?.message || 'Unknown'}`;
+        // Routing B (code review 2026-10-03): lastGoogleError reaches the client in the 503
+        // message and the Codex fallbackReason, so a hard-lane error stays generic there (no
+        // provider text such as "No endpoints found matching your data policy"); the detail
+        // goes to the server log only.
+        if (provider === 'openrouter-hard') {
+          console.log('[route] hard-lane error', { model: modelId, status: response.status, message: String(errorData.error?.message || 'Unknown').slice(0, 200) });
+          lastGoogleError = `HTTP ${response.status}`;
+        } else {
+          lastGoogleError = `HTTP ${response.status}: ${errorData.error?.message || 'Unknown'}`;
+        }
         if (gateCandidates) gateCandidates.push({ model: modelId, outcome: `http_${response.status}` });
 
         // Retry on transient failures, plus 404 — with a real second provider now in
@@ -1716,7 +1836,10 @@ ${textToSend}`;
         // and Google answers an unsupported value (and an invalid API key) with 400, which
         // would otherwise end the chain as a full outage instead of reaching GPT-OSS on its
         // own key. 401/403 still break.
-        if (response.status === 400 || response.status === 429 || response.status === 404 || response.status === 500 || response.status === 502 || response.status === 503 || response.status === 504) {
+        // Routing B (code review 2026-10-03): ANY error from a hard-lane model falls through.
+        // Its 401/402 (OpenRouter out of credit)/403 says nothing about the next model, and
+        // the Gemini net exists for exactly that OpenRouter failure.
+        if (provider === 'openrouter-hard' || response.status === 400 || response.status === 429 || response.status === 404 || response.status === 500 || response.status === 502 || response.status === 503 || response.status === 504) {
           modelIndex++;
           continue;
         }
@@ -1780,6 +1903,10 @@ ${textToSend}`;
           gateCandidates.push({ ...gate.entry, outcome: 'escalated' });
           gateEscalated = true;
           gateRetryNote = parachute.retryNote(gate.entry.report);
+          // Routing B: put the escalation target next in this request's chain (a normal-lane
+          // escalation goes to DeepSeek when routing is on; otherwise it is already next).
+          const target = escalationTarget(modelId);
+          if (target && !modelList.includes(target)) modelList.splice(modelList.findIndex((m) => m.id === modelId) + 1, 0, target);
           console.log('[gate] escalate', { from: modelId, codes: [...new Set(gate.entry.report.findings.filter((f) => f.tier === 'HARD' || f.tier === 'UNUSABLE').map((f) => f.code))] });
           modelIndex++;
           continue;
@@ -1928,6 +2055,27 @@ ${textToSend}`;
     };
     const promise = run().catch((err) => console.log(`[gate] ${gateShadow ? 'shadow' : gateMode} failed:`, err?.message || 'unknown'));
     waitUntil(promise);
+  }
+
+  // ROUTING Phase B telemetry: one enrich-route event per request when ROUTING_MODE is shadow
+  // or on, after the reply, on the gate's own Axiom client (never delays a reply or the
+  // security logs). Tokens and numbers only: the lane, why, the rule inputs, the chain of model
+  // ids, what served. Watchtower counts only status >= 400 there, so this never pages.
+  function routeLog(served) {
+    if (!routeDecision || !gateAxiom) return;
+    const event = {
+      endpoint: 'enrich-route', mode: routingMode, lane: routeDecision.lane, why: routeDecision.why,
+      rich: routeDecision.rich ?? null, lowSignal: routeDecision.lowSignal ?? null, csvRows: routeDecision.csvRows ?? null,
+      target: activeTarget, template: effectiveTemplate, sizeClass: effectiveSizeClass,
+      chain: modelList.map((m) => m.id), served, model: served === 'model' ? successfulModel : null,
+      gateId, ms: Date.now() - requestStartMs,
+    };
+    const run = async () => {
+      await new Promise((resolve) => setImmediate(resolve)); // let the reply go out first
+      gateAxiom.ingest('relatch-security', [{ ...event, _time: new Date().toISOString() }]);
+      await Promise.race([gateAxiom.flush(), new Promise((resolve) => { const t = setTimeout(resolve, 10000); if (t.unref) t.unref(); })]);
+    };
+    waitUntil(run().catch((err) => console.log('[route] log failed:', err?.message || 'unknown')));
   }
 
   // v2.4: Codex deterministic fallback assembler.
@@ -2135,6 +2283,7 @@ ${textToSend}`;
     const enrichedOutput = gateServedText !== null ? gateServedText : sanitize(finalRawText, activeTarget === 'codex' ? codexSlug : skillName, effectiveTemplate);
     // PARACHUTE shadow: scheduled here, runs after the reply. (enforce/escalate log here too.)
     if (gateCandidates) gateLog(enrichedOutput, 'model');
+    routeLog('model');
 
     if (quotaUsage && quotaUser) {
       try {
@@ -2171,6 +2320,7 @@ ${textToSend}`;
   // Claude target falls through to the 503 below — no safe local approximation exists for it.
   if (activeTarget === 'codex') {
     if (gateCandidates) gateLog(null, 'protocol_fallback');
+    routeLog('protocol_fallback');
     const fallbackRaw = buildCodexFallback();
     return res.status(200).json({
       enriched: sanitize(fallbackRaw, codexSlug, 'CODEX'),
@@ -2184,6 +2334,7 @@ ${textToSend}`;
 
   // Claude target or unknown — 503 unchanged
   if (gateCandidates) gateLog(null, 'error_503');
+  routeLog('error_503');
   await logToAxiom({ endpoint: 'enrich', status: 503, reason: 'google_api_error', userId, ip: req.headers['x-forwarded-for'] || null, ...(gateId ? { gateId } : {}) });
   return res.status(503).json({
     error: 'GOOGLE_API_ERROR',
