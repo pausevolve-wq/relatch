@@ -60,7 +60,11 @@ const BODY_LIMITS = {
 // so the input-cap study can bake 2x/4x inputs through the real pipeline (#26 merged before the
 // study ran). Still bounded: 32,000 chars is ~8k tokens, not the ~1M that #26 closed. The
 // study's result sets the values App.tsx asks for, and these may come down to match.
-const SERVER_CHAR_CAP = { small: 3500, medium: 20000, large: 32000 };
+// 2026-10-04 (study result): 2x read more of the source with no cut-offs, no invented numbers
+// and no added latency; 4x added nothing over 2x. App.tsx now asks for 2x on the Claude target
+// (10000 medium, a 16000-char sample for large; Codex and small unchanged), so the ceilings come
+// down to exactly 2x: nothing beyond what the app uses is accepted.
+const SERVER_CHAR_CAP = { small: 3500, medium: 10000, large: 16000 };
 
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', 'https://app.relatch.online');
