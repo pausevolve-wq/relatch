@@ -39,6 +39,24 @@ async function logToAxiom(event) {
   }
 }
 
+// 2026-10-04 (input-cap review): every client-sent string is clipped once, at handler entry, so
+// no downstream path (generation prompts, Jev calls, regexes, Redis keys) ever sees
+// attacker-sized input. Each limit sits well above what App.tsx can send: rawText is at most
+// a 40,000-char medium document (large documents arrive as an 8k sample, Codex text is
+// distilled to its cap), and its 120,000 limit also stays above GATE_MAX_SOURCE so the gate's
+// own large-source skip keeps working as tested; the longest domainRole/domainFrame there is
+// 239 chars; fileName is the user's own file name; sessionId is `session_<ms>_<6 chars>`. A real
+// request is never changed. Prompts are bounded separately by SERVER_CHAR_CAP below.
+const BODY_LIMITS = {
+  rawText: 120000, fileName: 255, category: 40, domainLabel: 100, domainRole: 400, domainFrame: 400,
+  template: 20, sizeClass: 20, target: 20, codexShape: 40, sessionId: 128,
+};
+// The server's ceiling on how much source text one generation prompt may carry, per size class.
+// Equal to what App.tsx sends as charCap today; the input-cap study may raise them. The legacy
+// sizeClass reconstruction in the handler keeps its own 5000/8000 literals on purpose: those
+// map the values old clients SENT, not these ceilings, so raising a ceiling must not move them.
+const SERVER_CHAR_CAP = { small: 3500, medium: 5000, large: 8000 };
+
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', 'https://app.relatch.online');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
@@ -46,6 +64,13 @@ module.exports = async function handler(req, res) {
 
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+
+  // Clip client strings in place before anything reads req.body (see BODY_LIMITS above).
+  if (req.body && typeof req.body === 'object') {
+    for (const [k, n] of Object.entries(BODY_LIMITS)) {
+      if (typeof req.body[k] === 'string' && req.body[k].length > n) req.body[k] = req.body[k].slice(0, n);
+    }
+  }
 
   // Auth: a Bearer header ALWAYS takes precedence and is verified through the unchanged
   // Clerk path, full stop — this is deliberate, not an oversight. An earlier version of
@@ -288,6 +313,8 @@ module.exports = async function handler(req, res) {
   }
   // ─── END QUOTA GATE ──────────────────────────────────────────────────────────
 
+  // Note (2026-10-04): processedText is not read anywhere below; BODY_LIMITS (top of file) is
+  // what bounds rawText.
   const processedText = rawText.length > 15000 ? rawText.slice(0, 15000) : rawText;
 
   // UNCHANGED — exact same validation logic as before
@@ -378,7 +405,21 @@ module.exports = async function handler(req, res) {
   const filteredText = signalLines.length >= 5 ? signalLines.join('\n') : sourceText;
 
   // V2: use charCap from profiler if provided, otherwise fall back to original logic
-  const effectiveCharCap = charCap || (signalLines.length >= 5 ? 2500 : 3500);
+  // 2026-10-04: the server owns the ceiling (SERVER_CHAR_CAP, top of file). charCap comes from
+  // the client and was used as sent, so one crafted request could put ~1M tokens of source text
+  // into a single generation prompt: the shared free-tier Gemini quota, or a paid DeepSeek call
+  // in the hard lane. Real requests are unchanged (the ceilings equal what App.tsx sends) and a
+  // missing or zero charCap falls back exactly as before. A value under 1000 chars (negative,
+  // fractional, true, non-numeric) now falls back too: it used to slice oddly (-5 kept all but
+  // 5 chars, unbounded; 0.5 or 'abc' sent an empty text). Accepted, bounded (code review
+  // 2026-10-04): the client still names its own sizeClass, so a forged 'large' gets the large
+  // ceiling and budgets and may reach the hard lane, but only within its own request quota and
+  // only if Jev finds >= 5 rich facets in the real text. The size class cannot be re-derived
+  // from rawText here: Codex text arrives distilled to the cap and large documents as a sample.
+  const clientCharCap = Math.floor(Number(charCap));
+  const effectiveCharCap = Math.min(
+    Number.isFinite(clientCharCap) && clientCharCap >= 1000 ? clientCharCap : (signalLines.length >= 5 ? 2500 : 3500),
+    SERVER_CHAR_CAP[effectiveSizeClass]);
   // `let`, not `const`, since 2026-09-26: when Jev routes a non-B request INTO Template B,
   // this is replaced with the unfiltered source further down (see activeTemplate).
   // Content fidelity (2026-09-26): with a content map, an over-cap text is no longer cut to its
