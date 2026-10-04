@@ -55,7 +55,12 @@ const BODY_LIMITS = {
 // Equal to what App.tsx sends as charCap today; the input-cap study may raise them. The legacy
 // sizeClass reconstruction in the handler keeps its own 5000/8000 literals on purpose: those
 // map the values old clients SENT, not these ceilings, so raising a ceiling must not move them.
-const SERVER_CHAR_CAP = { small: 3500, medium: 5000, large: 8000 };
+// 2026-10-04 (later): a ceiling is the MOST a client may ask for, not what it gets. App.tsx
+// still asks for 3500/5000/8000, so real requests are unchanged; medium and large are 4x that
+// so the input-cap study can bake 2x/4x inputs through the real pipeline (#26 merged before the
+// study ran). Still bounded: 32,000 chars is ~8k tokens, not the ~1M that #26 closed. The
+// study's result sets the values App.tsx asks for, and these may come down to match.
+const SERVER_CHAR_CAP = { small: 3500, medium: 20000, large: 32000 };
 
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', 'https://app.relatch.online');
@@ -408,7 +413,7 @@ module.exports = async function handler(req, res) {
   // 2026-10-04: the server owns the ceiling (SERVER_CHAR_CAP, top of file). charCap comes from
   // the client and was used as sent, so one crafted request could put ~1M tokens of source text
   // into a single generation prompt: the shared free-tier Gemini quota, or a paid DeepSeek call
-  // in the hard lane. Real requests are unchanged (the ceilings equal what App.tsx sends) and a
+  // in the hard lane. Real requests are unchanged (App.tsx asks for no more than the ceilings) and a
   // missing or zero charCap falls back exactly as before. A value under 1000 chars (negative,
   // fractional, true, non-numeric) now falls back too: it used to slice oddly (-5 kept all but
   // 5 chars, unbounded; 0.5 or 'abc' sent an empty text). Accepted, bounded (code review
