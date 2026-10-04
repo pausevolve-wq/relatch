@@ -1811,10 +1811,18 @@ ${textToSend}`;
             }
           );
 
-      clearTimeout(timeoutId);
+      // 2026-10-04: the timeout now stays armed until the BODY is read, not just the headers.
+      // OpenRouter sends 200 + headers as soon as a provider accepts the request, before the
+      // first token (its errors doc), so clearing it here left generation itself unbounded for
+      // every OpenRouter model (the hard lane and the GPT-OSS fallback): in the prod `on` bake
+      // one DeepSeek call (pg-ds, medium, 60s timeout) took the request to 68.4s, and a host
+      // that never finished would have run into Vercel's limit with no fallback. An abort during
+      // the body read rejects response.json() with AbortError, which the catch below already
+      // turns into a timeout and the next model.
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
+        clearTimeout(timeoutId);
         // Routing B (code review 2026-10-03): lastGoogleError reaches the client in the 503
         // message and the Codex fallbackReason, so a hard-lane error stays generic there (no
         // provider text such as "No endpoints found matching your data policy"); the detail
@@ -1847,6 +1855,7 @@ ${textToSend}`;
       }
 
       const data = await response.json();
+      clearTimeout(timeoutId); // the body is in: only now has the call finished (see above)
       const candidateText = provider === 'gemini'
         ? (data.candidates?.[0]?.content?.parts?.[0]?.text || '')
         : (data.choices?.[0]?.message?.content || '');
