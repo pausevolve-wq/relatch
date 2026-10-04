@@ -1778,7 +1778,13 @@ ${textToSend}`;
                 // every parameter sent, so none can silently ignore reasoning:{enabled:false}
                 // and let hidden thinking eat the token budget. If no such ZDR host is up, the
                 // call errors and the chain falls through to GLM.
-                provider: { zdr: true, data_collection: 'deny', ...(reasoningOff ? { require_parameters: true } : {}) },
+                // sort 'throughput' (2026-10-04): try the fastest ZDR host first instead of
+                // OpenRouter's price-weighted load balancing, which can pick a slow host. In the
+                // prod `on` bake 5 DeepSeek calls took 5-13s but one took ~60s for ~3.3k tokens,
+                // and the landing page promises results in under a minute. A host error still falls
+                // back to the next host (OpenRouter provider-routing doc); price differences
+                // between hosts are a fraction of a cent per skill.
+                provider: { zdr: true, data_collection: 'deny', sort: 'throughput', ...(reasoningOff ? { require_parameters: true } : {}) },
                 ...(reasoningOff ? { reasoning: { enabled: false } } : {}),
               }),
               signal: controller.signal
@@ -1811,10 +1817,18 @@ ${textToSend}`;
             }
           );
 
-      clearTimeout(timeoutId);
+      // 2026-10-04: the timeout now stays armed until the BODY is read, not just the headers.
+      // OpenRouter sends 200 + headers as soon as a provider accepts the request, before the
+      // first token (its errors doc), so clearing it here left generation itself unbounded for
+      // every OpenRouter model (the hard lane and the GPT-OSS fallback): in the prod `on` bake
+      // one DeepSeek call (pg-ds, medium, 60s timeout) took the request to 68.4s, and a host
+      // that never finished would have run into Vercel's limit with no fallback. An abort during
+      // the body read rejects response.json() with AbortError, which the catch below already
+      // turns into a timeout and the next model.
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
+        clearTimeout(timeoutId);
         // Routing B (code review 2026-10-03): lastGoogleError reaches the client in the 503
         // message and the Codex fallbackReason, so a hard-lane error stays generic there (no
         // provider text such as "No endpoints found matching your data policy"); the detail
@@ -1847,6 +1861,7 @@ ${textToSend}`;
       }
 
       const data = await response.json();
+      clearTimeout(timeoutId); // the body is in: only now has the call finished (see above)
       const candidateText = provider === 'gemini'
         ? (data.candidates?.[0]?.content?.parts?.[0]?.text || '')
         : (data.choices?.[0]?.message?.content || '');
