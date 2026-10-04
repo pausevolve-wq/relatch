@@ -1778,7 +1778,13 @@ ${textToSend}`;
                 // every parameter sent, so none can silently ignore reasoning:{enabled:false}
                 // and let hidden thinking eat the token budget. If no such ZDR host is up, the
                 // call errors and the chain falls through to GLM.
-                provider: { zdr: true, data_collection: 'deny', ...(reasoningOff ? { require_parameters: true } : {}) },
+                // sort 'throughput' (2026-10-04): try the fastest ZDR host first instead of
+                // OpenRouter's price-weighted load balancing, which can pick a slow host. In the
+                // prod `on` bake 5 DeepSeek calls took 5-13s but one took ~60s for ~3.3k tokens,
+                // and the landing page promises results in under a minute. A host error still falls
+                // back to the next host (OpenRouter provider-routing doc); price differences
+                // between hosts are a fraction of a cent per skill.
+                provider: { zdr: true, data_collection: 'deny', sort: 'throughput', ...(reasoningOff ? { require_parameters: true } : {}) },
                 ...(reasoningOff ? { reasoning: { enabled: false } } : {}),
               }),
               signal: controller.signal
