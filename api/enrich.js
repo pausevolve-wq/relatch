@@ -10,7 +10,7 @@ const axiomClient = process.env.AXIOM_TOKEN
   : null;
 // Jev planning layer (2026-09-26): fail-open typed decisions about the document before
 // template routing. See lib/planner.js - every export is a no-op on a null plan.
-const { planDocument, routeTemplate, routeCodexShape, buildPlanDirectives, buildFacetModules, summarizePlan, mapContent, spreadSelect, SPREAD_NOTE, summarizeContent } = require('../lib/planner');
+const { planDocument, routeTemplate, routeCodexShape, routeDomain, buildPlanDirectives, buildFacetModules, summarizePlan, mapContent, spreadSelect, SPREAD_NOTE, summarizeContent } = require('../lib/planner');
 // Parachute Gating (2026-09-28): deterministic quality gate, SHADOW mode only for now (see the
 // PARACHUTE block before the model loop). Pure functions; lib/parachute.js has no I/O.
 // 2026-10-03: P3 (PARACHUTE_MODE=enforce) and P4 (=escalate) let it act on what is served.
@@ -513,9 +513,13 @@ module.exports = async function handler(req, res) {
     .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
     .join(' ');
 
-  const safeDomainLabel = domainLabel || 'General';
-  const safeDomainRole = domainRole || 'an expert';
-  const safeDomainFrame = domainFrame || 'communicate effectively';
+  // 2026-10-21: Jev corrects a domain the frontend's keyword detection got wrong (see
+  // routeDomain in lib/planner.js). No plan, an unconfident answer, or agreement with the
+  // client leaves domainLabel/domainRole/domainFrame exactly as the request sent them.
+  const routedDomain = routeDomain({ label: domainLabel, role: domainRole, frame: domainFrame }, plan, target === 'codex' ? 'codex' : 'claude');
+  const safeDomainLabel = routedDomain.label || 'General';
+  const safeDomainRole = routedDomain.role || 'an expert';
+  const safeDomainFrame = routedDomain.frame || 'communicate effectively';
 
   // v2.1: Codex export target — kebab-case slug for OpenAI Codex skill name
   const codexSlug = skillName.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '') || 'my-skill';
@@ -1297,7 +1301,7 @@ ${textToSend}`;
   if (selection.spread && textToSend === selection.text) prompt = SPREAD_NOTE + prompt;
   if (planDirectives) prompt = planDirectives + prompt;
   const planSummary = plan
-    ? summarizePlan(plan, { clientTemplate: template || 'A', template: activeTemplate, clientShape: clientCodexShape, codexShape: activeCodexShape, target: activeTarget })
+    ? summarizePlan(plan, { clientTemplate: template || 'A', template: activeTemplate, clientShape: clientCodexShape, codexShape: activeCodexShape, target: activeTarget, domainChanged: routedDomain.changed })
     : null;
   if (planSummary) console.log('[plan]', planSummary);
   const contentSummary = contentMap ? summarizeContent(contentMap, selection.spread && textToSend === selection.text) : null;
