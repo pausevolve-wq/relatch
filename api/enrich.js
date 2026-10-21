@@ -956,11 +956,13 @@ RULES:
 - You MUST start your response exactly with the YAML block below, no code fences, no backticks, no preamble.
 - You MUST enclose all YAML values in double quotes.
 - The "name" field MUST be exactly: "${skillName}"
+- The "description" field is how Claude decides when to load this skill. Write one or two plain sentences (at most 600 characters, third person): what the skill does, then "Use when" followed by 3 to 5 concrete situations or requests drawn from the source's own topics and terms, including ones where the user would not name this skill. No line breaks, no angle brackets.
 - Use "software engineering" for the "domain" field unless the source clearly belongs to a different technical domain.
 
 FORMAT:
 ---
 name: "${skillName}"
+description: "What this skill does. Use when ..."
 domain: "software engineering"
 content_type: "behavioral skill"
 use_cases: ["code generation", "code review", "refactoring", "architecture alignment"]
@@ -1017,11 +1019,13 @@ RULES:
 - You MUST start your response exactly with the YAML block below, no code fences, no backticks, no preamble.
 - You MUST enclose all YAML values in double quotes.
 - The "name" field MUST be exactly: "${skillName}"
+- The "description" field is how Claude decides when to load this skill. Write one or two plain sentences (at most 600 characters, third person): what the skill does, then "Use when" followed by 3 to 5 concrete situations or requests drawn from the source's own topics and terms, including ones where the user would not name this skill. No line breaks, no angle brackets.
 - Use "${safeDomainLabel}" for the "domain" field by default, but if the content clearly belongs to a different domain, replace it with the most accurate domain instead.
 
 FORMAT:
 ---
 name: "${skillName}"
+description: "What this skill does. Use when ..."
 domain: "${safeDomainLabel}"
 content_type: "behavioral skill"
 use_cases: ["process execution", "decision support", "workflow guidance"]
@@ -1069,11 +1073,13 @@ RULES:
 - You MUST start your response exactly with the YAML block below, no code fences, no backticks, no preamble.
 - You MUST enclose all YAML values in double quotes.
 - The "name" field MUST be exactly: "${skillName}"
+- The "description" field is how Claude decides when to load this skill. Write one or two plain sentences (at most 600 characters, third person): what the skill does, then "Use when" followed by 3 to 5 concrete situations or requests drawn from the source's own topics and terms, including ones where the user would not name this skill. No line breaks, no angle brackets.
 - Use "${safeDomainLabel}" for the "domain" field by default, but if the content clearly belongs to a different domain, replace it with the most accurate domain instead.
 
 FORMAT:
 ---
 name: "${skillName}"
+description: "What this skill does. Use when ..."
 domain: "${safeDomainLabel}"
 content_type: "behavioral skill"
 use_cases: ["case 1", "case 2", "case 3"]
@@ -1132,10 +1138,12 @@ RULES:
 - You MUST start your response exactly with the YAML block below, no code fences, no backticks, no preamble.
 - You MUST enclose all YAML values in double quotes.
 - The "name" field MUST be exactly: "${skillName}"
+- The "description" field is how Claude decides when to load this skill. Write one or two plain sentences (at most 600 characters, third person): what the skill does, then "Use when" followed by 3 to 5 concrete situations or requests drawn from the source's own topics and terms, including ones where the user would not name this skill. No line breaks, no angle brackets.
 
 FORMAT:
 ---
 name: "${skillName}"
+description: "What this skill does. Use when ..."
 domain: "${safeDomainLabel}"
 content_type: "behavioral skill"
 use_cases: ["financial analysis", "data interpretation", "reporting"]
@@ -1197,6 +1205,7 @@ RULES:
 - You MUST start your response exactly with the YAML block below, no code fences, no backticks, no preamble.
 - You MUST enclose all YAML values in double quotes.
 - The "name" field MUST be exactly: "${skillName}"
+- The "description" field is how Claude decides when to load this skill. Write one or two plain sentences (at most 600 characters, third person): what the skill does, then "Use when" followed by 3 to 5 concrete situations or requests drawn from the source's own topics and terms, including ones where the user would not name this skill. No line breaks, no angle brackets.
 - Use "${safeDomainLabel}" for the "domain" field by default. Per the rule above, if the text is clearly not about the Suggested Domain, replace it with the most accurate domain instead.
 - NEVER skip ## Identity & Role under any circumstance. For instructional, pedagogical, or reference documents where no personal author voice is present, define the professional role Claude takes on: name the domain, the output type, and the primary behavioral constraint this skill enforces.
 - Generate ALL sections in the EXACT ORDER listed in the FORMAT block below. Do not reorder, skip, or omit any section.
@@ -1206,6 +1215,7 @@ ANTI-ABSTRACTION RULE: Before writing any bullet or principle, ask: "Could this 
 FORMAT:
 ---
 name: "${skillName}"
+description: "What this skill does. Use when ..."
 domain: "${safeDomainLabel}"
 content_type: "behavioral skill"
 use_cases: ["case 1", "case 2", "case 3"]
@@ -1312,6 +1322,39 @@ ${textToSend}`;
   // UNCHANGED: all YAML repair logic preserved exactly
   // CHANGED: removed hardcoded 8-section enforcement, replaced with template-aware minimum
   // ─────────────────────────────────────────────────────────────────────────────
+  // 2026-10-21 (Domain Templates step B): every Claude skill carries an Agent Skills
+  // `description`. Claude decides when to load a skill from it, and claude.ai's "Upload a
+  // skill" asks for name + description. Phase 0 (vault "Relatch Domain Templates F-K - Plan
+  // (2026-10-21)"): 0 of 47 Relatch Claude outputs had one; 48 of 48 native skill-creator and
+  // naive ones did. The model's own description is kept when usable - folded to ONE quoted
+  // line right after `name` (block scalars and continuation lines included), angle brackets
+  // dropped, at most 1024 chars (the spec limit). A missing or still-placeholder one is built
+  // from the skill's first body sentence plus its real use_cases.
+  function withDescription(fm, body) {
+    const lines = fm.split('\n');
+    let desc = '';
+    const at = lines.findIndex((l) => /^description:/.test(l));
+    if (at >= 0) {
+      let end = at + 1;
+      desc = lines[at].replace(/^description:\s*/, '').replace(/^[>|][-+]?\s*$/, '');
+      while (end < lines.length && /^\s+\S/.test(lines[end])) { desc += ' ' + lines[end].trim(); end++; }
+      lines.splice(at, Math.max(1, end - at));
+    }
+    desc = desc.trim().replace(/^"([\s\S]*)"$/, '$1').replace(/^'([\s\S]*)'$/, '$1').replace(/\\"/g, '"');
+    if (!desc || /^What this skill does\b/i.test(desc) || /^\[.*\]$/.test(desc)) {
+      const first = body.split('\n').map((l) => l.trim()).find((l) => l && !/^(#|\||-|\*|\d+[.)]|>|`|\[|---)/.test(l)) || '';
+      const sentence = ((first.match(/^.*?[.!?](?=\s|$)/) || [first])[0]).replace(/^You (are|act as)\b/i, 'Acts as').slice(0, 400).trim();
+      const useCases = ((fm.match(/^use_cases:\s*\[(.*)\]\s*$/m) || [])[1] || '')
+        .split(',').map((x) => x.trim().replace(/^"|"$/g, '')).filter((x) => x && !/^case \d+$/i.test(x) && x !== 'general use').slice(0, 4);
+      desc = (sentence || 'Applies the rules and knowledge from the source document.') + (useCases.length ? ` Use for ${useCases.join(', ')}.` : '');
+    }
+    desc = desc.replace(/[<>]/g, '').replace(/\s+/g, ' ').trim();
+    if (desc.length > 1024) desc = desc.slice(0, 1020).replace(/\s+\S*$/, '') + '...';
+    const nameAt = lines.findIndex((l) => /^name:/.test(l));
+    lines.splice(nameAt + 1, 0, `description: "${desc.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`);
+    return lines.join('\n');
+  }
+
   function sanitize(raw, skillName, tmpl) {
     let text = raw;
 
@@ -1520,6 +1563,7 @@ ${textToSend}`;
       // quoted again (`name: ""X""`, invalid YAML). The frontend's multi-file SKILL.md then
       // read an empty domain from it (App.tsx `^domain:` regex).
       fm = fm.replace(/^(name|domain|content_type):\s*(?![\s"])(.+)$/gm, (_, key, val) => `${key}: "${val.trim()}"`);
+      fm = withDescription(fm, text.slice(fmMatch[0].length));
       text = `---\n${fm.trim()}\n---` + text.slice(fmMatch[0].length);
     }
 
