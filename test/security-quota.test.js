@@ -182,3 +182,15 @@ test('a timed-out reservation denies but never corrupts the retry', async () => 
  const retry=await reserveOcr(redis,{userId:'timeout-retry',sessionId:'s'});
  assert.equal(retry.allowed,true);assert.equal(retry.dailyCount,1);
 });
+test('a stale frontend-minted session id is denied as expired even after tombstone retention', async () => {
+ const stale = `session_${Date.now() - 8 * 86400 * 1000}_abc123`;
+ const r = await reserveGeneration(redis, 'stale-user', stale);
+ assert.equal(r.allowed, false); assert.equal(r.limitType, 'session_expired'); assert.equal(r.dailyCount, 0);
+ // the stale denial wrote no counters: a genuinely fresh id still charges the first credit
+ const fresh = await reserveGeneration(redis, 'stale-user', `session_${Date.now()}_xyz789`);
+ assert.equal(fresh.allowed, true); assert.equal(fresh.dailyCount, 1);
+});
+test('session ids outside the frontend format charge within the allowance (tombstone-bounded)', async () => {
+ const r = await reserveGeneration(redis, 'legacy-user', 'legacy-id-without-timestamp');
+ assert.equal(r.allowed, true); assert.equal(r.dailyCount, 1);
+});
