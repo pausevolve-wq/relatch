@@ -82,6 +82,26 @@ module.exports = async function handler(req, res) {
         await logToAxiom({ endpoint: 'ocr', status: 401, reason: 'anon_token_invalid', ip: req.headers['x-forwarded-for'] || null });
         return res.status(401).json({ error: 'ANON_TOKEN_INVALID' });
       }
+      // Bind the token to this batch's sessionId, mirroring enrich.js's claim: OCR runs
+      // BEFORE the generation call in a real batch, so without this claim the one-trial
+      // boundary would only exist for generation and anonymous OCR could hop batch
+      // sessions freely. Whichever endpoint sees the batch first claims it (SET NX);
+      // the other then reads back and compares, exactly as in enrich.js.
+      // Read from req.body directly: the destructured sessionId below is not in scope yet.
+      const anonSessionId = req.body?.sessionId;
+      if (typeof anonSessionId !== 'string' || !anonSessionId || anonSessionId.length > 128) {
+        await logToAxiom({ endpoint: 'ocr', status: 401, reason: 'anon_missing_session_id', ip: req.headers['x-forwarded-for'] || null });
+        return res.status(401).json({ error: 'ANON_TOKEN_INVALID' });
+      }
+      const claimedSessionKey = `anon:${anonToken}:session`;
+      const claimResult = await redis.set(claimedSessionKey, anonSessionId, { nx: true, ex: 600 });
+      if (claimResult === null) {
+        const claimedSessionId = await redis.get(claimedSessionKey);
+        if (String(claimedSessionId) !== String(anonSessionId)) {
+          await logToAxiom({ endpoint: 'ocr', status: 401, reason: 'anon_session_mismatch', ip: req.headers['x-forwarded-for'] || null });
+          return res.status(401).json({ error: 'ANON_TOKEN_INVALID' });
+        }
+      }
     } catch (redisErr) {
       console.error('[anon] Redis check failed:', redisErr?.message || redisErr);
       await logToAxiom({ endpoint: 'ocr', status: 401, reason: 'anon_redis_error', ip: req.headers['x-forwarded-for'] || null });
@@ -134,8 +154,13 @@ module.exports = async function handler(req, res) {
     const quota = await reserveOcr(redis,
       { userId, anonToken: isAnonymousRequest ? anonToken : null, sessionId }, stored);
     if (!quota.allowed) {
+      // limitType 'session' means this batch's attempt budget is spent - NO new credit
+      // was consumed; the user starts a fresh upload instead of being silently charged.
       return res.status(429).json({ error: 'OCR_QUOTA_REACHED', limitType: quota.limitType,
-        limitValue: quota.limitType === 'daily' ? 5 : 35, weeklyCount: quota.weeklyCount, weeklyLimit: 35 });
+        limitValue: quota.limitType === 'weekly' ? 35 : 5, weeklyCount: quota.weeklyCount, weeklyLimit: 35,
+        message: quota.limitType === 'session'
+          ? "This upload batch has reached its attempt limit. Start a new upload to continue."
+          : 'OCR attempt limit reached. Please try again after the quota resets.' });
     }
   } catch {
     return res.status(503).json({ error: 'OCR_QUOTA_UNAVAILABLE' });

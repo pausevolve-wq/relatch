@@ -31,9 +31,12 @@ test('concurrent generation reservations cannot exceed 5 daily sessions', async 
  assert.equal(rows.filter(x=>x.allowed).length, 5);
  assert.equal(rows.filter(x=>!x.allowed).length,35);
 });
-test('concurrent same batch permits only 25 attempts total across 5 sessions', async () => {
+test('an exhausted batch is denied without silently charging a second credit', async () => {
  const rows = await Promise.all(Array.from({length:60}, () => reserveGeneration(redis,'same','one')));
- assert.equal(rows.filter(x=>x.allowed).length,25);
+ assert.equal(rows.filter(x=>x.allowed).length,5);
+ const denied = rows.filter(x=>!x.allowed);
+ assert.equal(denied.length,55);
+ assert.ok(denied.every(x=>x.limitType==='session' && x.dailyCount===1 && x.weeklyCount===1));
 });
 test('existing Clerk daily and weekly usage seed the first atomic reservation', async () => {
  const p=periods();
@@ -119,11 +122,42 @@ test('concurrent OCR and generation calls in one batch charge exactly one credit
  const probe=await reserveOcr(redis,{userId:'mix',sessionId:'batch-y'});
  assert.equal(probe.dailyCount,2); // batch-x cost exactly one credit; batch-y is the second
 });
-test('per-endpoint session caps still bind inside a paid run', async () => {
+test('per-endpoint attempt caps deny inside a paid run without charging again', async () => {
  for(let i=0;i<5;i++)assert.equal((await reserveGeneration(redis,'caps','run-1')).allowed,true);
  const sixth=await reserveGeneration(redis,'caps','run-1');
- assert.equal(sixth.allowed,true);assert.equal(sixth.dailyCount,2);
+ assert.equal(sixth.allowed,false);assert.equal(sixth.limitType,'session');assert.equal(sixth.dailyCount,1);
  for(let i=0;i<5;i++)assert.equal((await reserveOcr(redis,{userId:'caps',sessionId:'run-1'})).allowed,true);
  const ocrSixth=await reserveOcr(redis,{userId:'caps',sessionId:'run-1'});
- assert.equal(ocrSixth.dailyCount,3);
+ assert.equal(ocrSixth.allowed,false);assert.equal(ocrSixth.limitType,'session');assert.equal(ocrSixth.dailyCount,1);
+ // a genuinely new batch still charges the next credit
+ assert.equal((await reserveGeneration(redis,'caps','run-2')).dailyCount,2);
+});
+test('generation-first runs let later OCR calls of the batch ride the same credit', async () => {
+ assert.equal((await reserveGeneration(redis,'late-ocr','batch-1')).dailyCount,1);
+ for(let i=0;i<3;i++){
+  const ocr=await reserveOcr(redis,{userId:'late-ocr',sessionId:'batch-1'});
+  assert.equal(ocr.allowed,true);assert.equal(ocr.dailyCount,1);
+ }
+});
+test('an expired run claim charges a fresh credit instead of riding the old window', async () => {
+ const ttl=2;
+ assert.equal((await reserveOcr(redis,{userId:'expiry',sessionId:'s'}, {}, new Date(), ttl)).dailyCount,1);
+ await new Promise(r=>setTimeout(r,2300));
+ const after=await reserveOcr(redis,{userId:'expiry',sessionId:'s'}, {}, new Date(), ttl);
+ assert.equal(after.allowed,true);assert.equal(after.dailyCount,2);
+});
+test('a cross-endpoint counter created late in the window dies with the claim', async () => {
+ const ttl=2;
+ assert.equal((await reserveGeneration(redis,'aligned','s',{},new Date(),ttl)).allowed,true);
+ await new Promise(r=>setTimeout(r,1800)); // late in the window
+ assert.equal((await reserveOcr(redis,{userId:'aligned',sessionId:'s'},{},new Date(),ttl)).allowed,true);
+ await new Promise(r=>setTimeout(r,500)); // claim now expired
+ const next=await reserveOcr(redis,{userId:'aligned',sessionId:'s'},{},new Date(),ttl);
+ assert.equal(next.dailyCount,2); // charged fresh - the late counter did not outlive the claim
+});
+test('a timed-out reservation denies but never corrupts the retry', async () => {
+ const hanging={eval:()=>new Promise(()=>{})};
+ await assert.rejects(reserveOcr(hanging,{userId:'timeout-retry',sessionId:'s'}),/timeout/);
+ const retry=await reserveOcr(redis,{userId:'timeout-retry',sessionId:'s'});
+ assert.equal(retry.allowed,true);assert.equal(retry.dailyCount,1);
 });

@@ -250,9 +250,14 @@ module.exports = async function handler(req, res) {
       const quota = await reserveGeneration(redis, userId, sessionId, user.privateMetadata?.relatchUsage);
       if (!quota.allowed) {
         await logToAxiom({ endpoint: 'enrich', status: 429, reason: 'quota_reached', userId });
+        // limitType 'session' means this batch's attempt budget is spent - NO new
+        // credit was consumed; the user starts a fresh upload instead of being
+        // silently charged twice for one batch.
         return res.status(429).json({ error: 'QUOTA_REACHED', limitType: quota.limitType,
-          limitValue: quota.limitType === 'daily' ? 5 : 35, weeklyCount: quota.weeklyCount, weeklyLimit: 35,
-          message: 'Generation attempt limit reached. Please try again after the quota resets.' });
+          limitValue: quota.limitType === 'weekly' ? 35 : 5, weeklyCount: quota.weeklyCount, weeklyLimit: 35,
+          message: quota.limitType === 'session'
+            ? 'This upload batch has reached its attempt limit. Start a new upload to continue.'
+            : 'Generation attempt limit reached. Please try again after the quota resets.' });
       }
     } catch {
       await logToAxiom({ endpoint: 'enrich', status: 503, reason: 'quota_unavailable', userId });

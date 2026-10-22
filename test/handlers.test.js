@@ -70,10 +70,43 @@ test('OCR authorized request reserves before provider and preserves extracted re
 });
 test('anonymous OCR is bounded too, without accepting a forged identity',async()=>{
  let identity;
- const {handler,calls}=loadHandler('ocr.js',{redis:{get:async()=>1},quota:{reserveOcr:async(_,value)=>{identity=value;return{allowed:false}}}});
+ const {handler,calls}=loadHandler('ocr.js',{redis:{get:async()=>1,set:async()=>'OK'},quota:{reserveOcr:async(_,value)=>{identity=value;return{allowed:false}}}});
+ const res={statusCode:200,setHeader(){},status(n){this.statusCode=n;return this},json(body){this.body=body;return this}};
+ await handler({method:'POST',headers:{'x-anon-token':'fixture'},body:{...ocr,sessionId:'batch-1'}},res);
+ assert.equal(res.statusCode,429);assert.equal(identity.anonToken,'fixture');assert.equal(identity.userId,null);assert.equal(calls.length,0);
+});
+test('anonymous OCR without a batch sessionId is rejected before any quota or provider work',async()=>{
+ let reached=false;
+ const {handler,calls}=loadHandler('ocr.js',{redis:{get:async()=>1,set:async()=>'OK'},quota:{reserveOcr:async()=>{reached=true;return{allowed:true}}}});
  const res={statusCode:200,setHeader(){},status(n){this.statusCode=n;return this},json(body){this.body=body;return this}};
  await handler({method:'POST',headers:{'x-anon-token':'fixture'},body:ocr},res);
- assert.equal(res.statusCode,429);assert.equal(identity.anonToken,'fixture');assert.equal(identity.userId,null);assert.equal(calls.length,0);
+ assert.equal(res.statusCode,401);assert.equal(reached,false);assert.equal(calls.length,0);
+});
+test('anonymous OCR bound to one batch sessionId rejects a second session',async()=>{
+ const store={'anon:fixture':1};
+ const redis={
+  get:async k=>store[k]??null,
+  set:async(k,v)=>{ if(k in store){} else {store[k]=v;return 'OK'} return null },
+ };
+ store['anon:fixture:session']='batch-1';
+ let reached=false;
+ const {handler,calls}=loadHandler('ocr.js',{redis,quota:{reserveOcr:async()=>{reached=true;return{allowed:true}}}});
+ const res={statusCode:200,setHeader(){},status(n){this.statusCode=n;return this},json(body){this.body=body;return this}};
+ // same session: claim matches, reaches quota
+ await handler({method:'POST',headers:{'x-anon-token':'fixture'},body:{...ocr,sessionId:'batch-1'}},res);
+ assert.equal(reached,true);
+ // different session: rejected as a genuinely new run
+ const res2={statusCode:200,setHeader(){},status(n){this.statusCode=n;return this},json(body){this.body=body;return this}};
+ await handler({method:'POST',headers:{'x-anon-token':'fixture'},body:{...ocr,sessionId:'batch-2'}},res2);
+ assert.equal(res2.statusCode,401);assert.equal(calls.length,0);
+});
+test('a batch that exhausted its attempt budget is denied without a second charge',async()=>{
+ for(const [file,body,quotaKey] of [['enrich.js',enrich,'reserveGeneration'],['ocr.js',{...ocr,sessionId:'one'},'reserveOcr']]){
+  const {handler,calls}=loadHandler(file,{quota:{[quotaKey]:async()=>({allowed:false,limitType:'session',dailyCount:1,weeklyCount:1})}});
+  const res=await invoke(handler,body);
+  assert.equal(res.statusCode,429);assert.equal(res.body.limitType,'session');
+  assert.match(res.body.message,/new upload/);assert.equal(calls.length,0);
+ }
 });
 test('signed-in OCR forwards the batch sessionId and migrated Clerk usage to the shared allowance',async()=>{
  let seen;
