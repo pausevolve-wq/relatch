@@ -259,7 +259,9 @@ module.exports = async function handler(req, res) {
             ? 'This upload batch has reached its attempt limit. Start a new upload to continue.'
             : quota.limitType === 'session_expired'
               ? 'This upload batch has already been used. Start a new upload to continue.'
-              : 'Generation attempt limit reached. Please try again after the quota resets.' });
+              : quota.limitType === 'session_unverifiable'
+                ? 'This upload batch could not be verified. Check that your device clock is set correctly, then start a new upload.'
+                : 'Generation attempt limit reached. Please try again after the quota resets.' });
       }
     } catch {
       await logToAxiom({ endpoint: 'enrich', status: 503, reason: 'quota_unavailable', userId });

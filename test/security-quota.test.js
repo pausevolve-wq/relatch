@@ -194,3 +194,12 @@ test('session ids outside the frontend format charge within the allowance (tombs
  const r = await reserveGeneration(redis, 'legacy-user', 'legacy-id-without-timestamp');
  assert.equal(r.allowed, true); assert.equal(r.dailyCount, 1);
 });
+test('a session id timestamped materially ahead of the server clock is denied unverifiable', async () => {
+ const future = `session_${Date.now() + 3600000}_abc123`;
+ const r = await reserveGeneration(redis, 'future-user', future);
+ assert.equal(r.allowed, false); assert.equal(r.limitType, 'session_unverifiable'); assert.equal(r.dailyCount, 0);
+ // ordinary client clock skew inside the 15-minute tolerance is still accepted
+ const skewed = `session_${Date.now() + 10 * 60000}_abc123`;
+ const ok = await reserveGeneration(redis, 'future-user', skewed);
+ assert.equal(ok.allowed, true); assert.equal(ok.dailyCount, 1);
+});
