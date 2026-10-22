@@ -107,11 +107,29 @@ test('weekly cap survives UTC day changes and resets next ISO week', async()=>{
  assert.equal((await reserveGeneration(redis,'week-boundary','extra',{},last)).allowed,false);
  assert.equal((await reserveGeneration(redis,'week-boundary','new-week',{},new Date('2026-10-26T12:00:00Z'))).allowed,true);
 });
-test('same client session is not shared across users or UTC days',async()=>{
- for(let i=0;i<5;i++)await reserveGeneration(redis,'day-boundary','same',{},new Date('2026-10-21T12:00:00Z'));
- const next=await reserveGeneration(redis,'day-boundary','same',{},new Date('2026-10-22T12:00:00Z'));
- assert.equal(next.dailyCount,1);assert.equal(next.allowed,true);
+test('a batch replayed on a later UTC day is denied; a new upload charges normally',async()=>{
+ // Redis TTLs are real time, so the day-1 charge uses a short claim TTL to simulate
+ // the day rollover; the tombstone (real 24h TTL) outlives it as in production.
+ const ttl=2, day1=new Date('2026-10-21T12:00:00Z'), day2=new Date('2026-10-22T12:00:00Z');
+ assert.equal((await reserveGeneration(redis,'day-boundary','same',{},day1,ttl)).allowed,true);
+ await new Promise(r=>setTimeout(r,2300));
+ const replay=await reserveGeneration(redis,'day-boundary','same',{},day2,ttl);
+ assert.equal(replay.allowed,false);assert.equal(replay.limitType,'session_expired');assert.equal(replay.dailyCount,0);
+ // a genuinely new upload on the new day charges its first credit
+ const fresh=await reserveGeneration(redis,'day-boundary','same-day2',{},day2,ttl);
+ assert.equal(fresh.allowed,true);assert.equal(fresh.dailyCount,1);
+ // tombstones and counters are isolated per user
  assert.equal((await reserveGeneration(redis,'different-user','same')).dailyCount,1);
+});
+test('a retry after an ambiguous provider timeout (credit consumed, response lost) never charges twice',async()=>{
+ // First attempt's reservation lands on real storage; the caller never learns the result.
+ assert.equal((await reserveGeneration(redis,'ambiguous','batch-1')).dailyCount,1);
+ // Retry of the SAME batch on the same endpoint rides the live claim.
+ const sameEndpoint=await reserveGeneration(redis,'ambiguous','batch-1');
+ assert.equal(sameEndpoint.allowed,true);assert.equal(sameEndpoint.dailyCount,1);
+ // Retry reaching the OTHER endpoint of the batch also rides the same credit.
+ const otherEndpoint=await reserveOcr(redis,{userId:'ambiguous',sessionId:'batch-1'});
+ assert.equal(otherEndpoint.allowed,true);assert.equal(otherEndpoint.dailyCount,1);
 });
 test('concurrent OCR and generation calls in one batch charge exactly one credit', async () => {
  const rows=await Promise.all([
@@ -139,21 +157,24 @@ test('generation-first runs let later OCR calls of the batch ride the same credi
   assert.equal(ocr.allowed,true);assert.equal(ocr.dailyCount,1);
  }
 });
-test('an expired run claim charges a fresh credit instead of riding the old window', async () => {
+test('an expired run claim denies the same batch without charging again', async () => {
  const ttl=2;
  assert.equal((await reserveOcr(redis,{userId:'expiry',sessionId:'s'}, {}, new Date(), ttl)).dailyCount,1);
  await new Promise(r=>setTimeout(r,2300));
  const after=await reserveOcr(redis,{userId:'expiry',sessionId:'s'}, {}, new Date(), ttl);
- assert.equal(after.allowed,true);assert.equal(after.dailyCount,2);
+ assert.equal(after.allowed,false);assert.equal(after.limitType,'session_expired');assert.equal(after.dailyCount,1);
+ // a genuinely new upload (new sessionId) still charges normally
+ assert.equal((await reserveOcr(redis,{userId:'expiry',sessionId:'s2'}, {}, new Date(), ttl)).dailyCount,2);
 });
 test('a cross-endpoint counter created late in the window dies with the claim', async () => {
  const ttl=2;
  assert.equal((await reserveGeneration(redis,'aligned','s',{},new Date(),ttl)).allowed,true);
  await new Promise(r=>setTimeout(r,1800)); // late in the window
  assert.equal((await reserveOcr(redis,{userId:'aligned',sessionId:'s'},{},new Date(),ttl)).allowed,true);
- await new Promise(r=>setTimeout(r,500)); // claim now expired
+ await new Promise(r=>setTimeout(r,700)); // claim now expired
  const next=await reserveOcr(redis,{userId:'aligned',sessionId:'s'},{},new Date(),ttl);
- assert.equal(next.dailyCount,2); // charged fresh - the late counter did not outlive the claim
+ // denied via the tombstone, NOT charged - the late counter did not outlive the claim
+ assert.equal(next.allowed,false);assert.equal(next.limitType,'session_expired');assert.equal(next.dailyCount,1);
 });
 test('a timed-out reservation denies but never corrupts the retry', async () => {
  const hanging={eval:()=>new Promise(()=>{})};

@@ -154,13 +154,15 @@ module.exports = async function handler(req, res) {
     const quota = await reserveOcr(redis,
       { userId, anonToken: isAnonymousRequest ? anonToken : null, sessionId }, stored);
     if (!quota.allowed) {
-      // limitType 'session' means this batch's attempt budget is spent - NO new credit
+      // limitType 'session'/'session_expired' means this batch is spent or already used - NO new credit
       // was consumed; the user starts a fresh upload instead of being silently charged.
       return res.status(429).json({ error: 'OCR_QUOTA_REACHED', limitType: quota.limitType,
         limitValue: quota.limitType === 'weekly' ? 35 : 5, weeklyCount: quota.weeklyCount, weeklyLimit: 35,
         message: quota.limitType === 'session'
           ? "This upload batch has reached its attempt limit. Start a new upload to continue."
-          : 'OCR attempt limit reached. Please try again after the quota resets.' });
+          : quota.limitType === 'session_expired'
+            ? "This upload batch has already been used. Start a new upload to continue."
+            : 'OCR attempt limit reached. Please try again after the quota resets.' });
     }
   } catch {
     return res.status(503).json({ error: 'OCR_QUOTA_UNAVAILABLE' });
