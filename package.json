@@ -6,5 +6,8 @@
     "@clerk/backend": "^1",
     "@axiomhq/js": "^1",
     "@upstash/redis": "^1"
+  },
+  "scripts": {
+    "test:security": "node --test test/*.test.js"
   }
 }
