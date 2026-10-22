@@ -7,7 +7,7 @@ function loadHandler(file, { quota = {}, auth = 'valid', redis = {}, env = {}, f
   const calls=[];
   const client={users:{getUser:async()=>({privateMetadata:{}})}};
   const mocks={
-    '../lib/security-quota': { reserveGeneration:async()=>({allowed:true}),reserveOcr:async()=>true,reserveDatalab:async()=>false,...quota },
+    '../lib/security-quota': { reserveGeneration:async()=>({allowed:true}),reserveOcr:async()=>({allowed:true}),reserveDatalab:async()=>false,...quota },
     '@clerk/backend':{verifyToken:async()=>{if(auth==='invalid')throw Error('bad');return{sub:'owner'}},createClerkClient:()=>client},
     '@upstash/redis':{Redis:function(){return redis}},
     '@axiomhq/js':{Axiom:function(){return{ingest(){},flush:async()=>{}}}},
@@ -50,7 +50,7 @@ test('invalid generation input never consumes a reservation',async()=>{
  assert.equal((await invoke(handler,{...enrich,rawText:'tiny'})).statusCode,422);assert.equal(reservations,0);
 });
 test('OCR denied quota never calls any provider',async()=>{
- const {handler,calls}=loadHandler('ocr.js',{quota:{reserveOcr:async()=>false}});
+ const {handler,calls}=loadHandler('ocr.js',{quota:{reserveOcr:async()=>({allowed:false,limitType:'daily',weeklyCount:9})}});
  assert.equal((await invoke(handler,ocr)).statusCode,429);assert.equal(calls.length,0);
 });
 test('OCR storage exception fails closed',async()=>{
@@ -59,19 +59,25 @@ test('OCR storage exception fails closed',async()=>{
 });
 test('OCR malformed input never reaches quota/provider',async()=>{
  let reservations=0;
- const {handler,calls}=loadHandler('ocr.js',{quota:{reserveOcr:async()=>{reservations++;return true}}});
+ const {handler,calls}=loadHandler('ocr.js',{quota:{reserveOcr:async()=>{reservations++;return{allowed:true}}}});
  assert.equal((await invoke(handler,{base64:123,fileName:'x'})).statusCode,400);assert.equal(reservations,0);assert.equal(calls.length,0);
 });
 
 test('OCR authorized request reserves before provider and preserves extracted result',async()=>{
  const order=[];
- const {handler,calls}=loadHandler('ocr.js',{env:{MISTRALOCR_API_KEY:'fixture'},quota:{reserveOcr:async()=>{order.push('reserve');return true}},fetch:async()=>{order.push('provider');return{ok:true,json:async()=>({pages:[{markdown:'Source text with enough words to be a useful OCR result. '.repeat(3)}]})}}});
+ const {handler,calls}=loadHandler('ocr.js',{env:{MISTRALOCR_API_KEY:'fixture'},quota:{reserveOcr:async()=>{order.push('reserve');return{allowed:true}}},fetch:async()=>{order.push('provider');return{ok:true,json:async()=>({pages:[{markdown:'Source text with enough words to be a useful OCR result. '.repeat(3)}]})}}});
  const result=await invoke(handler,ocr);assert.equal(result.statusCode,200);assert.equal(result.body.source,'mistral');assert.equal(calls.length,1);assert.deepEqual(order,['reserve','provider']);
 });
 test('anonymous OCR is bounded too, without accepting a forged identity',async()=>{
  let identity;
- const {handler,calls}=loadHandler('ocr.js',{redis:{get:async()=>1},quota:{reserveOcr:async(_,value)=>{identity=value;return false}}});
+ const {handler,calls}=loadHandler('ocr.js',{redis:{get:async()=>1},quota:{reserveOcr:async(_,value)=>{identity=value;return{allowed:false}}}});
  const res={statusCode:200,setHeader(){},status(n){this.statusCode=n;return this},json(body){this.body=body;return this}};
  await handler({method:'POST',headers:{'x-anon-token':'fixture'},body:ocr},res);
  assert.equal(res.statusCode,429);assert.equal(identity.anonToken,'fixture');assert.equal(identity.userId,null);assert.equal(calls.length,0);
+});
+test('signed-in OCR forwards the batch sessionId and migrated Clerk usage to the shared allowance',async()=>{
+ let seen;
+ const {handler}=loadHandler('ocr.js',{quota:{reserveOcr:async(_r,value,stored)=>{seen={value,stored};return{allowed:false,limitType:'daily',weeklyCount:0}}}});
+ const res=await invoke(handler,{...ocr,sessionId:'batch-9'});
+ assert.equal(res.statusCode,429);assert.equal(seen.value.sessionId,'batch-9');assert.equal(seen.value.anonToken,null);assert.deepEqual(seen.stored,undefined);
 });

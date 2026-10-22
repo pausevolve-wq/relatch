@@ -9,15 +9,15 @@ Not deployed. No production data or provider API calls used in tests.
 - Atomic Redis Lua reservations before generation, instead of Clerk read/write counters.
 - Existing Clerk period usage seeds the first reservation to avoid resetting used quota.
 - UTC daily/ISO-week periods; 5 daily / 35 weekly sessions, up to 5 attempts per 10-minute batch.
-- OCR independently limited: 5 calls per anonymous token, 25 per signed-in user per UTC day.
+- OCR shares the signed-in generation allowance: a batch's OCR calls and generation calls together cost one of the 5 daily / 35 weekly credits (approved owner policy, 2026-10-22). Anonymous-trial OCR stays bounded at 5 calls per token.
 - Datalab limited to 3 reserved attempts per signed-in user per UTC day, before job submission.
 - Quota storage missing/failure/timeout denies provider work; Datalab-only quota failure skips that tier.
 - Removed generated description debug text from backend console logging.
 
 ## Behavior changes requiring review
-Failed/in-flight generation and Datalab attempts remain counted. This is intentionally conservative: a timed-out job can still incur provider cost. No automatic refunds are implemented. Requests rejected as insufficient generation input do not reserve quota. Existing output/response format is preserved apart from quota failures.
+Failed/in-flight generation and Datalab attempts remain counted. This is intentionally conservative: a timed-out job can still incur provider cost. No automatic refunds are implemented. Requests rejected as insufficient generation input do not reserve quota. The shared run claim lives for the same 10-minute window as the previous session design: a batch whose generation call lands more than 10 minutes after its first OCR call is charged a second credit rather than riding an expired claim. Existing output/response format is preserved apart from quota failures.
 
-Signed-in provider work now depends on Redis as well as Clerk. A Redis outage therefore pauses signed-in generation/OCR instead of allowing potentially unbounded provider work. Existing frontend fallback behavior has not been redesigned. The 25/day OCR limit is a new policy choice derived from the existing 5 sessions x 5 requests allowance; review before deployment.
+Signed-in provider work now depends on Redis as well as Clerk. A Redis outage therefore pauses signed-in generation/OCR instead of allowing potentially unbounded provider work. Existing frontend fallback behavior has not been redesigned. OCR is no longer an independent 25/day budget. Per the owner's approved policy (2026-10-22), signed-in OCR is included in the same 5/day + 35/week generation allowance: the first call of an upload batch (OCR or generation) reserves one credit via a shared run claim keyed on the batch sessionId, and later calls in that batch are not charged again, so a scanned document never costs two credits. Scripted OCR without generation is bounded by that same shared allowance, and OCR-only runs now also count toward the 35/week cap, which the old independent daily cap did not.
 
 Redis is authoritative after reservation. Clerk private metadata is no longer updated by generation. Any dashboard reading Clerk usage directly must be changed to read the authoritative counters before rollout. The current frontend located in this review reads quota response fields, not a usage endpoint.
 

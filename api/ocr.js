@@ -93,9 +93,10 @@ module.exports = async function handler(req, res) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  const { base64, mimeType, fileName } = req.body || {};
+  const { base64, mimeType, fileName, sessionId } = req.body || {};
   if (typeof base64 !== 'string' || typeof fileName !== 'string' || fileName.length > 255 ||
-      (mimeType !== undefined && typeof mimeType !== 'string')) {
+      (mimeType !== undefined && typeof mimeType !== 'string') ||
+      (sessionId !== undefined && (typeof sessionId !== 'string' || sessionId.length > 128))) {
     return res.status(400).json({ error: 'Invalid OCR fields' });
   }
 
@@ -119,9 +120,22 @@ module.exports = async function handler(req, res) {
     return res.status(413).json({ error: 'File too large for OCR. Maximum size is ~3MB.' });
   }
 
+  // Signed-in OCR draws from the SAME 5/day + 35/week generation allowance as
+  // /api/enrich (approved product policy, 2026-10-22): both endpoints share one run
+  // claim keyed on the upload batch's sessionId, so a batch whose files need OCR costs
+  // one credit total - never one credit per file or per OCR call - and scripted OCR
+  // without generation is bounded by that shared allowance instead of a separate
+  // OCR-only budget. Clerk usage seeding mirrors enrich.js so the first reservation of
+  // a period honors migrated usage no matter which endpoint of the batch runs first.
   try {
-    if (!await reserveOcr(redis, { userId, anonToken: isAnonymousRequest ? anonToken : null })) {
-      return res.status(429).json({ error: 'OCR_QUOTA_REACHED' });
+    const stored = !isAnonymousRequest
+      ? (await clerkClient.users.getUser(userId)).privateMetadata?.relatchUsage
+      : undefined;
+    const quota = await reserveOcr(redis,
+      { userId, anonToken: isAnonymousRequest ? anonToken : null, sessionId }, stored);
+    if (!quota.allowed) {
+      return res.status(429).json({ error: 'OCR_QUOTA_REACHED', limitType: quota.limitType,
+        limitValue: quota.limitType === 'daily' ? 5 : 35, weeklyCount: quota.weeklyCount, weeklyLimit: 35 });
     }
   } catch {
     return res.status(503).json({ error: 'OCR_QUOTA_UNAVAILABLE' });
