@@ -1,5 +1,5 @@
 const { verifyToken, createClerkClient } = require('@clerk/backend');
-const { reserveRun, reserveDatalab, reserveAnonOcr, quotaReachedBody } = require('../lib/usage-limits');
+const { reserveRun, reserveDatalab, reserveAnonOcr, reserveAnonLlamaParse, quotaReachedBody } = require('../lib/usage-limits');
 const clerkClient = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
 const { Redis } = require('@upstash/redis');
 const redis = (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN)
@@ -44,7 +44,48 @@ async function fetchWithTimeout(url, options, timeoutMs) {
   }
 }
 
+// 2026-10-23: LlamaParse v2 (tier cost_effective) is the first OCR tier. Chosen on a scored
+// benchmark (2-page scanned PDF with tables, a flowchart, a bar chart and handwriting, clean and
+// phone-photo-degraded): every table row intact and every value right on both, where OCR.space
+// (removed below) lost all table structure and, on the degraded scan, silently dropped decimal
+// points (412.50 -> 41250, 13.7% -> 137%). API: upload+parse in one multipart call, then poll.
+// Tables are requested as markdown pipe tables: HTML tables broke enrich.js's line-based signal
+// filter and char-cap slice (see the Mistral table_format note below), and llamaParseMarkdown()
+// converts any <table> that still comes back.
+const LLAMAPARSE_BASE = 'https://api.cloud.llamaindex.ai/api/v2/parse';
+
+// Fallback for HTML tables in LlamaParse output (output_tables_as_markdown can still return HTML
+// for merged-cell tables): one pipe row per <tr>, header separator after the first row.
+function htmlTablesToMarkdown(text) {
+  const cellText = c => c.replace(/<br\s*\/?>/gi, ' ').replace(/<[^>]+>/g, '').replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ').replace(/\|/g, '/').replace(/\s+/g, ' ').trim();
+  return text.replace(/<table[\s\S]*?<\/table>/gi, table => {
+    const rows = [...table.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)]
+      .map(r => [...r[1].matchAll(/<t[hd][^>]*>([\s\S]*?)<\/t[hd]>/gi)].map(c => cellText(c[1])))
+      .filter(r => r.length);
+    if (!rows.length) return cellText(table);
+    const lines = rows.map(r => `| ${r.join(' | ')} |`);
+    lines.splice(1, 0, `|${rows[0].map(() => ' --- ').join('|')}|`);
+    return `\n${lines.join('\n')}\n`;
+  });
+}
+
+// markdown_full arrives as a string; accept the object shapes the API has used for markdown too,
+// so a response-shape change degrades to "no text" (next tier) instead of a crash.
+function llamaParseMarkdown(body) {
+  const m = body?.markdown_full ?? body?.markdown;
+  const raw = typeof m === 'string' ? m
+    : typeof m?.markdown === 'string' ? m.markdown
+    : Array.isArray(m?.pages) ? m.pages.map(p => p.markdown || '').join('\n\n')
+    : '';
+  return htmlTablesToMarkdown(raw).trim();
+}
+
 module.exports = async function handler(req, res) {
+  // OCR tiers run one after another inside Vercel's 60s function ceiling; each tier's timeout is
+  // clipped to what is left of this deadline so a slow tier can't push the chain past 60s.
+  const handlerDeadlineMs = Date.now() + 55000;
+  const remainingMs = () => handlerDeadlineMs - Date.now();
   res.setHeader('Access-Control-Allow-Origin', 'https://app.relatch.online');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Anon-Token');
@@ -147,13 +188,80 @@ module.exports = async function handler(req, res) {
   }
 
   const fileMime = mimeType || 'application/pdf';
+  const llamaKey = process.env.LLAMAINDEX_OCR_API_KEY;
   const mistralKey = process.env.MISTRALOCR_API_KEY;
   const datalabKey = process.env.DATALAB_API_KEY;
-  const ocrSpaceKey = process.env.OCRCLD_API_KEY;
 
   const dataUri = base64.startsWith('data:') ? base64 : `data:${fileMime};base64,${base64}`;
 
-  if (mistralKey) {
+  // Tier 1: LlamaParse (see the note at the top of this file). Anonymous calls also need the
+  // site-wide daily budget (reserveAnonLlamaParse) and parse at most 10 pages; signed-in 25,
+  // same as Datalab. 30s budget: a 2-page scan took 9-17s in the benchmark; a slower job is
+  // abandoned and the chain moves on. disable_cache: LlamaParse would otherwise reuse (and keep)
+  // a cached copy of an identical upload.
+  let llamaAllowed = Boolean(llamaKey);
+  if (llamaAllowed && isAnonymousRequest) {
+    try {
+      llamaAllowed = await reserveAnonLlamaParse(redis);
+      if (!llamaAllowed) await logToAxiom({ endpoint: 'ocr', status: 200, reason: 'llamaparse_anon_budget_skipped', fileName, ip: req.headers['x-forwarded-for'] || null });
+    } catch {
+      llamaAllowed = false; // budget unverifiable: skip the paid tier, same posture as Datalab
+    }
+  }
+  if (llamaAllowed) {
+    const llamaStartMs = Date.now();
+    const llamaDeadlineMs = Math.min(llamaStartMs + 30000, handlerDeadlineMs - 5000);
+    const llamaHeaders = { 'Authorization': `Bearer ${llamaKey}` };
+    try {
+      console.log(`[ocr] trying LlamaParse for: ${fileName}`);
+      const rawBase64 = dataUri.includes(',') ? dataUri.slice(dataUri.indexOf(',') + 1) : dataUri;
+      const form = new FormData();
+      form.append('file', new Blob([Buffer.from(rawBase64, 'base64')], { type: fileMime }), fileName);
+      form.append('configuration', JSON.stringify({
+        tier: 'cost_effective',
+        version: 'latest',
+        disable_cache: true,
+        page_ranges: { max_pages: isAnonymousRequest ? 10 : 25 },
+        output_options: { markdown: { tables: { output_tables_as_markdown: true, compact_markdown_tables: true } } },
+      }));
+      const submitResponse = await fetchWithTimeout(`${LLAMAPARSE_BASE}/upload`, { method: 'POST', headers: llamaHeaders, body: form },
+        Math.max(1000, Math.min(10000, llamaDeadlineMs - Date.now())));
+      const submitData = submitResponse.ok ? await submitResponse.json() : null;
+      const jobId = submitData?.id || submitData?.job?.id;
+      let status = null, body = null;
+      if (jobId) {
+        while (Date.now() < llamaDeadlineMs) {
+          const pollResponse = await fetchWithTimeout(`${LLAMAPARSE_BASE}/${encodeURIComponent(jobId)}?expand=markdown_full`,
+            { headers: llamaHeaders }, Math.max(1000, Math.min(5000, llamaDeadlineMs - Date.now())));
+          if (!pollResponse.ok) { status = `HTTP_${pollResponse.status}`; break; }
+          body = await pollResponse.json();
+          status = body?.job?.status || body?.status || null;
+          if (status === 'COMPLETED' || status === 'FAILED' || status === 'CANCELLED') break;
+          await new Promise(resolve => setTimeout(resolve, 1500));
+        }
+      }
+      const durationMs = Date.now() - llamaStartMs;
+      const text = status === 'COMPLETED' ? llamaParseMarkdown(body) : '';
+      if (text.length > 50) {
+        console.log(`[ocr] LlamaParse success: ${text.length} chars from ${fileName} in ${durationMs}ms`);
+        await logToAxiom({ endpoint: 'ocr', status: 200, reason: 'llamaparse_success', fileName, userId, chars: text.length, durationMs, ip: req.headers['x-forwarded-for'] || null });
+        return res.status(200).json({ text, source: 'llamaparse' });
+      }
+      const reason = !submitResponse.ok ? 'llamaparse_http_error' : !jobId ? 'llamaparse_no_job'
+        : status === 'COMPLETED' ? 'llamaparse_empty_text' : status === 'FAILED' || status === 'CANCELLED' ? 'llamaparse_failed'
+        : String(status).startsWith('HTTP_') ? 'llamaparse_poll_error' : 'llamaparse_timeout';
+      console.log(`[ocr] LlamaParse ${reason} (${status || submitResponse.status})`);
+      await logToAxiom({ endpoint: 'ocr', status: 200, reason, fileName, userId, httpStatus: submitResponse.ok ? null : submitResponse.status, jobStatus: status, durationMs, ip: req.headers['x-forwarded-for'] || null });
+    } catch (err) {
+      const timedOut = err.name === 'AbortError';
+      console.log(`[ocr] LlamaParse ${timedOut ? 'timed out' : 'threw'}: ${err.message || 'unknown'}`);
+      await logToAxiom({ endpoint: 'ocr', status: 200, reason: timedOut ? 'llamaparse_timeout' : 'llamaparse_threw', fileName, userId, durationMs: Date.now() - llamaStartMs, ip: req.headers['x-forwarded-for'] || null });
+    }
+  }
+
+  // Tier 2: Mistral. 2026-10-23: it returned HTTP 429 on every production call seen this month
+  // (provider quota/billing, not code) - kept as a fallback in case that clears.
+  if (mistralKey && remainingMs() > 3000) {
     // Mistral only being down is exactly the condition that sends traffic to Datalab below,
     // so a hang here (not just a fast error) would eat the time budget the fallback tiers need.
     // 30s (not a shorter number): Mistral's OCR endpoint is synchronous with no documented
@@ -191,7 +299,9 @@ module.exports = async function handler(req, res) {
           // to keep — bounding boxes live in a separate response field, never touching the
           // markdown text that gets filtered/sliced.
         })
-      }, 30000);
+        // 2026-10-23: still up to 30s, but clipped so a signed-in request keeps ~19s for Datalab
+        // after it (LlamaParse now runs first and may have used part of the 60s).
+      }, Math.max(3000, Math.min(30000, remainingMs() - (datalabKey && !isAnonymousRequest ? 19000 : 1000))));
 
       if (mistralResponse.ok) {
         const data = await mistralResponse.json();
@@ -226,9 +336,13 @@ module.exports = async function handler(req, res) {
   // Anonymous requests skip the paid Datalab tier entirely — it's gated by a per-Clerk-user
   // daily quota, and there's no userId to track for an anonymous request. Anonymous OCR
   // still gets Mistral (above) and OCR.space (below), neither of which are user-quota-gated.
+  // (2026-10-23: OCR.space is removed; anonymous OCR gets LlamaParse and Mistral above.)
   if (isAnonymousRequest) datalabAllowed = false;
+  // 2026-10-23: Datalab needs ~19s (5s submit + 12s poll + logging); with less left before the
+  // 55s deadline it is skipped rather than started and cut off mid-job (a submitted job can bill).
+  if (remainingMs() < 19000) datalabAllowed = false;
 
-  if (datalabKey && !isAnonymousRequest) {
+  if (datalabKey && datalabAllowed) {
     try {
       // Counts the attempt now, before the paid submit (2026-10-23, atomic Redis counter).
       if (!(await reserveDatalab(redis, userId))) {
@@ -337,54 +451,9 @@ module.exports = async function handler(req, res) {
     }
   }
 
-  if (ocrSpaceKey) {
-    try {
-      console.log(`[ocr] trying OCR.space fallback for: ${fileName}`);
-
-      const formData = new URLSearchParams();
-      formData.append('base64Image', dataUri);
-      formData.append('language', 'eng');
-      formData.append('isOverlayRequired', 'false');
-      formData.append('detectOrientation', 'true');
-      formData.append('scale', 'true');
-      formData.append('OCREngine', '2'); 
-      formData.append('isCreateSearchablePdf', 'true');
-      formData.append('isSearchablePdfHideTextLayer', 'true'); 
-
-      // 8s: last tier in the chain, so cutting it short just reaches the graceful 422 below
-      // sooner (unlike Mistral/Datalab, nothing after it can be starved) — sized to fit the
-      // ~9s typically left under Vercel's 60s ceiling after Mistral + Datalab's worst case.
-      const response = await fetchWithTimeout('https://api.ocr.space/parse/image', {
-        method: 'POST',
-        headers: {
-          'apikey': ocrSpaceKey,
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body: formData.toString()
-      }, 8000);
-
-      if (response.ok) {
-        const data = await response.json();
-        if (!data.IsErroredOnProcessing) {
-          const text = data.ParsedResults?.map(r => r.ParsedText || '').join('\n').trim() || '';
-          const searchablePdfUrl = data.SearchablePDFURL || null;
-          
-          if (text.length > 50) {
-            console.log(`[ocr] OCR.space success: ${text.length} chars from ${fileName}`);
-            return res.status(200).json({ 
-              text, 
-              source: 'ocr.space',
-              searchablePdfUrl
-            });
-          }
-        }
-      } else {
-        console.log(`[ocr] OCR.space HTTP ${response.status}`);
-      }
-    } catch (err) {
-      console.log(`[ocr] OCR.space threw: ${err.message || 'unknown'}`);
-    }
-  }
+  // 2026-10-23: the OCR.space tier (last free fallback, OCREngine 2, 8s timeout) was removed at
+  // Manas's request after the LlamaParse benchmark: on a phone-photo scan it dropped decimal points
+  // (412.50 -> 41250) and row labels, and it never kept table structure. OCRCLD_API_KEY is unused.
 
   console.log(`[ocr] all OCR methods failed for: ${fileName}`);
   await logToAxiom({ endpoint: 'ocr', status: 422, reason: 'ocr_failed', fileName, ip: req.headers['x-forwarded-for'] || null });
