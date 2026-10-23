@@ -1,5 +1,6 @@
 const { verifyToken, createClerkClient } = require('@clerk/backend');
-const { reserveRun, reserveDatalab, reserveAnonOcr, reserveAnonLlamaParse, quotaReachedBody } = require('../lib/usage-limits');
+const { reserveRun, reserveDatalab, reserveAnonOcr, reserveAnonLlamaParse, reserveAnonDatalab, quotaReachedBody } = require('../lib/usage-limits');
+const { httpFailureKind, estimatePages, assessText, isProviderDown, recordProviderResult } = require('../lib/ocr-routing');
 const clerkClient = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
 const { Redis } = require('@upstash/redis');
 const redis = (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN)
@@ -80,6 +81,118 @@ function llamaParseMarkdown(body) {
     : '';
   return htmlTablesToMarkdown(raw).trim();
 }
+
+// 2026-10-24: each provider is one function that never throws and returns
+// { text, kind, reason, durationMs, ... } - kind 'ok' with text, or the failure kind the circuit
+// breaker needs (lib/ocr-routing.js): 'auth' (our key/billing), 'outage' (provider struggling,
+// incl. timeouts) or 'document' (this file was the problem; never counts against the provider).
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+// LlamaParse (see the note at the top of this file). disable_cache: LlamaParse would otherwise
+// reuse (and keep) a cached copy of an identical upload. A 2-page scan took 9-17s in the benchmark.
+async function runLlamaParse({ key, fileBuffer, fileMime, fileName, maxPages, deadlineMs }) {
+  const startMs = Date.now();
+  const done = (kind, reason, extra = {}) => ({ text: '', kind, reason, durationMs: Date.now() - startMs, ...extra });
+  const headers = { 'Authorization': `Bearer ${key}` };
+  try {
+    const form = new FormData();
+    form.append('file', new Blob([fileBuffer], { type: fileMime }), fileName);
+    form.append('configuration', JSON.stringify({
+      tier: 'cost_effective',
+      version: 'latest',
+      disable_cache: true,
+      page_ranges: { max_pages: maxPages },
+      output_options: { markdown: { tables: { output_tables_as_markdown: true, compact_markdown_tables: true } } },
+    }));
+    const submitResponse = await fetchWithTimeout(`${LLAMAPARSE_BASE}/upload`, { method: 'POST', headers, body: form },
+      Math.max(1000, Math.min(10000, deadlineMs - Date.now())));
+    if (!submitResponse.ok) return done(httpFailureKind(submitResponse.status), 'llamaparse_http_error', { httpStatus: submitResponse.status });
+    const submitData = await submitResponse.json();
+    const jobId = submitData?.id || submitData?.job?.id;
+    if (!jobId) return done('outage', 'llamaparse_no_job');
+    let status = null, body = null;
+    while (Date.now() < deadlineMs) {
+      const pollResponse = await fetchWithTimeout(`${LLAMAPARSE_BASE}/${encodeURIComponent(jobId)}?expand=markdown_full`,
+        { headers }, Math.max(1000, Math.min(5000, deadlineMs - Date.now())));
+      if (!pollResponse.ok) {
+        const kind = httpFailureKind(pollResponse.status) === 'auth' ? 'auth' : 'outage';
+        return done(kind, 'llamaparse_poll_error', { httpStatus: pollResponse.status });
+      }
+      body = await pollResponse.json();
+      status = body?.job?.status || body?.status || null;
+      if (status === 'COMPLETED') break;
+      if (status === 'FAILED' || status === 'CANCELLED') return done('document', 'llamaparse_failed', { jobStatus: status });
+      await sleep(1500);
+    }
+    if (status !== 'COMPLETED') return done('outage', 'llamaparse_timeout', { jobStatus: status });
+    const text = llamaParseMarkdown(body);
+    if (text.length <= 50) return done('document', 'llamaparse_empty_text', { jobStatus: status });
+    return { ...done('ok', 'llamaparse_success', { jobStatus: status }), text };
+  } catch (err) {
+    return done('outage', err.name === 'AbortError' ? 'llamaparse_timeout' : 'llamaparse_threw', { error: err.message || 'unknown' });
+  }
+}
+
+// Datalab (paid, $4/1000 pages). Billed per page once a job reaches 'complete', whether or not
+// the text clears our length gate - which is why its credit is reserved before the submit.
+async function runDatalab({ key, fileBuffer, fileMime, fileName, maxPages, deadlineMs }) {
+  const startMs = Date.now();
+  const done = (kind, reason, extra = {}) => ({ text: '', kind, reason, durationMs: Date.now() - startMs, ...extra });
+  try {
+    const form = new FormData();
+    form.append('file', new Blob([fileBuffer], { type: fileMime }), fileName);
+    form.append('output_format', 'markdown');
+    form.append('mode', 'balanced'); // same $4/1000-page rate as 'fast', better quality — no reason to use 'fast'
+    // 25 (not 40): sized to finish well inside the poll window at Datalab's own stated worst case
+    // of ~3 pages/sec (25/3≈8.3s + margin). Anonymous calls are capped at 10 like LlamaParse.
+    form.append('max_pages', String(maxPages));
+
+    // submit only enqueues the job and returns a request_id — should be near-instant per Datalab's
+    // own docs, not the actual OCR processing time
+    const submitResponse = await fetchWithTimeout('https://www.datalab.to/api/v1/convert', {
+      method: 'POST',
+      headers: { 'X-Api-Key': key },
+      body: form,
+    }, Math.max(1000, Math.min(5000, deadlineMs - Date.now())));
+    if (!submitResponse.ok) return done(httpFailureKind(submitResponse.status), 'datalab_http_error', { httpStatus: submitResponse.status });
+    const checkUrl = (await submitResponse.json())?.request_check_url;
+    if (!checkUrl) return done('outage', 'datalab_no_job');
+
+    // Checks immediately first (no wasted delay for jobs that finish fast), then backs off 2s.
+    // Each poll has its own timeout too: the loop can't re-check the clock while a call hangs.
+    let firstCheck = true;
+    while (Date.now() < deadlineMs) {
+      if (!firstCheck) await sleep(2000);
+      firstCheck = false;
+      const pollResponse = await fetchWithTimeout(checkUrl, { headers: { 'X-Api-Key': key } }, Math.max(1000, Math.min(5000, deadlineMs - Date.now())));
+      if (!pollResponse.ok) {
+        const kind = httpFailureKind(pollResponse.status) === 'auth' ? 'auth' : 'outage';
+        return done(kind, 'datalab_poll_error', { httpStatus: pollResponse.status });
+      }
+      const result = await pollResponse.json();
+      if (result.status === 'failed') return done('document', 'datalab_failed');
+      if (result.status !== 'complete') continue;
+      const billed = { pageCount: result.page_count ?? null, cost: result.cost_breakdown ?? null };
+      if (!result.success) return done('document', 'datalab_processing_failed', billed);
+      const text = (result.markdown || '').trim();
+      if (text.length <= 50) return done('document', 'datalab_empty_text', billed);
+      return { ...done('ok', 'datalab_success', billed), text };
+    }
+    return done('outage', 'datalab_timeout');
+  } catch (err) {
+    return done('outage', err.name === 'AbortError' ? 'datalab_timeout' : 'datalab_threw', { error: err.message || 'unknown' });
+  }
+}
+
+// Order, time budget and minimum time to start, per provider. LlamaParse leads: it won the
+// 2026-10-23 benchmark on table structure and degraded scans. maxMs bounds one attempt; minMs is
+// the least time left at which a job is still worth starting (a started paid job can bill).
+const OCR_PROVIDERS = [
+  { name: 'llamaparse', run: runLlamaParse, keyEnv: 'LLAMAINDEX_OCR_API_KEY', maxMs: 30000, minMs: 10000 },
+  { name: 'datalab', run: runDatalab, keyEnv: 'DATALAB_API_KEY', maxMs: 35000, minMs: 15000 },
+];
+// Within this margin LlamaParse's result is kept over Datalab's (better table structure).
+const LLAMAPARSE_TIE_MARGIN = 1.15;
 
 module.exports = async function handler(req, res) {
   // OCR tiers run one after another inside Vercel's 60s function ceiling; each tier's timeout is
@@ -188,275 +301,93 @@ module.exports = async function handler(req, res) {
   }
 
   const fileMime = mimeType || 'application/pdf';
-  const llamaKey = process.env.LLAMAINDEX_OCR_API_KEY;
-  const mistralKey = process.env.MISTRALOCR_API_KEY;
-  const datalabKey = process.env.DATALAB_API_KEY;
+  const ip = req.headers['x-forwarded-for'] || null;
+  const rawBase64 = base64.startsWith('data:') ? base64.slice(base64.indexOf(',') + 1) : base64;
+  const fileBuffer = Buffer.from(rawBase64, 'base64');
+  const maxPages = isAnonymousRequest ? 10 : 25;
+  // Pages a provider will actually read, for judging text volume per page.
+  const pages = Math.min(maxPages, estimatePages(fileBuffer, fileMime));
 
-  const dataUri = base64.startsWith('data:') ? base64 : `data:${fileMime};base64,${base64}`;
+  // 2026-10-24: routing on evidence instead of a blind chain (see lib/ocr-routing.js):
+  // 1. A provider whose circuit breaker is open (key/billing rejected, or 3 outage failures in a
+  //    row) goes LAST instead of first, and is tried only if nothing usable came back yet - the
+  //    breaker may be stale, and a request with no other option loses nothing by probing it.
+  // 2. A result that is thin or mostly junk for its page count gets a second opinion from the
+  //    next provider (time and budget permitting); the better-scoring text is served.
+  // 3. Failures caused by the document itself never count against a provider's health.
+  // 4. A provider only starts if enough of the 55s deadline is left for it to finish, and the
+  //    first one leaves room for the next.
+  // Jev (lib/planner.js) is deliberately not involved: before OCR a scan has no text to plan from,
+  // and Jev already sees the OCR text in /api/enrich, where it plans the skill.
+  const configured = OCR_PROVIDERS.filter(p => process.env[p.keyEnv]);
+  const down = Object.fromEntries(await Promise.all(configured.map(async p => [p.name, await isProviderDown(redis, p.name)])));
+  const order = [...configured.filter(p => !down[p.name]), ...configured.filter(p => down[p.name])];
 
-  // Tier 1: LlamaParse (see the note at the top of this file). Anonymous calls also need the
-  // site-wide daily budget (reserveAnonLlamaParse) and parse at most 10 pages; signed-in 25,
-  // same as Datalab. 30s budget: a 2-page scan took 9-17s in the benchmark; a slower job is
-  // abandoned and the chain moves on. disable_cache: LlamaParse would otherwise reuse (and keep)
-  // a cached copy of an identical upload.
-  let llamaAllowed = Boolean(llamaKey);
-  if (llamaAllowed && isAnonymousRequest) {
+  // Paid-budget gate, taken right before each call because it counts the attempt. Signed-in
+  // LlamaParse use is already bounded by the run credit above; Datalab keeps its 3/day per user.
+  // Anonymous calls draw on site-wide daily budgets. A usage-store error skips the provider
+  // (fail closed - same posture as enrich.js's quota gate).
+  async function reserveProvider(name) {
     try {
-      llamaAllowed = await reserveAnonLlamaParse(redis);
-      if (!llamaAllowed) await logToAxiom({ endpoint: 'ocr', status: 200, reason: 'llamaparse_anon_budget_skipped', fileName, ip: req.headers['x-forwarded-for'] || null });
-    } catch {
-      llamaAllowed = false; // budget unverifiable: skip the paid tier, same posture as Datalab
-    }
-  }
-  if (llamaAllowed) {
-    const llamaStartMs = Date.now();
-    const llamaDeadlineMs = Math.min(llamaStartMs + 30000, handlerDeadlineMs - 5000);
-    const llamaHeaders = { 'Authorization': `Bearer ${llamaKey}` };
-    try {
-      console.log(`[ocr] trying LlamaParse for: ${fileName}`);
-      const rawBase64 = dataUri.includes(',') ? dataUri.slice(dataUri.indexOf(',') + 1) : dataUri;
-      const form = new FormData();
-      form.append('file', new Blob([Buffer.from(rawBase64, 'base64')], { type: fileMime }), fileName);
-      form.append('configuration', JSON.stringify({
-        tier: 'cost_effective',
-        version: 'latest',
-        disable_cache: true,
-        page_ranges: { max_pages: isAnonymousRequest ? 10 : 25 },
-        output_options: { markdown: { tables: { output_tables_as_markdown: true, compact_markdown_tables: true } } },
-      }));
-      const submitResponse = await fetchWithTimeout(`${LLAMAPARSE_BASE}/upload`, { method: 'POST', headers: llamaHeaders, body: form },
-        Math.max(1000, Math.min(10000, llamaDeadlineMs - Date.now())));
-      const submitData = submitResponse.ok ? await submitResponse.json() : null;
-      const jobId = submitData?.id || submitData?.job?.id;
-      let status = null, body = null;
-      if (jobId) {
-        while (Date.now() < llamaDeadlineMs) {
-          const pollResponse = await fetchWithTimeout(`${LLAMAPARSE_BASE}/${encodeURIComponent(jobId)}?expand=markdown_full`,
-            { headers: llamaHeaders }, Math.max(1000, Math.min(5000, llamaDeadlineMs - Date.now())));
-          if (!pollResponse.ok) { status = `HTTP_${pollResponse.status}`; break; }
-          body = await pollResponse.json();
-          status = body?.job?.status || body?.status || null;
-          if (status === 'COMPLETED' || status === 'FAILED' || status === 'CANCELLED') break;
-          await new Promise(resolve => setTimeout(resolve, 1500));
-        }
-      }
-      const durationMs = Date.now() - llamaStartMs;
-      const text = status === 'COMPLETED' ? llamaParseMarkdown(body) : '';
-      if (text.length > 50) {
-        console.log(`[ocr] LlamaParse success: ${text.length} chars from ${fileName} in ${durationMs}ms`);
-        await logToAxiom({ endpoint: 'ocr', status: 200, reason: 'llamaparse_success', fileName, userId, chars: text.length, durationMs, ip: req.headers['x-forwarded-for'] || null });
-        return res.status(200).json({ text, source: 'llamaparse' });
-      }
-      const reason = !submitResponse.ok ? 'llamaparse_http_error' : !jobId ? 'llamaparse_no_job'
-        : status === 'COMPLETED' ? 'llamaparse_empty_text' : status === 'FAILED' || status === 'CANCELLED' ? 'llamaparse_failed'
-        : String(status).startsWith('HTTP_') ? 'llamaparse_poll_error' : 'llamaparse_timeout';
-      console.log(`[ocr] LlamaParse ${reason} (${status || submitResponse.status})`);
-      await logToAxiom({ endpoint: 'ocr', status: 200, reason, fileName, userId, httpStatus: submitResponse.ok ? null : submitResponse.status, jobStatus: status, durationMs, ip: req.headers['x-forwarded-for'] || null });
+      const ok = name === 'llamaparse'
+        ? (!isAnonymousRequest || await reserveAnonLlamaParse(redis))
+        : isAnonymousRequest ? await reserveAnonDatalab(redis) : await reserveDatalab(redis, userId);
+      if (!ok) await logToAxiom({ endpoint: 'ocr', status: 200, reason: `${name}_budget_skipped`, fileName, userId, ip });
+      return ok;
     } catch (err) {
-      const timedOut = err.name === 'AbortError';
-      console.log(`[ocr] LlamaParse ${timedOut ? 'timed out' : 'threw'}: ${err.message || 'unknown'}`);
-      await logToAxiom({ endpoint: 'ocr', status: 200, reason: timedOut ? 'llamaparse_timeout' : 'llamaparse_threw', fileName, userId, durationMs: Date.now() - llamaStartMs, ip: req.headers['x-forwarded-for'] || null });
+      console.log(`[ocr] ${name} budget check failed, skipping:`, err?.message || 'unknown');
+      return false;
     }
   }
 
-  // Tier 2: Mistral. 2026-10-23: it returned HTTP 429 on every production call seen this month
-  // (provider quota/billing, not code) - kept as a fallback in case that clears.
-  if (mistralKey && remainingMs() > 3000) {
-    // Mistral only being down is exactly the condition that sends traffic to Datalab below,
-    // so a hang here (not just a fast error) would eat the time budget the fallback tiers need.
-    // 30s (not a shorter number): Mistral's OCR endpoint is synchronous with no documented
-    // server-side timeout, and no independently-observed per-page latency figure exists publicly
-    // (their "2000 pages/min" figure is a GPU-cluster throughput claim, not measured single-request
-    // latency for markdown+bbox generation). A too-short timeout here would misclassify a slow-but-
-    // working Mistral call as "down" and route it to the paid Datalab tier unnecessarily — the
-    // opposite of the "only when Mistral is actually down" intent. Duration is logged to Axiom below
-    // on every outcome so this number can be tuned from real production data instead of guesswork.
-    const mistralStartMs = Date.now();
-    try {
-      console.log(`[ocr] trying Mistral OCR for: ${fileName}`);
-
-      const mistralResponse = await fetchWithTimeout("https://api.mistral.ai/v1/ocr", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${mistralKey}`
-        },
-        body: JSON.stringify({
-          model: "mistral-ocr-latest",
-          document: {
-            type: "document_url",
-            document_url: dataUri
-          },
-          include_blocks: true
-          // table_format deliberately left at Mistral's default (markdown), NOT "html" —
-          // reverted after a live test (2026-08-08) showed HTML table markup breaking two
-          // parts of the downstream pipeline in enrich.js: the line-based signal filter
-          // (built assuming one markdown table row per line) and the effectiveCharCap slice
-          // (HTML tags are ~2-3x more verbose than markdown pipe-tables for the same data,
-          // so dense tables blew the 2500-5000 char budget where markdown wouldn't have).
-          // Real symptom: a scanned central-bank financial-statement PDF's two dense
-          // tables vanished entirely from the generated skill file. include_blocks is safe
-          // to keep — bounding boxes live in a separate response field, never touching the
-          // markdown text that gets filtered/sliced.
-        })
-        // 2026-10-23: still up to 30s, but clipped so a signed-in request keeps ~19s for Datalab
-        // after it (LlamaParse now runs first and may have used part of the 60s).
-      }, Math.max(3000, Math.min(30000, remainingMs() - (datalabKey && !isAnonymousRequest ? 19000 : 1000))));
-
-      if (mistralResponse.ok) {
-        const data = await mistralResponse.json();
-        const text = data.pages.map(p => p.markdown).join("\n\n").trim();
-        const mistralDurationMs = Date.now() - mistralStartMs;
-
-        if (text.length > 50) {
-          // Block extraction requires OCR 4+ (mistral-ocr-latest resolves there as of 2026-07-26);
-          // older models silently accept include_blocks but return an empty array per page.
-          const blocks = data.pages.map(p => ({ page: p.index, blocks: p.blocks || [] }));
-          console.log(`[ocr] Mistral success: ${text.length} chars from ${fileName} in ${mistralDurationMs}ms`);
-          // Real per-request latency, not published anywhere by Mistral — logged so the 30s
-          // timeout above can eventually be tuned from actual production numbers, not a guess.
-          await logToAxiom({ endpoint: 'ocr', status: 200, reason: 'mistral_success', fileName, userId, pageCount: data.pages.length, durationMs: mistralDurationMs, ip: req.headers['x-forwarded-for'] || null });
-          return res.status(200).json({ text, source: 'mistral', blocks });
-        }
-        await logToAxiom({ endpoint: 'ocr', status: 200, reason: 'mistral_empty_text', fileName, userId, pageCount: data.pages.length, durationMs: mistralDurationMs, ip: req.headers['x-forwarded-for'] || null });
-      } else {
-        console.log(`[ocr] Mistral HTTP ${mistralResponse.status}`);
-        await logToAxiom({ endpoint: 'ocr', status: 200, reason: 'mistral_http_error', fileName, userId, httpStatus: mistralResponse.status, durationMs: Date.now() - mistralStartMs, ip: req.headers['x-forwarded-for'] || null });
-      }
-    } catch (err) {
-      const timedOut = err.name === 'AbortError';
-      console.log(`[ocr] Mistral ${timedOut ? 'timed out' : 'threw'}: ${err.message || 'unknown'}`);
-      await logToAxiom({ endpoint: 'ocr', status: 200, reason: timedOut ? 'mistral_timeout' : 'mistral_threw', fileName, userId, durationMs: Date.now() - mistralStartMs, ip: req.headers['x-forwarded-for'] || null });
-    }
+  const tried = [];
+  let best = null;
+  for (let i = 0; i < order.length; i++) {
+    const provider = order[i];
+    if (best && down[provider.name]) continue; // already have text: don't wait on a provider marked down
+    if (remainingMs() < provider.minMs) continue;
+    if (!(await reserveProvider(provider.name))) continue;
+    const next = order.slice(i + 1).find(p => !down[p.name]);
+    const deadlineMs = Math.min(Date.now() + provider.maxMs, handlerDeadlineMs - (next ? next.minMs + 2000 : 2000));
+    console.log(`[ocr] trying ${provider.name} for: ${fileName}`);
+    const result = await provider.run({ key: process.env[provider.keyEnv], fileBuffer, fileMime, fileName, maxPages, deadlineMs });
+    const breakerOpened = await recordProviderResult(redis, provider.name, result.kind);
+    const quality = result.text ? assessText(result.text, pages) : null;
+    tried.push(`${provider.name}:${quality?.weak ? quality.reason : result.kind}`);
+    console.log(`[ocr] ${provider.name}: ${result.reason} in ${result.durationMs}ms${quality ? ` (score ${quality.score}${quality.weak ? `, weak: ${quality.reason}` : ''})` : ''}`);
+    await logToAxiom({ endpoint: 'ocr', status: 200, reason: result.reason, fileName, userId, chars: result.text.length || null, pages, quality, breakerOpened, httpStatus: result.httpStatus ?? null, jobStatus: result.jobStatus ?? null, pageCount: result.pageCount ?? null, cost: result.cost ?? null, durationMs: result.durationMs, ip });
+    if (!result.text) continue;
+    const rank = quality.score * (quality.weak ? 0.5 : 1) * (provider.name === 'llamaparse' ? LLAMAPARSE_TIE_MARGIN : 1);
+    if (!best || rank > best.rank) best = { text: result.text, source: provider.name, rank };
+    if (!quality.weak) break;
   }
 
-  const DATALAB_DAILY_LIMIT = 3;
-  let datalabAllowed = true;
-
-  // Anonymous requests skip the paid Datalab tier entirely — it's gated by a per-Clerk-user
-  // daily quota, and there's no userId to track for an anonymous request. Anonymous OCR
-  // still gets Mistral (above) and OCR.space (below), neither of which are user-quota-gated.
-  // (2026-10-23: OCR.space is removed; anonymous OCR gets LlamaParse and Mistral above.)
-  if (isAnonymousRequest) datalabAllowed = false;
-  // 2026-10-23: Datalab needs ~19s (5s submit + 12s poll + logging); with less left before the
-  // 55s deadline it is skipped rather than started and cut off mid-job (a submitted job can bill).
-  if (remainingMs() < 19000) datalabAllowed = false;
-
-  if (datalabKey && datalabAllowed) {
-    try {
-      // Counts the attempt now, before the paid submit (2026-10-23, atomic Redis counter).
-      if (!(await reserveDatalab(redis, userId))) {
-        datalabAllowed = false;
-        console.log(`[ocr] Datalab daily cap reached for user ${userId} (${DATALAB_DAILY_LIMIT}/day)`);
-        await logToAxiom({ endpoint: 'ocr', status: 200, reason: 'datalab_quota_skipped', fileName, userId, ip: req.headers['x-forwarded-for'] || null });
-      }
-    } catch (err) {
-      // Fail closed on the quota read itself — skip the paid tier rather than risk an
-      // uncapped call, same posture as enrich.js's Clerk-read fail-closed quota gate.
-      datalabAllowed = false;
-      console.log('[ocr] Datalab quota check failed, skipping paid tier:', err?.message || 'unknown');
-    }
+  if (best) {
+    console.log(`[ocr] served ${best.source}: ${best.text.length} chars from ${fileName} (${tried.join(', ')})`);
+    await logToAxiom({ endpoint: 'ocr', status: 200, reason: 'ocr_served', source: best.source, tried, fileName, userId, chars: best.text.length, ip });
+    return res.status(200).json({ text: best.text, source: best.source });
   }
 
-  // NOTE (known, accepted, not fixed here): this quota check and the increment after a successful
-  // call below are a non-atomic read-modify-write against Clerk metadata — concurrent requests from
-  // the same user (e.g. a multi-file batch upload, which the frontend fires as Promise.allSettled
-  // over all files at once) can all read the same stale dailyCount and all pass the cap. This is the
-  // same class of race enrich.js's Gemini quota gate already has and has already deferred to Upstash
-  // Redis (see relatch-quota-security-fixes memory) — not re-solved here to avoid introducing new,
-  // unverified concurrency-control code the night before launch. The real backstop against runaway
-  // spend is the $8 hard cap Manas set directly on the Datalab API key in their dashboard, which holds
-  // regardless of whether this counter under-counts.
-  // 2026-10-23: FIXED - the check-and-count is now one atomic Redis INCR (reserveDatalab) taken
-  // before the submit, so parallel files cannot all pass. The $8 key cap stays as the backstop.
-  if (datalabKey && datalabAllowed) {
-    try {
-      console.log(`[ocr] trying Datalab OCR fallback for: ${fileName}`);
+  // 2026-10-24: the Mistral tier (mistral-ocr-latest, 30s, include_blocks) was removed: Mistral's
+  // Free plan lost OCR access ("Your organization is on the Free plan. Upgrade to activate your API
+  // keys"), so every call returned 429. MISTRALOCR_API_KEY is unused. Lesson kept from it: HTML
+  // table markup (table_format "html", reverted 2026-08-08) broke enrich.js's line-based signal
+  // filter, which assumes one markdown table row per line, and its effectiveCharCap slice (HTML is
+  // ~2-3x more verbose than pipe tables) - a scanned central-bank statement's two dense tables
+  // vanished from the skill file. That is why LlamaParse output is converted to pipe tables.
+  // The `blocks` field (Mistral bounding boxes) is no longer returned; App.tsx treats it as optional.
 
-      const rawBase64 = dataUri.includes(',') ? dataUri.slice(dataUri.indexOf(',') + 1) : dataUri;
-      const fileBuffer = Buffer.from(rawBase64, 'base64');
-      const form = new FormData();
-      form.append('file', new Blob([fileBuffer], { type: fileMime }), fileName);
-      form.append('output_format', 'markdown');
-      form.append('mode', 'balanced'); // same $4/1000-page rate as 'fast', better quality — no reason to use 'fast'
-      // 25 (not 40): sized to comfortably finish inside the 12s poll budget below at Datalab's own
-      // stated worst-case ~3 pages/sec (25/3≈8.3s + margin), rather than the two numbers being picked
-      // independently and only fitting together in the best case. Kept tight because this budget
-      // stacks behind Mistral's own 30s above — see the overall worst-case accounting below.
-      form.append('max_pages', '25');
-
-      const submitResponse = await fetchWithTimeout('https://www.datalab.to/api/v1/convert', {
-        method: 'POST',
-        headers: { 'X-Api-Key': datalabKey },
-        body: form,
-      }, 5000); // submit only enqueues the job and returns a request_id — should be near-instant per Datalab's own docs, not the actual OCR processing time
-
-      if (submitResponse.ok) {
-        const submitData = await submitResponse.json();
-        const checkUrl = submitData.request_check_url;
-
-        let result = null;
-        if (checkUrl) {
-          // 12s overall budget, sized against the 25-page cap above. Checks immediately first (no
-          // guaranteed wasted delay for jobs that finish fast), then backs off 2s between checks.
-          // Each individual poll request also has its own 5s timeout — the outer deadline alone
-          // doesn't help if a single poll call hangs, since the loop can't re-check the clock while
-          // it's still awaiting that call. Overall worst-case accounting (Mistral 30s + its Axiom
-          // log 2s + Datalab submit 5s + this 12s poll + its Axiom log 2s = 51s) leaves ~9s for
-          // OCR.space + response before Vercel's 60s function ceiling — real margin, not razor-thin.
-          const deadline = Date.now() + 12000;
-          let firstCheck = true;
-          while (Date.now() < deadline) {
-            if (!firstCheck) await new Promise((resolve) => setTimeout(resolve, 2000));
-            firstCheck = false;
-            const pollResponse = await fetchWithTimeout(checkUrl, { headers: { 'X-Api-Key': datalabKey } }, 5000);
-            if (!pollResponse.ok) break;
-            const pollData = await pollResponse.json();
-            if (pollData.status === 'complete') { result = pollData; break; }
-            if (pollData.status === 'failed') break;
-          }
-        }
-
-        if (result) {
-          // Datalab bills per page once a job reaches 'complete', independent of whether the
-          // extracted text clears our own length gate below. (2026-10-23: the spend used to be
-          // recorded here, after the fact, in Clerk metadata; reserveDatalab now counts it
-          // before the submit.)
-          await logToAxiom({
-            endpoint: 'ocr',
-            status: 200,
-            reason: result.success ? 'datalab_success' : 'datalab_processing_failed',
-            fileName,
-            userId,
-            pageCount: result.page_count ?? null,
-            cost: result.cost_breakdown ?? null,
-            ip: req.headers['x-forwarded-for'] || null,
-          });
-
-          if (result.success && result.markdown) {
-            const text = result.markdown.trim();
-            if (text.length > 50) {
-              console.log(`[ocr] Datalab success: ${text.length} chars from ${fileName}`);
-              return res.status(200).json({ text, source: 'datalab' });
-            }
-          }
-        } else {
-          console.log(`[ocr] Datalab did not complete within the poll window for: ${fileName}`);
-        }
-      } else {
-        console.log(`[ocr] Datalab HTTP ${submitResponse.status}`);
-      }
-    } catch (err) {
-      console.log(`[ocr] Datalab threw: ${err.message || 'unknown'}`);
-    }
-  }
+  // NOTE (history): Datalab's per-user daily cap was a non-atomic Clerk metadata read-modify-write,
+  // so parallel files from one batch could all pass it. 2026-10-23: FIXED - the check-and-count is
+  // one atomic Redis INCR (reserveDatalab) taken before the submit. The $8 hard cap Manas set on the
+  // Datalab API key in their dashboard stays as the backstop against runaway spend.
 
   // 2026-10-23: the OCR.space tier (last free fallback, OCREngine 2, 8s timeout) was removed at
   // Manas's request after the LlamaParse benchmark: on a phone-photo scan it dropped decimal points
   // (412.50 -> 41250) and row labels, and it never kept table structure. OCRCLD_API_KEY is unused.
 
-  console.log(`[ocr] all OCR methods failed for: ${fileName}`);
-  await logToAxiom({ endpoint: 'ocr', status: 422, reason: 'ocr_failed', fileName, ip: req.headers['x-forwarded-for'] || null });
+  console.log(`[ocr] all OCR methods failed for: ${fileName} (${tried.join(', ') || 'none tried'})`);
+  await logToAxiom({ endpoint: 'ocr', status: 422, reason: 'ocr_failed', tried, fileName, ip });
   return res.status(422).json({
     error: 'OCR_FAILED',
     message: 'Could not extract text from this document. It may be image-based, encrypted, or corrupted.',
