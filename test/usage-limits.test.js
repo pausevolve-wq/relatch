@@ -6,7 +6,7 @@ const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const net = require('node:net');
 const { spawn } = require('node:child_process');
-const { reserveRun, reserveDatalab, reserveAnonOcr, quotaReachedBody, periodKeys } = require('../lib/usage-limits');
+const { reserveRun, reserveDatalab, reserveAnonOcr, reserveAnonLlamaParse, reserveAnonDatalab, quotaReachedBody, periodKeys } = require('../lib/usage-limits');
 
 const SERVER = process.env.REDIS_SERVER;
 const PORT = 6390 + Math.floor(Math.random() * 500);
@@ -155,6 +155,23 @@ test('anonymous OCR: 10 parallel calls on one token, exactly 5 pass', { skip }, 
   assert.equal(rows.filter(Boolean).length, 5);
   const ttl = await command('TTL', 'anon:tok-1:ocr');
   assert.ok(ttl > 0 && ttl <= 600);
+});
+
+test('anonymous LlamaParse: one site-wide budget of 200 calls per UTC day', { skip }, async () => {
+  const day = new Date('2026-10-23T12:00:00Z');
+  await command('SET', 'usage:v1:anon:llamaparse:2026-10-23', 195);
+  const rows = await Promise.all(Array.from({ length: 10 }, () => reserveAnonLlamaParse(redis, day)));
+  assert.equal(rows.filter(Boolean).length, 5);
+  assert.equal(await reserveAnonLlamaParse(redis, new Date('2026-10-24T00:00:01Z')), true);
+});
+
+test('anonymous Datalab: its own site-wide budget of 50 calls per UTC day', { skip }, async () => {
+  const day = new Date('2026-10-23T12:00:00Z');
+  await command('SET', 'usage:v1:anon:datalab:2026-10-23', 45);
+  const rows = await Promise.all(Array.from({ length: 10 }, () => reserveAnonDatalab(redis, day)));
+  assert.equal(rows.filter(Boolean).length, 5);
+  assert.equal(await command('GET', 'usage:v1:anon:datalab:2026-10-23'), '55'); // separate from LlamaParse's key
+  assert.equal(await reserveAnonDatalab(redis, new Date('2026-10-24T00:00:01Z')), true);
 });
 
 test('store failures throw (callers fail closed)', async () => {
