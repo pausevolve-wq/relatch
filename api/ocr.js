@@ -272,7 +272,7 @@ module.exports = async function handler(req, res) {
   // friendly error below, since Vercel's own limit sits in front of this code.
   const estimatedBytes = base64.length * 0.75;
   if (estimatedBytes > 3000000) {
-    await logToAxiom({ endpoint: 'ocr', status: 413, reason: 'file_too_large', fileName, ip: req.headers['x-forwarded-for'] || null });
+    await logToAxiom({ endpoint: 'ocr', status: 413, reason: 'file_too_large', ip: req.headers['x-forwarded-for'] || null });
     return res.status(413).json({ error: 'File too large for OCR. Maximum size is ~3MB.' });
   }
 
@@ -304,6 +304,11 @@ module.exports = async function handler(req, res) {
   const ip = req.headers['x-forwarded-for'] || null;
   const rawBase64 = base64.startsWith('data:') ? base64.slice(base64.indexOf(',') + 1) : base64;
   const fileBuffer = Buffer.from(rawBase64, 'base64');
+  // 2026-10-24: providers get a neutral upload name that keeps only the extension (they use it to
+  // detect the file type); the person's own file name is never sent to them or logged (privacy
+  // policy 2.5/2.6). It is still required in the request body for older app builds.
+  const ext = (/\.([A-Za-z0-9]{1,8})$/.exec(String(fileName)) || [])[1];
+  const uploadName = ext ? `document.${ext.toLowerCase()}` : 'document';
   const maxPages = isAnonymousRequest ? 10 : 25;
   // Pages a provider will actually read, for judging text volume per page.
   const pages = Math.min(maxPages, estimatePages(fileBuffer, fileMime));
@@ -332,7 +337,7 @@ module.exports = async function handler(req, res) {
       const ok = name === 'llamaparse'
         ? (!isAnonymousRequest || await reserveAnonLlamaParse(redis))
         : isAnonymousRequest ? await reserveAnonDatalab(redis) : await reserveDatalab(redis, userId);
-      if (!ok) await logToAxiom({ endpoint: 'ocr', status: 200, reason: `${name}_budget_skipped`, fileName, userId, ip });
+      if (!ok) await logToAxiom({ endpoint: 'ocr', status: 200, reason: `${name}_budget_skipped`, userId, ip });
       return ok;
     } catch (err) {
       console.log(`[ocr] ${name} budget check failed, skipping:`, err?.message || 'unknown');
@@ -349,13 +354,13 @@ module.exports = async function handler(req, res) {
     if (!(await reserveProvider(provider.name))) continue;
     const next = order.slice(i + 1).find(p => !down[p.name]);
     const deadlineMs = Math.min(Date.now() + provider.maxMs, handlerDeadlineMs - (next ? next.minMs + 2000 : 2000));
-    console.log(`[ocr] trying ${provider.name} for: ${fileName}`);
-    const result = await provider.run({ key: process.env[provider.keyEnv], fileBuffer, fileMime, fileName, maxPages, deadlineMs });
+    console.log(`[ocr] trying ${provider.name}`);
+    const result = await provider.run({ key: process.env[provider.keyEnv], fileBuffer, fileMime, fileName: uploadName, maxPages, deadlineMs });
     const breakerOpened = await recordProviderResult(redis, provider.name, result.kind);
     const quality = result.text ? assessText(result.text, pages) : null;
     tried.push(`${provider.name}:${quality?.weak ? quality.reason : result.kind}`);
     console.log(`[ocr] ${provider.name}: ${result.reason} in ${result.durationMs}ms${quality ? ` (score ${quality.score}${quality.weak ? `, weak: ${quality.reason}` : ''})` : ''}`);
-    await logToAxiom({ endpoint: 'ocr', status: 200, reason: result.reason, fileName, userId, chars: result.text.length || null, pages, quality, breakerOpened, httpStatus: result.httpStatus ?? null, jobStatus: result.jobStatus ?? null, pageCount: result.pageCount ?? null, cost: result.cost ?? null, durationMs: result.durationMs, ip });
+    await logToAxiom({ endpoint: 'ocr', status: 200, reason: result.reason, userId, chars: result.text.length || null, pages, quality, breakerOpened, httpStatus: result.httpStatus ?? null, jobStatus: result.jobStatus ?? null, pageCount: result.pageCount ?? null, cost: result.cost ?? null, durationMs: result.durationMs, ip });
     if (!result.text) continue;
     const rank = quality.score * (quality.weak ? 0.5 : 1) * (provider.name === 'llamaparse' ? LLAMAPARSE_TIE_MARGIN : 1);
     if (!best || rank > best.rank) best = { text: result.text, source: provider.name, rank };
@@ -363,8 +368,8 @@ module.exports = async function handler(req, res) {
   }
 
   if (best) {
-    console.log(`[ocr] served ${best.source}: ${best.text.length} chars from ${fileName} (${tried.join(', ')})`);
-    await logToAxiom({ endpoint: 'ocr', status: 200, reason: 'ocr_served', source: best.source, tried, fileName, userId, chars: best.text.length, ip });
+    console.log(`[ocr] served ${best.source}: ${best.text.length} chars (${tried.join(', ')})`);
+    await logToAxiom({ endpoint: 'ocr', status: 200, reason: 'ocr_served', source: best.source, tried, userId, chars: best.text.length, ip });
     return res.status(200).json({ text: best.text, source: best.source });
   }
 
@@ -386,8 +391,8 @@ module.exports = async function handler(req, res) {
   // Manas's request after the LlamaParse benchmark: on a phone-photo scan it dropped decimal points
   // (412.50 -> 41250) and row labels, and it never kept table structure. OCRCLD_API_KEY is unused.
 
-  console.log(`[ocr] all OCR methods failed for: ${fileName} (${tried.join(', ') || 'none tried'})`);
-  await logToAxiom({ endpoint: 'ocr', status: 422, reason: 'ocr_failed', tried, fileName, ip });
+  console.log(`[ocr] all OCR methods failed (${tried.join(', ') || 'none tried'})`);
+  await logToAxiom({ endpoint: 'ocr', status: 422, reason: 'ocr_failed', tried, ip });
   return res.status(422).json({
     error: 'OCR_FAILED',
     message: 'Could not extract text from this document. It may be image-based, encrypted, or corrupted.',
