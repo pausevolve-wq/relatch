@@ -1,4 +1,5 @@
 const { verifyToken, createClerkClient } = require('@clerk/backend');
+const { reserveRun, reserveDatalab, reserveAnonOcr, quotaReachedBody } = require('../lib/usage-limits');
 const clerkClient = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
 const { Redis } = require('@upstash/redis');
 const redis = (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN)
@@ -25,15 +26,9 @@ async function logToAxiom(event) {
   }
 }
 
-// Shared by the Datalab quota check (read-only) and the post-success increment (read-then-write)
-// so the "reset if it's a new day" logic can't drift out of sync between the two call sites.
-async function getDatalabDailyCount(userId) {
-  const quotaUser = await clerkClient.users.getUser(userId);
-  const todayKey = new Date().toISOString().slice(0, 10);
-  const stored = quotaUser.privateMetadata?.relatchOcrUsage ?? {};
-  const dailyCount = stored.lastDayKey === todayKey ? (stored.dailyCount ?? 0) : 0;
-  return { dailyCount, todayKey };
-}
+// (2026-10-23: getDatalabDailyCount, the Clerk privateMetadata.relatchOcrUsage read shared by
+// the Datalab quota check and its post-success increment, was replaced by reserveDatalab in
+// lib/usage-limits.js - one atomic Redis counter, taken before the paid submit.)
 
 // fetch() wrapped with an AbortController timeout — every outbound call in this file uses this
 // instead of a bare fetch, so a hung third-party endpoint can never stall the fallback chain
@@ -66,6 +61,8 @@ module.exports = async function handler(req, res) {
   // die here before the run's real work even starts. See enrich.js and anon-token.js for
   // the full model (enrich.js is also where the per-token call-count cap lives — OCR
   // preprocessing calls are deliberately not counted against it).
+  // 2026-10-23: OCR calls now have their own cap per trial token (reserveAnonOcr, 5 calls), and
+  // signed-in OCR shares the batch's credit with generation (reserveRun) - see below the size check.
   const authHeader = req.headers['authorization'];
   const anonToken = req.headers['x-anon-token'];
   let userId = null;
@@ -102,7 +99,8 @@ module.exports = async function handler(req, res) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  const { base64, mimeType, fileName } = req.body;
+  // sessionId: the upload batch id App.tsx also sends to /api/enrich (older app builds omit it).
+  const { base64, mimeType, fileName, sessionId } = req.body;
 
   if (!base64 || !fileName) {
     await logToAxiom({ endpoint: 'ocr', status: 400, reason: 'missing_fields', ip: req.headers['x-forwarded-for'] || null });
@@ -122,6 +120,30 @@ module.exports = async function handler(req, res) {
   if (estimatedBytes > 3000000) {
     await logToAxiom({ endpoint: 'ocr', status: 413, reason: 'file_too_large', fileName, ip: req.headers['x-forwarded-for'] || null });
     return res.status(413).json({ error: 'File too large for OCR. Maximum size is ~3MB.' });
+  }
+
+  // Usage limit, reserved atomically BEFORE any provider call (2026-10-23). Until now signed-in
+  // OCR through Mistral/OCR.space had no limit at all, and anonymous OCR was unlimited for the
+  // token's 10 minutes. Signed-in: the call joins the upload batch's run, so a batch's OCR and
+  // generation calls together cost one credit of the 5/day + 35/week allowance. Anonymous: at
+  // most 5 OCR calls per trial token. Fail CLOSED on any usage-store error.
+  try {
+    if (isAnonymousRequest) {
+      if (!(await reserveAnonOcr(redis, anonToken))) {
+        await logToAxiom({ endpoint: 'ocr', status: 429, reason: 'anon_ocr_cap', ip: req.headers['x-forwarded-for'] || null });
+        return res.status(429).json({ error: 'ANON_OCR_LIMIT' });
+      }
+    } else {
+      const quota = await reserveRun(redis, { userId, sessionId, kind: 'ocr' });
+      if (!quota.allowed) {
+        await logToAxiom({ endpoint: 'ocr', status: 429, reason: 'quota_reached', limitType: quota.limitType, userId, ip: req.headers['x-forwarded-for'] || null });
+        return res.status(429).json(quotaReachedBody(quota));
+      }
+    }
+  } catch (quotaErr) {
+    console.error('[quota] usage store failed:', quotaErr?.message || quotaErr);
+    await logToAxiom({ endpoint: 'ocr', status: 503, reason: 'quota_unavailable', userId, ip: req.headers['x-forwarded-for'] || null });
+    return res.status(503).json({ error: 'QUOTA_UNAVAILABLE' });
   }
 
   const fileMime = mimeType || 'application/pdf';
@@ -208,11 +230,10 @@ module.exports = async function handler(req, res) {
 
   if (datalabKey && !isAnonymousRequest) {
     try {
-      const { dailyCount } = await getDatalabDailyCount(userId);
-
-      if (dailyCount >= DATALAB_DAILY_LIMIT) {
+      // Counts the attempt now, before the paid submit (2026-10-23, atomic Redis counter).
+      if (!(await reserveDatalab(redis, userId))) {
         datalabAllowed = false;
-        console.log(`[ocr] Datalab daily cap reached for user ${userId} (${dailyCount}/${DATALAB_DAILY_LIMIT})`);
+        console.log(`[ocr] Datalab daily cap reached for user ${userId} (${DATALAB_DAILY_LIMIT}/day)`);
         await logToAxiom({ endpoint: 'ocr', status: 200, reason: 'datalab_quota_skipped', fileName, userId, ip: req.headers['x-forwarded-for'] || null });
       }
     } catch (err) {
@@ -232,6 +253,8 @@ module.exports = async function handler(req, res) {
   // unverified concurrency-control code the night before launch. The real backstop against runaway
   // spend is the $8 hard cap Manas set directly on the Datalab API key in their dashboard, which holds
   // regardless of whether this counter under-counts.
+  // 2026-10-23: FIXED - the check-and-count is now one atomic Redis INCR (reserveDatalab) taken
+  // before the submit, so parallel files cannot all pass. The $8 key cap stays as the backstop.
   if (datalabKey && datalabAllowed) {
     try {
       console.log(`[ocr] trying Datalab OCR fallback for: ${fileName}`);
@@ -282,17 +305,9 @@ module.exports = async function handler(req, res) {
 
         if (result) {
           // Datalab bills per page once a job reaches 'complete', independent of whether the
-          // extracted text clears our own length gate below — record the spend here, not
-          // after the quality check, so the daily counter reflects what was actually billed.
-          try {
-            const { dailyCount, todayKey } = await getDatalabDailyCount(userId);
-            await clerkClient.users.updateUserMetadata(userId, {
-              privateMetadata: { relatchOcrUsage: { dailyCount: dailyCount + 1, lastDayKey: todayKey } },
-            });
-          } catch (err) {
-            console.log('[ocr] Datalab quota write failed:', err?.message || 'unknown');
-          }
-
+          // extracted text clears our own length gate below. (2026-10-23: the spend used to be
+          // recorded here, after the fact, in Clerk metadata; reserveDatalab now counts it
+          // before the submit.)
           await logToAxiom({
             endpoint: 'ocr',
             status: 200,

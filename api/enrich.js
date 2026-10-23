@@ -1,4 +1,5 @@
 const { verifyToken, createClerkClient } = require('@clerk/backend');
+const { reserveRun, quotaReachedBody } = require('../lib/usage-limits');
 const clerkClient = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
 const { Redis } = require('@upstash/redis');
 const redis = (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN)
@@ -131,6 +132,7 @@ module.exports = async function handler(req, res) {
     // const is declared later in this function (inside the quota-gate section) and referencing
     // it here would throw a TDZ ReferenceError on every anonymous request. Keep this value in
     // sync with MAX_FREE_REQUESTS_PER_SESSION by hand if that one ever changes.
+    // (2026-10-23: that signed-in cap is now RUN_CALL_CAP in lib/usage-limits.js, still 5.)
     const ANON_MAX_ENRICH_CALLS = 5;
     const requestSessionId = req.body?.sessionId;
     if (!requestSessionId) {
@@ -224,102 +226,10 @@ module.exports = async function handler(req, res) {
   const FUNCTION_BUDGET_MS = 280000;
 
   // ─── QUOTA GATE ──────────────────────────────────────────────────────────────
-  const DAILY_LIMIT  = 5;
-  const WEEKLY_LIMIT = 35;
-  // Session dedup window. A multi-file batch shares one client-supplied sessionId so it
-  // counts once; but sessionId is client-controlled, so an unbounded bypass is possible
-  // by replaying a fixed sessionId forever. Honour the dedup only while the session is
-  // fresh — legitimate batches finish in seconds, replay attacks do not.
-  const SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes
-  // The frontend caps a single upload batch at 3 files (App.tsx FileUploadZone), so a
-  // legitimate session never needs more than 3 free (uncounted) requests. 5 gives headroom
-  // for a stray retry. Without this cap, a client that keeps replaying the same sessionId
-  // forever gets literally unlimited free Gemini calls inside every 10-minute window — this
-  // bounds the exploit to (DAILY_LIMIT/WEEKLY_LIMIT) x MAX_FREE_REQUESTS_PER_SESSION instead,
-  // since renewing the free window still costs one real counted generation each time.
-  const MAX_FREE_REQUESTS_PER_SESSION = 5;
-
-  function getDateKey(now) {
-    return now.toISOString().slice(0, 10);
-  }
-
-  function getIsoWeekKey(date) {
-    const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
-    const dayNum = d.getUTCDay() || 7;
-    d.setUTCDate(d.getUTCDate() + 4 - dayNum);
-    const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
-    const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
-    return `${d.getUTCFullYear()}-W${String(weekNo).padStart(2, '0')}`;
-  }
-
-  let quotaUsage = null;
-  let quotaUser  = null;
-
-  // Anonymous requests never touch Clerk-backed quota — there is no userId to look up,
-  // and the one-time anon token already bounds usage to exactly one run by construction.
-  // quotaUsage/quotaUser stay null, which the post-generation write below (`if (quotaUsage
-  // && quotaUser)`) already treats as "nothing to record."
-  if (!isAnonymousRequest) {
-  try {
-    quotaUser = await clerkClient.users.getUser(userId);
-    const now = new Date();
-    const currentDayKey  = getDateKey(now);
-    const currentWeekKey = getIsoWeekKey(now);
-
-    const stored = quotaUser.privateMetadata?.relatchUsage ?? {};
-    quotaUsage = {
-      dailyCount:    stored.dailyCount    ?? 0,
-      weeklyCount:   stored.weeklyCount   ?? 0,
-      lastDayKey:    stored.lastDayKey    ?? currentDayKey,
-      lastWeekKey:   stored.lastWeekKey   ?? currentWeekKey,
-      lastSessionId: stored.lastSessionId ?? null,
-      lastSessionStartedAt: stored.lastSessionStartedAt ?? 0,
-      sessionRequestCount: stored.sessionRequestCount ?? 0,
-    };
-
-    if (quotaUsage.lastDayKey !== currentDayKey) {
-      quotaUsage.dailyCount = 0;
-      quotaUsage.lastDayKey = currentDayKey;
-    }
-
-    if (quotaUsage.lastWeekKey !== currentWeekKey) {
-      quotaUsage.weeklyCount = 0;
-      quotaUsage.lastWeekKey = currentWeekKey;
-    }
-
-    const isSameSession = sessionId
-      && quotaUsage.lastSessionId === sessionId
-      && (now.getTime() - quotaUsage.lastSessionStartedAt) < SESSION_TTL_MS
-      && quotaUsage.sessionRequestCount < MAX_FREE_REQUESTS_PER_SESSION;
-
-    if (!isSameSession) {
-      if (quotaUsage.dailyCount >= DAILY_LIMIT || quotaUsage.weeklyCount >= WEEKLY_LIMIT) {
-        const limitType  = quotaUsage.dailyCount >= DAILY_LIMIT ? 'daily' : 'weekly';
-        const limitValue = limitType === 'daily' ? DAILY_LIMIT : WEEKLY_LIMIT;
-        await logToAxiom({ endpoint: 'enrich', status: 429, reason: 'quota_reached', limitType, userId, ip: req.headers['x-forwarded-for'] || null });
-        return res.status(429).json({
-          error: 'QUOTA_REACHED',
-          limitType,
-          limitValue,
-          weeklyCount: quotaUsage.weeklyCount,
-          weeklyLimit: WEEKLY_LIMIT,
-          message: `You have used all ${limitValue} free generations for this ${limitType === 'daily' ? 'day' : 'week'}. Your quota resets automatically ${limitType === 'daily' ? 'tomorrow' : 'next week'}.`,
-        });
-      }
-    }
-  } catch (quotaErr) {
-    console.error('[quota] Clerk read failed:', quotaErr?.message || quotaErr);
-    // Fail CLOSED: if we cannot verify the quota, we do not generate. Proceeding here
-    // would call Gemini with zero quota checking and zero recording (free generations
-    // during any Clerk outage/rate-limit). The frontend treats this 503 as a generic
-    // failure and serves its local deterministic fallback, so the user is not dead-ended.
-    await logToAxiom({ endpoint: 'enrich', status: 503, reason: 'quota_unavailable', userId, ip: req.headers['x-forwarded-for'] || null });
-    return res.status(503).json({
-      error: 'QUOTA_UNAVAILABLE',
-      message: 'Unable to verify your usage quota right now. Please try again in a moment.',
-    });
-  }
-  }
+  // 2026-10-23: the old Clerk privateMetadata read-modify-write gate that lived here (5/day,
+  // 35/week, 10-minute sessionId dedup capped at 5 requests, counted after success) raced under
+  // parallel batch calls. It moved to lib/usage-limits.js as one atomic Redis step, and now runs
+  // just after the input validation below, so a 422 "not enough content" costs nothing.
   // ─── END QUOTA GATE ──────────────────────────────────────────────────────────
 
   // Note (2026-10-04): processedText is not read anywhere below; BODY_LIMITS (top of file) is
@@ -341,6 +251,28 @@ module.exports = async function handler(req, res) {
       error: 'INSUFFICIENT_SIGNAL',
       message: 'Not enough content to generate a skill file.',
     });
+  }
+
+  // Usage limit (see QUOTA GATE above): reserved atomically BEFORE any provider call. The
+  // batch's OCR calls and generation calls share one credit. Anonymous requests are bounded by
+  // the trial token's run claim and ANON_MAX_ENRICH_CALLS above instead.
+  if (!isAnonymousRequest) {
+    try {
+      const quota = await reserveRun(redis, { userId, sessionId, kind: 'gen' });
+      if (!quota.allowed) {
+        await logToAxiom({ endpoint: 'enrich', status: 429, reason: 'quota_reached', limitType: quota.limitType, userId, ip: req.headers['x-forwarded-for'] || null });
+        return res.status(429).json(quotaReachedBody(quota));
+      }
+    } catch (quotaErr) {
+      console.error('[quota] usage store failed:', quotaErr?.message || quotaErr);
+      // Fail CLOSED: if we cannot verify the quota, we do not generate. The frontend treats
+      // this 503 as a generic failure and serves its local deterministic fallback.
+      await logToAxiom({ endpoint: 'enrich', status: 503, reason: 'quota_unavailable', userId, ip: req.headers['x-forwarded-for'] || null });
+      return res.status(503).json({
+        error: 'QUOTA_UNAVAILABLE',
+        message: 'Unable to verify your usage quota right now. Please try again in a moment.',
+      });
+    }
   }
 
   // ── JEV LAYER (2026-09-26 content fidelity) ──────────────────────────────────
@@ -2398,30 +2330,8 @@ ${textToSend}`;
     if (gateCandidates) gateLog(enrichedOutput, 'model');
     routeLog('model');
 
-    if (quotaUsage && quotaUser) {
-      try {
-        const isSameSession = sessionId
-          && quotaUsage.lastSessionId === sessionId
-          && (Date.now() - quotaUsage.lastSessionStartedAt) < SESSION_TTL_MS
-          && quotaUsage.sessionRequestCount < MAX_FREE_REQUESTS_PER_SESSION;
-        if (!isSameSession) {
-          quotaUsage.dailyCount  += 1;
-          quotaUsage.weeklyCount += 1;
-          if (sessionId) {
-            quotaUsage.lastSessionId = sessionId;
-            quotaUsage.lastSessionStartedAt = Date.now();
-            quotaUsage.sessionRequestCount = 1;
-          }
-        } else {
-          quotaUsage.sessionRequestCount += 1;
-        }
-        await clerkClient.users.updateUserMetadata(userId, {
-          privateMetadata: { relatchUsage: quotaUsage },
-        });
-      } catch (writeErr) {
-        console.error('[quota] Clerk write failed:', writeErr?.message || writeErr);
-      }
-    }
+    // (2026-10-23: the post-success Clerk usage write that was here is gone - the credit is
+    // now reserved before generation, in lib/usage-limits.js.)
 
     // `plan` only appears when Jev answered - the frontend ignores unknown fields.
     return res.status(200).json({ enriched: enrichedOutput, model: successfulModel, sessionId, ...(planSummary ? { plan: planSummary } : {}), ...(contentSummary ? { content: contentSummary } : {}) });
