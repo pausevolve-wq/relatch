@@ -65,7 +65,26 @@ const BODY_LIMITS = {
 // and no added latency; 4x added nothing over 2x. App.tsx now asks for 2x on the Claude target
 // (10000 medium, a 16000-char sample for large; Codex and small unchanged), so the ceilings come
 // down to exactly 2x: nothing beyond what the app uses is accepted.
-const SERVER_CHAR_CAP = { small: 3500, medium: 10000, large: 16000 };
+// 2026-10-24 (Step C, domain templates plan): medium/large back to 4x. Measured on the 24-doc
+// domain corpus 2026-10-21: coverage 5.1 -> 6.7, W20/T2/L2 vs 2x, no added latency.
+const SERVER_CHAR_CAP = { small: 3500, medium: 20000, large: 32000 };
+
+// 2026-10-24 (EXPERIMENT, domain templates F-K): a confident domain moves A/C/D into its own
+// template. Gated by env DOMAIN_TEMPLATES (comma list of letters; empty = off, today's behaviour).
+const DOMAIN_TEMPLATE_BY_LABEL = {
+  'legal & compliance': 'F',
+  'economics & policy analysis': 'G', 'finance & financial analysis': 'G',
+  'academic research & writing': 'H',
+  'growth marketing & performance': 'I', 'SEO & search strategy': 'I',
+  'product management': 'J', 'product design & UX': 'J',
+  'HR & people operations': 'K',
+};
+function routeDomainTemplate(tmpl, label, target) {
+  const on = (process.env.DOMAIN_TEMPLATES || '').split(',').map(x => x.trim()).filter(Boolean);
+  const letter = DOMAIN_TEMPLATE_BY_LABEL[label];
+  if (target === 'codex' || !letter || !on.includes(letter) || !['A', 'C', 'D'].includes(tmpl)) return tmpl;
+  return letter;
+}
 
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', 'https://app.relatch.online');
@@ -385,8 +404,8 @@ module.exports = async function handler(req, res) {
   // The Jev depth boost (x1.5) still applies on top. flash keeps its +700 OpenRouter pad below.
   const tokenBudgets = {
     small:  { lite: 1600, flash: 1600 },
-    medium: { lite: 2000, flash: 1800 },
-    large:  { lite: 2600, flash: 2200 },
+    medium: { lite: 3600, flash: 3200 },  // 2026-10-24 Step C (was 2000/1800)
+    large:  { lite: 4400, flash: 4000 },  // 2026-10-24 Step C (was 2600/2200)
   };
   const budgetForSize = tokenBudgets[effectiveSizeClass] || tokenBudgets.small;
   // ─────────────────────────────────────────────────────────────────────────
@@ -467,7 +486,7 @@ module.exports = async function handler(req, res) {
   // Jev may override A/C/D on a confident doc-type answer; B and E are never touched.
   // 2026-09-26: B now joins routing behind a double lock (Jev >= 0.9 AND code-like lines
   // counted in code) - see routeTemplate in lib/planner.js. E is still never touched.
-  const activeTemplate = routeTemplate(template || 'A', plan, activeTarget);
+  const activeTemplate = routeDomainTemplate(routeTemplate(template || 'A', plan, activeTarget), safeDomainLabel, activeTarget);
   // Routed INTO B: the signal-line filter above ran with the client's template (it must read
   // `template`, not `activeTemplate` - TDZ rule) and drops most code-shaped lines on A/C/D.
   // Give B the unfiltered source instead, capped the same way. The filter itself is untouched.
@@ -635,6 +654,12 @@ module.exports = async function handler(req, res) {
       B: ['## Role & Capability', '## Example Patterns', '## What to Always Write'],  // unchanged
       C: ['## Domain Role', '## Decision Process'],  // unchanged
       D: ['## Domain Role', '## Decision Framework'],  // unchanged
+      F: ['## Domain Role', '## Obligations & Permissions'],
+      G: ['## Analyst Role', '## Models & Mechanisms'],
+      H: ['## Researcher Role', '## Methodology Standards'],
+      I: ['## Marketer Role', '## Messaging Hierarchy'],
+      J: ['## PM Role', '## Prioritization Model'],
+      K: ['## People-Ops Role', '## Policy Matrix', '## Sensitive Situations & Escalation'],
     };
     const required = requiredSections[tmpl] || requiredSections.A;
     if (required.every(s => text.includes(s))) score += 2;
@@ -664,8 +689,8 @@ module.exports = async function handler(req, res) {
     if (genericCount <= 3) score += 1;
 
     // +1: Rich format present (soft check, template-aware)
-    if (tmpl === 'D' || tmpl === 'C') {
-      if (text.includes('|')) score += 1;
+    if (['C', 'D', 'F', 'G', 'H', 'I', 'J', 'K'].includes(tmpl)) {
+      if (text.includes('|') || text.includes('## Verify This Skill Is Working')) score += 1;
     } else if (tmpl === 'B') {
       if (text.includes('```')) score += 1;
     } else {
@@ -1046,6 +1071,154 @@ Otherwise use bullets. Domain-specific rules only — no generic professional ad
 
 ## Quality Bar
 [How to know output meets the professional standard of this exact domain.]
+
+CONTENT:
+${textToSend}`;
+
+  } else if (['F', 'G', 'H', 'I', 'J', 'K'].includes(activeTemplate)) {
+    // ── TEMPLATES F-K: domain templates (2026-10-24 EXPERIMENT, vault plan section 6) ──
+    // Shared rules carry Step D's loosening (quote where wording matters, keep the source's own
+    // structure, tables only for real comparisons); each letter has its own sections + guardrail.
+    const spec = {
+      F: { who: 'Legal & Compliance Skill Architect', never: 'clauses, statutes, case law, section numbers or obligations', guard: 'This skill applies the source document; it is not legal advice. Every clause or section reference you cite must exist in the source.', sections: `## Domain Role
+[2 sentences: the compliance role Claude takes and whose rules it applies (name the organisation or document from the source).]
+
+## Defined Terms
+[Every term the source defines or uses with a specific meaning. Keep the source's own definition wording.]
+
+## Obligations & Permissions
+[THE MOST IMPORTANT SECTION. What people MUST do, MUST NOT do, and MAY do, each with who it applies to, its conditions, limits and thresholds exactly as stated. Keep the source's own order.]
+
+## Decision Framework
+[How to decide whether a situation is allowed, needs approval, or is prohibited. Use the source's own tests, approval paths and thresholds.]
+
+## Risk Flags & Escalation
+[The situations the source treats as red flags, and exactly who to contact or what to do (channels, roles, deadlines from the source).]
+
+## What to Never Do
+[The source's prohibitions, each starting with "Never".]
+
+## Jurisdiction & Limits
+[Where and to whom this applies, what the source does not cover, and when a human lawyer or compliance officer must decide.]` },
+      G: { who: 'Economics & Finance Analysis Skill Architect', never: 'numbers, coefficients, dates, studies or findings', guard: 'Every number keeps its unit and period. No investment or policy advice beyond what the source states.', sections: `## Analyst Role
+[2 sentences: the analytical role Claude takes and the questions this source equips it to answer.]
+
+## Models & Mechanisms
+[THE MOST IMPORTANT SECTION. Each model, rule, equation or mechanism in the source: what it says, its formula or variables exactly as given, and how to apply it. Keep formulas and coefficients exact.]
+
+## Assumptions & Sensitivities
+[What each model assumes, and what changes the result (the source's own caveats, conditions and parameter ranges).]
+
+## Evidence & Data
+[The empirical findings, estimates and ranges the source reports, with who found them and when, if stated. Use a TABLE if 3 or more estimates are compared.]
+
+## Reasoning Standards
+[How to reason with this material: competing views or schools the source describes, known criticisms, and how to present uncertainty.]
+
+## What to Never Do
+[Specific misuses of these models or numbers, each starting with "Never".]` },
+      H: { who: 'Research Methods Skill Architect', never: 'citations, DOIs, authors, sample sizes or statistics', guard: 'Separate what the source states as established from what it presents as hypothesis or practice.', sections: `## Researcher Role
+[2 sentences: the research role Claude takes and what kind of studies or evaluations it runs with this source.]
+
+## Methodology Standards
+[THE MOST IMPORTANT SECTION. The source's methods, steps, cadences, sample guidance, instruments and scoring scales, in the source's own order and with its exact numbers.]
+
+## Evidence Grading
+[How the source rates, scores or weighs findings (scales, thresholds, severity levels). Use a TABLE if the source defines levels.]
+
+## Citation & Attribution Rules
+[How findings, participants and sources must be recorded, attributed and shared, as the source states.]
+
+## Limitations & Validity Threats
+[Biases, pitfalls and limits the source names, and how it says to handle them.]
+
+## What to Never Do
+[The source's prohibitions and anti-patterns, each starting with "Never".]` },
+      I: { who: 'Marketing Strategy Skill Architect', never: 'statistics, customer names, testimonials, results or channel benchmarks', guard: 'Use only the positioning, audiences and claims the source itself makes.', sections: `## Marketer Role
+[2 sentences: the marketing role Claude takes and the decisions this source equips it to make.]
+
+## Audience & Positioning
+[Who the audiences or buyer stages are and how the source positions the offering for each, with its exact terms.]
+
+## Messaging Hierarchy
+[THE MOST IMPORTANT SECTION. The core messages, proof points and the order or conditions in which the source says to use them. Keep exact phrases where the source prescribes wording.]
+
+## Channel Playbook
+[Channel-, stage- or tool-specific rules, naming conventions, parameters and procedures exactly as the source states them.]
+
+## Claims Discipline
+[What may and may not be claimed or published, approvals required, and compliance rules from the source.]
+
+## What to Never Do
+[The source's prohibitions, each starting with "Never".]` },
+      J: { who: 'Product Thinking Skill Architect', never: 'weights, scores, metrics, targets or decision outcomes', guard: 'Label anything the source presents as a hypothesis or guideline as such; do not upgrade it to a validated rule.', sections: `## PM Role
+[2 sentences: the product role Claude takes and the decisions this source equips it to make.]
+
+## Problem Framing
+[How the source says to define problems, users and scope before deciding.]
+
+## Prioritization Model
+[THE MOST IMPORTANT SECTION. The source's prioritization or tiering criteria, scales, weights, tiers and tie-breakers exactly as given. Use a TABLE if it defines levels or tiers.]
+
+## Decision Records
+[How decisions, launches or reviews are run and recorded: the steps, owners, artifacts and checklists from the source, in its order.]
+
+## Metrics Tree
+[The metrics, scores or signals the source uses to judge success, with their definitions and thresholds.]
+
+## What to Never Do
+[The source's prohibitions and anti-patterns, each starting with "Never".]` },
+      K: { who: 'HR & People Operations Skill Architect', never: 'policy terms, durations, amounts, eligibility rules or legal requirements', guard: 'This skill applies the source policy; it does not make employment decisions and is not legal advice. Note when rules vary by country or entity.', sections: `## People-Ops Role
+[2 sentences: the people-operations role Claude takes and whose policy it applies.]
+
+## Policy Matrix
+[THE MOST IMPORTANT SECTION. The policy's rules by situation, role, country or entity: eligibility, durations, amounts, approvals and steps exactly as stated. Use a TABLE where rules vary across 3 or more cases.]
+
+## Sensitive Situations & Escalation
+[Situations the source treats as sensitive (complaints, misconduct, performance, legal risk) and exactly who handles them and how.]
+
+## Communication Standards
+[How to communicate these matters: channels, timing, wording and documentation rules from the source.]
+
+## Privacy & Confidentiality
+[What must be kept confidential, who may see what, and records rules from the source.]
+
+## What to Never Do
+[The source's prohibitions, each starting with "Never".]` },
+    }[activeTemplate];
+    prompt = `${documentContext}You are a ${spec.who}. Turn the provided document into a Claude Skill File that lets Claude apply this exact source the way its authors intend.
+Focus on: ${focus}
+Domain: ${safeDomainLabel}
+Role: ${safeDomainRole}
+
+RULES:
+- Extract ONLY what the source states. Never invent ${spec.never}.
+- ${spec.guard}
+- Keep the source's own terms, numbers, thresholds, names and references exact. Quote a short phrase verbatim when the precise wording matters (a definition, a rule, a threshold); otherwise write direct instructions.
+- Follow the document's own structure and order where it has one. Use a markdown TABLE only where the source compares 3 or more items across consistent attributes; otherwise use bullets.
+- Cover every topic the source spends real space on. Do not let minor or boilerplate material crowd it out. Do not pad.
+- If the source has nothing for a section, leave that section out entirely (heading included). Never keep an empty or "not present" section. The first two sections are always required.
+- You MUST start your response exactly with the YAML block below, no code fences, no backticks, no preamble.
+- You MUST enclose all YAML values in double quotes.
+- The "name" field MUST be exactly: "${skillName}"
+- The "description" field is how Claude decides when to load this skill. Write one or two plain sentences (at most 600 characters, third person): what the skill does, then "Use when" followed by 3 to 5 concrete situations or requests drawn from the source's own topics and terms, including ones where the user would not name this skill. No line breaks, no angle brackets.
+
+FORMAT:
+---
+name: "${skillName}"
+description: "What this skill does. Use when ..."
+domain: "${safeDomainLabel}"
+content_type: "behavioral skill"
+use_cases: ["3 short situations drawn from the source"]
+---
+
+${spec.sections}
+
+## Other Source Rules & Details
+[Everything else the source states that a user could ask about and that did not fit above: named tools, channels, links, forms, owners, country- or team-specific rules, examples, history. Group it under the source's own topic names, keep exact names and numbers, one bullet each. Skip only boilerplate.]
+
+## Verify This Skill Is Working
+[3 to 4 test requests a user might send, each followed by what a correct answer must contain: a specific rule, number or term from the source.]
 
 CONTENT:
 ${textToSend}`;
@@ -1509,6 +1682,8 @@ ${textToSend}`;
       C: '## Domain Role',
       D: '## Domain Role',
       E: '## Data Scope',
+      F: '## Domain Role', G: '## Analyst Role', H: '## Researcher Role',
+      I: '## Marketer Role', J: '## PM Role', K: '## People-Ops Role',
     };
     const anchor = templateAnchors[tmpl] || templateAnchors.A;
     if (!text.includes(anchor)) {
