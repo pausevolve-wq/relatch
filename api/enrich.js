@@ -69,20 +69,24 @@ const BODY_LIMITS = {
 // domain corpus 2026-10-21: coverage 5.1 -> 6.7, W20/T2/L2 vs 2x, no added latency.
 const SERVER_CHAR_CAP = { small: 3500, medium: 20000, large: 32000 };
 
-// 2026-10-24 (EXPERIMENT, domain templates F-K): a confident domain moves A/C/D into its own
-// template. Gated by env DOMAIN_TEMPLATES (comma list of letters; empty = off, today's behaviour).
-const DOMAIN_TEMPLATE_BY_LABEL = {
-  'legal & compliance': 'F',
-  'economics & policy analysis': 'G', 'finance & financial analysis': 'G',
-  'academic research & writing': 'H',
-  'growth marketing & performance': 'I', 'SEO & search strategy': 'I',
-  'product management': 'J', 'product design & UX': 'J',
-  'HR & people operations': 'K',
+// 2026-10-24 (domain templates F-K): a document moves from A/C/D into its domain's own template
+// only on Jev's reading of the WHOLE document (plan.domain, confidence >= 0.8), never on the
+// frontend's keyword label, so one keyword in the text cannot select F-K. No plan (Jev off, slow
+// or failed) = no F-K. Voice documents (persona/style) stay on A even with a confident domain.
+// Gated by env DOMAIN_TEMPLATES (comma list of letters; empty = off, today's behaviour).
+const DOMAIN_TEMPLATE_BY_JEV = {
+  legal: 'F', economics: 'G', finance: 'G', academic_research: 'H',
+  growth_marketing: 'I', seo: 'I', product_management: 'J', product_design: 'J', hr_people: 'K',
 };
-function routeDomainTemplate(tmpl, label, target) {
+const DOMAIN_TEMPLATE_LETTERS = ['F', 'G', 'H', 'I', 'J', 'K'];
+const DOMAIN_TEMPLATE_CONFIDENCE = 0.8;
+const VOICE_DOC_TYPES = ['persona_writing', 'style_samples', 'style_guide'];
+function routeDomainTemplate(tmpl, plan, target) {
   const on = (process.env.DOMAIN_TEMPLATES || '').split(',').map(x => x.trim()).filter(Boolean);
-  const letter = DOMAIN_TEMPLATE_BY_LABEL[label];
-  if (target === 'codex' || !letter || !on.includes(letter) || !['A', 'C', 'D'].includes(tmpl)) return tmpl;
+  if (target === 'codex' || !on.length || !plan || !plan.domain || !(plan.domain.confidence >= DOMAIN_TEMPLATE_CONFIDENCE)) return tmpl;
+  const letter = DOMAIN_TEMPLATE_BY_JEV[plan.domain.value];
+  if (!letter || !on.includes(letter) || !['A', 'C', 'D'].includes(tmpl)) return tmpl;
+  if (tmpl === 'A' && plan.docType && VOICE_DOC_TYPES.includes(plan.docType.value)) return tmpl;
   return letter;
 }
 
@@ -486,7 +490,7 @@ module.exports = async function handler(req, res) {
   // Jev may override A/C/D on a confident doc-type answer; B and E are never touched.
   // 2026-09-26: B now joins routing behind a double lock (Jev >= 0.9 AND code-like lines
   // counted in code) - see routeTemplate in lib/planner.js. E is still never touched.
-  const activeTemplate = routeDomainTemplate(routeTemplate(template || 'A', plan, activeTarget), safeDomainLabel, activeTarget);
+  const activeTemplate = routeDomainTemplate(routeTemplate(template || 'A', plan, activeTarget), plan, activeTarget);
   // Routed INTO B: the signal-line filter above ran with the client's template (it must read
   // `template`, not `activeTemplate` - TDZ rule) and drops most code-shaped lines on A/C/D.
   // Give B the unfiltered source instead, capped the same way. The filter itself is untouched.
@@ -1075,7 +1079,7 @@ Otherwise use bullets. Domain-specific rules only — no generic professional ad
 CONTENT:
 ${textToSend}`;
 
-  } else if (['F', 'G', 'H', 'I', 'J', 'K'].includes(activeTemplate)) {
+  } else if (DOMAIN_TEMPLATE_LETTERS.includes(activeTemplate)) {
     // ── TEMPLATES F-K: domain templates (2026-10-24 EXPERIMENT, vault plan section 6) ──
     // Shared rules carry Step D's loosening (quote where wording matters, keep the source's own
     // structure, tables only for real comparisons); each letter has its own sections + guardrail.
@@ -1776,6 +1780,10 @@ ${textToSend}`;
     const rich = (planSummary.rich || []).length, lowSignal = planSummary.low_signal;
     const base = { rich, lowSignal, csvRows: null };
     if (lowSignal >= HARD_LANE_RULES.maxLowSignal) return { ...base, lane: 'normal', why: 'low_signal' };
+    // 2026-10-24: domain templates F-K always take the hard lane. On the 24-doc domain corpus
+    // F-K on DeepSeek V4.1 Flash matched native Claude (judge z 0.00 vs +0.03) where Flash-Lite
+    // did not (-0.41), and beat GLM-5.3 10/4/2 with neutral judges, so the chain order stays.
+    if (DOMAIN_TEMPLATE_LETTERS.includes(effectiveTemplate)) return { ...base, lane: 'complex', why: 'domain_template' };
     // Template E: only text that really parses as a numeric CSV table counts (code review: the
     // client sets `template`, so 20 lines of prose sent as 'E' must not force the paid lane).
     // Anything else falls through to the general rule below.
