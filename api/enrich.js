@@ -1,5 +1,5 @@
 const { verifyToken, createClerkClient } = require('@clerk/backend');
-const { reserveRun, quotaReachedBody } = require('../lib/usage-limits');
+const { reserveRun, quotaReachedBody, isSessionComplete } = require('../lib/usage-limits');
 const clerkClient = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
 const { Redis } = require('@upstash/redis');
 const redis = (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN)
@@ -110,6 +110,9 @@ function routeDomainTemplate(tmpl, plan, target) {
   return letter;
 }
 
+// 2026-10-25: answered for a session whose skill was already downloaded (api/session-complete.js).
+const SESSION_COMPLETE_BODY = { error: 'SESSION_COMPLETE', message: 'This skill is complete. Start a new skill to add more documents.' };
+
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', 'https://app.relatch.online');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
@@ -190,6 +193,12 @@ module.exports = async function handler(req, res) {
       if (validToken === null) {
         await logToAxiom({ endpoint: 'enrich', status: 401, reason: 'anon_token_invalid', ip: req.headers['x-forwarded-for'] || null });
         return res.status(401).json({ error: 'ANON_TOKEN_INVALID' });
+      }
+      // The trial's skill was downloaded: its session is shut. A store error here falls into
+      // the fail-closed catch below, like every other check in this block.
+      if (await isSessionComplete(redis, { anonToken })) {
+        await logToAxiom({ endpoint: 'enrich', status: 409, reason: 'session_complete', ip: req.headers['x-forwarded-for'] || null });
+        return res.status(409).json(SESSION_COMPLETE_BODY);
       }
       // Claim atomically via SET NX (same primitive anon-token.js already uses to issue the
       // token itself) rather than GET-then-conditional-SET — a plain read-then-write here
@@ -308,6 +317,12 @@ module.exports = async function handler(req, res) {
   // the trial token's run claim and ANON_MAX_ENRICH_CALLS above instead.
   if (!isAnonymousRequest) {
     try {
+      // Checked before the reservation, so a refused document costs no credit. A store error
+      // falls into the same fail-closed 503 as the quota itself.
+      if (await isSessionComplete(redis, { userId, sessionId })) {
+        await logToAxiom({ endpoint: 'enrich', status: 409, reason: 'session_complete', userId, ip: req.headers['x-forwarded-for'] || null });
+        return res.status(409).json(SESSION_COMPLETE_BODY);
+      }
       const quota = await reserveRun(redis, { userId, sessionId, kind: 'gen' });
       if (!quota.allowed) {
         await logToAxiom({ endpoint: 'enrich', status: 429, reason: 'quota_reached', limitType: quota.limitType, userId, ip: req.headers['x-forwarded-for'] || null });
