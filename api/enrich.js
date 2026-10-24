@@ -507,6 +507,8 @@ module.exports = async function handler(req, res) {
   // 2026-10-21: Jev corrects a domain the frontend's keyword detection got wrong (see
   // routeDomain in lib/planner.js). No plan, an unconfident answer, or agreement with the
   // client leaves domainLabel/domainRole/domainFrame exactly as the request sent them.
+  // 2026-10-24: except an unconfident answer that DISAGREES with the client's label: that one
+  // now gets the neutral label (routeDomain `neutral`) instead of the keyword guess.
   const routedDomain = routeDomain({ label: domainLabel, role: domainRole, frame: domainFrame }, plan, target === 'codex' ? 'codex' : 'claude');
   const safeDomainLabel = routedDomain.label || 'General';
   const safeDomainRole = routedDomain.role || 'an expert';
@@ -1479,7 +1481,7 @@ ${textToSend}`;
   if (selection.spread && textToSend === selection.text) prompt = SPREAD_NOTE + prompt;
   if (planDirectives) prompt = planDirectives + prompt;
   const planSummary = plan
-    ? summarizePlan(plan, { clientTemplate: template || 'A', template: activeTemplate, clientShape: clientCodexShape, codexShape: activeCodexShape, target: activeTarget, domainChanged: routedDomain.changed })
+    ? summarizePlan(plan, { clientTemplate: template || 'A', template: activeTemplate, clientShape: clientCodexShape, codexShape: activeCodexShape, target: activeTarget, domainChanged: routedDomain.changed, domainSource: routedDomain.source })
     : null;
   if (planSummary) console.log('[plan]', planSummary);
   const contentSummary = contentMap ? summarizeContent(contentMap, selection.spread && textToSend === selection.text) : null;
