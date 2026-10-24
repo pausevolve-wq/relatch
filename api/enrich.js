@@ -65,9 +65,12 @@ const BODY_LIMITS = {
 // and no added latency; 4x added nothing over 2x. App.tsx now asks for 2x on the Claude target
 // (10000 medium, a 16000-char sample for large; Codex and small unchanged), so the ceilings come
 // down to exactly 2x: nothing beyond what the app uses is accepted.
-// 2026-10-24 (Step C, domain templates plan): medium/large back to 4x. Measured on the 24-doc
-// domain corpus 2026-10-21: coverage 5.1 -> 6.7, W20/T2/L2 vs 2x, no added latency.
-const SERVER_CHAR_CAP = { small: 3500, medium: 20000, large: 32000 };
+const SERVER_CHAR_CAP = { small: 3500, medium: 10000, large: 16000 };
+// 2026-10-24 (Step C, domain templates plan): 4x, for templates F-K ONLY. Measured on the 24-doc
+// domain corpus 2026-10-21: coverage 5.1 -> 6.7, W20/T2/L2 vs 2x, no added latency. Every other
+// template keeps SERVER_CHAR_CAP above. Server-owned fixed values: medium documents arrive whole,
+// large ones arrive already sampled by App.tsx, so this never reads more than the request sent.
+const DOMAIN_CHAR_CAP = { small: 3500, medium: 20000, large: 32000 };
 
 // 2026-10-24 (domain templates F-K): a document moves from A/C/D into its domain's own template
 // only on Jev's reading of the WHOLE document (plan.domain, confidence >= 0.8), never on the
@@ -389,7 +392,7 @@ module.exports = async function handler(req, res) {
   // Content fidelity (2026-09-26): with a content map, an over-cap text is no longer cut to its
   // head - whole-line chunks are picked evenly from start to end (spreadSelect). No map = the
   // original head slice, byte for byte.
-  const selection = contentMap ? spreadSelect(filteredText, effectiveCharCap) : { text: filteredText.slice(0, effectiveCharCap), spread: false };
+  let selection = contentMap ? spreadSelect(filteredText, effectiveCharCap) : { text: filteredText.slice(0, effectiveCharCap), spread: false };
   let textToSend = selection.text;
 
   // ── ADAPTIVE OUTPUT BUDGET ────────────────────────────────────────────────
@@ -408,10 +411,16 @@ module.exports = async function handler(req, res) {
   // The Jev depth boost (x1.5) still applies on top. flash keeps its +700 OpenRouter pad below.
   const tokenBudgets = {
     small:  { lite: 1600, flash: 1600 },
-    medium: { lite: 3600, flash: 3200 },  // 2026-10-24 Step C (was 2000/1800)
-    large:  { lite: 4400, flash: 4000 },  // 2026-10-24 Step C (was 2600/2200)
+    medium: { lite: 2000, flash: 1800 },
+    large:  { lite: 2600, flash: 2200 },
   };
-  const budgetForSize = tokenBudgets[effectiveSizeClass] || tokenBudgets.small;
+  // `let`: templates F-K swap in their own budgets once routed (see activeTemplate below).
+  let budgetForSize = tokenBudgets[effectiveSizeClass] || tokenBudgets.small;
+  // 2026-10-24 Step C, templates F-K only (measured with these; A-E keep the table above).
+  const DOMAIN_TOKEN_BUDGETS = {
+    medium: { lite: 3600, flash: 3200 },
+    large:  { lite: 4400, flash: 4000 },
+  };
   // ─────────────────────────────────────────────────────────────────────────
 
   // ── DOCUMENT CONTEXT HEADER ───────────────────────────────────────────────
@@ -496,6 +505,14 @@ module.exports = async function handler(req, res) {
   // Give B the unfiltered source instead, capped the same way. The filter itself is untouched.
   // (2026-09-26: from sourceText, so removed page furniture stays removed.)
   if (activeTemplate === 'B' && template !== 'B') textToSend = sourceText.slice(0, effectiveCharCap);
+  // Routed INTO F-K: re-select from the same filtered text with the Step C ceilings and budgets the
+  // templates were measured with. `selection` is replaced too, so the spread note stays correct.
+  if (DOMAIN_TEMPLATE_LETTERS.includes(activeTemplate)) {
+    const domainCap = DOMAIN_CHAR_CAP[effectiveSizeClass];
+    selection = contentMap ? spreadSelect(filteredText, domainCap) : { text: filteredText.slice(0, domainCap), spread: false };
+    textToSend = selection.text;
+    budgetForSize = DOMAIN_TOKEN_BUDGETS[effectiveSizeClass] || budgetForSize;
+  }
   // v2.1: when targeting Codex, override template selection to the CODEX prompt + scoring path
   const effectiveTemplate = activeTarget === 'codex' ? 'CODEX' : activeTemplate;
 
@@ -693,7 +710,9 @@ module.exports = async function handler(req, res) {
     if (genericCount <= 3) score += 1;
 
     // +1: Rich format present (soft check, template-aware)
-    if (['C', 'D', 'F', 'G', 'H', 'I', 'J', 'K'].includes(tmpl)) {
+    if (tmpl === 'D' || tmpl === 'C') {
+      if (text.includes('|')) score += 1;
+    } else if (['F', 'G', 'H', 'I', 'J', 'K'].includes(tmpl)) {
       if (text.includes('|') || text.includes('## Verify This Skill Is Working')) score += 1;
     } else if (tmpl === 'B') {
       if (text.includes('```')) score += 1;
