@@ -1197,6 +1197,8 @@ RULES:
 - Keep the source's own terms, numbers, thresholds, names and references exact. Quote a short phrase verbatim when the precise wording matters (a definition, a rule, a threshold); otherwise write direct instructions.
 - Follow the document's own structure and order where it has one. Use a markdown TABLE only where the source compares 3 or more items across consistent attributes; otherwise use bullets.
 - Cover every topic the source spends real space on. Do not let minor or boilerplate material crowd it out. Do not pad.
+- Write rules as decisions Claude can apply, not as a summary: for each rule say when it applies, what to do, and the exception or limit if the source gives one (e.g. "If X, then Y, unless Z."). Turn descriptions into instructions.
+- If the source describes a current process and an older, archived or superseded one, keep them apart and say which one is current. Never merge their steps.
 - If the source has nothing for a section, leave that section out entirely (heading included). Never keep an empty or "not present" section. The first two sections are always required.
 - You MUST start your response exactly with the YAML block below, no code fences, no backticks, no preamble.
 - You MUST enclose all YAML values in double quotes.
@@ -1213,6 +1215,9 @@ use_cases: ["3 short situations drawn from the source"]
 ---
 
 ${spec.sections}
+
+## How to Apply This Skill
+[3 to 6 numbered steps Claude follows when a user brings a request in this domain: what to check or ask first, which rules above decide it, when to escalate to a named owner, and when to say the source does not cover it.]
 
 ## Other Source Rules & Details
 [Everything else the source states that a user could ask about and that did not fit above: named tools, channels, links, forms, owners, country- or team-specific rules, examples, history. Group it under the source's own topic names, keep exact names and numbers, one bullet each. Skip only boilerplate.]
