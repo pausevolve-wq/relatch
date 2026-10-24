@@ -72,6 +72,23 @@ const SERVER_CHAR_CAP = { small: 3500, medium: 10000, large: 16000 };
 // large ones arrive already sampled by App.tsx, so this never reads more than the request sent.
 const DOMAIN_CHAR_CAP = { small: 3500, medium: 20000, large: 32000 };
 
+// 2026-10-24 (F-K large documents): App.tsx samples a large document as start + middle + end, each
+// floor(cap / 3) chars, joined by LARGE_SAMPLE_SEP (sampleLargeDocument). A sample at cap 32000
+// contains the sample at cap 16000 at fixed offsets, so the server rebuilds that 16000 sample
+// byte for byte: Jev, the content map, the filter, routing and templates A-E see exactly what
+// they saw when the app sent 16000. Only F-K read the 32000 sample (after routing, below).
+// Anything that is not exactly that shape returns null and the request is used as sent.
+const LARGE_SAMPLE_SEP = '\n\n...[content continues]...\n\n';
+function shrinkLargeSample(text, bigCap, smallCap) {
+  const cb = Math.floor(bigCap / 3), cs = Math.floor(smallCap / 3), n = LARGE_SAMPLE_SEP.length;
+  if (typeof text !== 'string' || cs > cb || text.length !== 3 * cb + 2 * n) return null;
+  if (text.slice(cb, cb + n) !== LARGE_SAMPLE_SEP || text.slice(2 * cb + n, 2 * cb + 2 * n) !== LARGE_SAMPLE_SEP) return null;
+  const start = text.slice(0, cb), middle = text.slice(cb + n, 2 * cb + n), end = text.slice(2 * cb + 2 * n);
+  // middle chunks are centred on the same point: floor(L/2) - floor(chunk/2) in App.tsx
+  const off = Math.floor(cb / 2) - Math.floor(cs / 2);
+  return start.slice(0, cs) + LARGE_SAMPLE_SEP + middle.slice(off, off + cs) + LARGE_SAMPLE_SEP + end.slice(cb - cs);
+}
+
 // 2026-10-24 (domain templates F-K): a document moves from A/C/D into its domain's own template
 // only on Jev's reading of the WHOLE document (plan.domain, confidence >= 0.8), never on the
 // frontend's keyword label, so one keyword in the text cannot select F-K. No plan (Jev off, slow
@@ -220,7 +237,14 @@ module.exports = async function handler(req, res) {
   // Old fields remain exactly the same — backward compatible if frontend hasn't updated yet
   // richFormats: consumed by Claude prompt templates only. Codex path uses codexSourceHint
   // pre-scan (v2.2.1) for dynamic structure detection — intentionally unused on Codex path.
-  const { rawText, category, fileName, domainLabel, domainRole, domainFrame, template, richFormats, charCap, sizeClass, target = 'claude', codexShape = 'execute', sessionId } = req.body;
+  const { rawText: requestText, category, fileName, domainLabel, domainRole, domainFrame, template, richFormats, charCap, sizeClass, target = 'claude', codexShape = 'execute', sessionId } = req.body;
+  // 2026-10-24 (F-K large documents, see shrinkLargeSample): a Claude large document sampled at
+  // 32000 is reduced to the 16000 sample for everything except templates F-K. charCap 32000 is
+  // then clamped to SERVER_CHAR_CAP.large (16000) below, exactly as the app's old 16000.
+  const largeSampleShrunk = target !== 'codex' && sizeClass === 'large' && Math.floor(Number(charCap)) === DOMAIN_CHAR_CAP.large
+    ? shrinkLargeSample(requestText, DOMAIN_CHAR_CAP.large, SERVER_CHAR_CAP.large) : null;
+  const rawText = largeSampleShrunk || requestText;
+  const domainLargeSample = largeSampleShrunk ? requestText : null; // only templates F-K read it
   if (!rawText || !category || !fileName) {
     await logToAxiom({ endpoint: 'enrich', status: 400, reason: 'missing_fields', userId, ip: req.headers['x-forwarded-for'] || null });
     return res.status(400).json({ error: 'Missing required fields' });
@@ -338,7 +362,8 @@ module.exports = async function handler(req, res) {
   // 2026-09-26: reads sourceText (rawText with page furniture removed by the content map, or
   // rawText itself when there is no map) - see the JEV LAYER block above.
   const allLines = sourceText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-  const signalLines = allLines.filter(line =>
+  // 2026-10-24: named (was inline) so templates F-K can apply the same filter to a large sample.
+  const isSignalLine = line =>
     line.length > 20 && (
       /\d/.test(line) ||
       /\b(always|never|use|create|build|write|make|avoid|ensure|must|should|start|end|keep|focus|lead|design|follow|apply|open|close|prefer|every|each)\b/i.test(line) ||
@@ -366,8 +391,8 @@ module.exports = async function handler(req, res) {
         /[{};]|=>|::|->/.test(line) ||
         /^\s*(\/\/|\/\*|\*\s|#\s)/.test(line)
       ))
-    )
-  );
+    );
+  const signalLines = allLines.filter(isSignalLine);
 
   const filteredText = signalLines.length >= 5 ? signalLines.join('\n') : sourceText;
 
@@ -419,7 +444,9 @@ module.exports = async function handler(req, res) {
   // 2026-10-24 Step C, templates F-K only (measured with these; A-E keep the table above).
   const DOMAIN_TOKEN_BUDGETS = {
     medium: { lite: 3600, flash: 3200 },
-    large:  { lite: 4400, flash: 4000 },
+    // 2026-10-24: large 4400/4000 -> 5700/5300 for 32000-char samples (max_tokens 5700 x 1.5 +
+    // 1500 = 10050 vs a p95 of ~8.5k; slow-host time ~64 s < the 75 s hard-lane timeout).
+    large:  { lite: 5700, flash: 5300 },
   };
   // ─────────────────────────────────────────────────────────────────────────
 
@@ -509,7 +536,15 @@ module.exports = async function handler(req, res) {
   // templates were measured with. `selection` is replaced too, so the spread note stays correct.
   if (DOMAIN_TEMPLATE_LETTERS.includes(activeTemplate)) {
     const domainCap = DOMAIN_CHAR_CAP[effectiveSizeClass];
-    selection = contentMap ? spreadSelect(filteredText, domainCap) : { text: filteredText.slice(0, domainCap), spread: false };
+    if (domainLargeSample) {
+      const kept = contentMap ? new Set(sourceText.split('\n')) : null;
+      const furniture = kept ? new Set(rawText.split('\n').filter(l => !kept.has(l))) : null;
+      const source32 = furniture && furniture.size ? domainLargeSample.split('\n').filter(l => !furniture.has(l)).join('\n') : domainLargeSample;
+      const signal32 = source32.split('\n').map(l => l.trim()).filter(l => l.length > 0).filter(isSignalLine);
+      selection = spreadSelect(signal32.length >= 5 ? signal32.join('\n') : source32, domainCap);
+    } else {
+      selection = contentMap ? spreadSelect(filteredText, domainCap) : { text: filteredText.slice(0, domainCap), spread: false };
+    }
     textToSend = selection.text;
     budgetForSize = DOMAIN_TOKEN_BUDGETS[effectiveSizeClass] || budgetForSize;
   }
@@ -1864,7 +1899,7 @@ ${textToSend}`;
   // Inspected exactly as calibrated: sanitize()d text against the full source (rawText).
   let gateCtxCache = null;
   const gateCtx = () => gateCtxCache || (gateCtxCache = {
-    template: effectiveTemplate, shape: activeCodexShape, source: rawText,
+    template: effectiveTemplate, shape: activeCodexShape, source: domainLargeSample && DOMAIN_TEMPLATE_LETTERS.includes(effectiveTemplate) ? domainLargeSample : rawText,
     // the prompt minus the document it carries (the source is already `source`)
     vocab: [textToSend ? prompt.split(textToSend).join(' ') : prompt, fileName, domainLabel, domainRole, domainFrame].filter(Boolean).join('\n'),
   });
