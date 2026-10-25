@@ -11,7 +11,7 @@ const axiomClient = process.env.AXIOM_TOKEN
   : null;
 // Jev planning layer (2026-09-26): fail-open typed decisions about the document before
 // template routing. See lib/planner.js - every export is a no-op on a null plan.
-const { planDocument, routeTemplate, routeCodexShape, routeDomain, buildPlanDirectives, buildFacetModules, summarizePlan, mapContent, spreadSelect, SPREAD_NOTE, summarizeContent } = require('../lib/planner');
+const { planDocument, detectDeliverable, routeTemplate, routeCodexShape, routeDomain, buildPlanDirectives, buildFacetModules, summarizePlan, mapContent, spreadSelect, SPREAD_NOTE, summarizeContent } = require('../lib/planner');
 // Parachute Gating (2026-09-28): deterministic quality gate, SHADOW mode only for now (see the
 // PARACHUTE block before the model loop). Pure functions; lib/parachute.js has no I/O.
 // 2026-10-03: P3 (PARACHUTE_MODE=enforce) and P4 (=escalate) let it act on what is served.
@@ -51,6 +51,9 @@ async function logToAxiom(event) {
 const BODY_LIMITS = {
   rawText: 120000, fileName: 255, category: 40, domainLabel: 100, domainRole: 400, domainFrame: 400,
   template: 20, sizeClass: 20, target: 20, codexShape: 40, sessionId: 128,
+  // 2026-10-25: Codex only - the whole document (App.tsx: up to 20000 medium / a 32000 sample large),
+  // read by DELIVERABLE auto-detection and, when it fires, by the DELIVERABLE prompt.
+  fullText: 40000,
 };
 // The server's ceiling on how much source text one generation prompt may carry, per size class.
 // Equal to what App.tsx sends as charCap today; the input-cap study may raise them. The legacy
@@ -71,6 +74,11 @@ const SERVER_CHAR_CAP = { small: 3500, medium: 10000, large: 16000 };
 // template keeps SERVER_CHAR_CAP above. Server-owned fixed values: medium documents arrive whole,
 // large ones arrive already sampled by App.tsx, so this never reads more than the request sent.
 const DOMAIN_CHAR_CAP = { small: 3500, medium: 20000, large: 32000 };
+// 2026-10-25 (Codex DELIVERABLE auto-detection): route to DELIVERABLE when detectDeliverable() on the
+// full text is at least this sure. Measured on 48 labelled docs (2 runs, scores moved <= 0.04):
+// templates 0.94-0.96, highest non-deliverable 0.62, so 0.8 sits mid-gap - 4/10 recall, 0/38 false
+// positives. Precision first: a miss gets the normal Codex output, a false fire gets a worse one.
+const DELIVERABLE_AUTO_P = 0.8;
 
 // 2026-10-24 (F-K large documents): App.tsx samples a large document as start + middle + end, each
 // floor(cap / 3) chars, joined by LARGE_SAMPLE_SEP (sampleLargeDocument). A sample at cap 32000
@@ -237,7 +245,9 @@ module.exports = async function handler(req, res) {
   // Old fields remain exactly the same — backward compatible if frontend hasn't updated yet
   // richFormats: consumed by Claude prompt templates only. Codex path uses codexSourceHint
   // pre-scan (v2.2.1) for dynamic structure detection — intentionally unused on Codex path.
-  const { rawText: requestText, category, fileName, domainLabel, domainRole, domainFrame, template, richFormats, charCap, sizeClass, target = 'claude', codexShape = 'execute', sessionId } = req.body;
+  const { rawText: requestText, category, fileName, domainLabel, domainRole, domainFrame, template, richFormats, charCap, sizeClass, target = 'claude', codexShape = 'execute', sessionId, fullText: requestFullText } = req.body;
+  // 2026-10-25: the whole document, sent by the app for Codex only (see BODY_LIMITS.fullText).
+  const codexFullText = target === 'codex' && typeof requestFullText === 'string' && requestFullText.trim() ? requestFullText : null;
   // 2026-10-24 (F-K large documents, see shrinkLargeSample): a Claude large document sampled at
   // 32000 is reduced to the 16000 sample for everything except templates F-K. charCap 32000 is
   // then clamped to SERVER_CHAR_CAP.large (16000) below, exactly as the app's old 16000.
@@ -343,9 +353,11 @@ module.exports = async function handler(req, res) {
         : charCap >= 5000
           ? 'medium'
           : 'small';
-  const [plan, contentMap] = await Promise.all([
+  const [plan, contentMap, deliverableP] = await Promise.all([
     planDocument({ text: rawText, fileName, category, sizeClass: effectiveSizeClass, target: target === 'codex' ? 'codex' : 'claude' }),
     mapContent({ text: rawText, fileName, template }),
+    // 2026-10-25: DELIVERABLE auto-detection, its own Jev call on the full text (fail open: null).
+    codexFullText && codexShape !== 'deliverable' ? detectDeliverable({ text: codexFullText, fileName }) : Promise.resolve(null),
   ]);
   // Furniture removed (whole original lines, original order); rawText when no map.
   const sourceText = contentMap ? contentMap.text : rawText;
@@ -564,13 +576,16 @@ module.exports = async function handler(req, res) {
   // Jev may override the regex-derived shape on a confident answer (Codex target only).
   // 2026-10-25 (DELIVERABLE v3): the app sends deliverable only when the user explicitly picks it, so
   // Jev may not override that choice (it moved 3 of 8 explicit requests to specialist in testing).
-  const activeCodexShape = clientCodexShape === 'deliverable' ? 'deliverable' : routeCodexShape(clientCodexShape, plan, activeTarget);
+  // 2026-10-25: ...and when the full text was sent, DELIVERABLE is auto-detected (DELIVERABLE_AUTO_P).
+  const deliverableAuto = activeTarget === 'codex' && typeof deliverableP === 'number' && deliverableP >= DELIVERABLE_AUTO_P;
+  const activeCodexShape = clientCodexShape === 'deliverable' || deliverableAuto ? 'deliverable' : routeCodexShape(clientCodexShape, plan, activeTarget);
   // 2026-10-25 (DELIVERABLE v3): this shape is built on the document's structure, so it reads the
   // unfiltered source (page furniture removed, every line kept) up to the F-K ceiling
   // (DOMAIN_CHAR_CAP: 20000 medium / 32000 large) instead of the signal-filtered 10000 / 16000.
   if (activeTarget === 'codex' && activeCodexShape === 'deliverable') {
     const dlvCap = Math.min(Number.isFinite(clientCharCap) && clientCharCap >= 1000 ? clientCharCap : SERVER_CHAR_CAP[effectiveSizeClass], DOMAIN_CHAR_CAP[effectiveSizeClass]);
-    selection = contentMap ? spreadSelect(sourceText, dlvCap) : { text: sourceText.slice(0, dlvCap), spread: false };
+    // 2026-10-25: the app's full text when sent (the distilled rawText lacks the structure).
+    selection = codexFullText ? spreadSelect(codexFullText, dlvCap) : contentMap ? spreadSelect(sourceText, dlvCap) : { text: sourceText.slice(0, dlvCap), spread: false };
     textToSend = selection.text;
   }
   // Depth boost: x1.5 output tokens only when Jev is confident the source is dense.
@@ -1566,6 +1581,7 @@ ${textToSend}`;
   const planSummary = plan
     ? summarizePlan(plan, { clientTemplate: template || 'A', template: activeTemplate, clientShape: clientCodexShape, codexShape: activeCodexShape, target: activeTarget, domainChanged: routedDomain.changed, domainSource: routedDomain.source })
     : null;
+  if (planSummary && typeof deliverableP === 'number') planSummary.deliverable_p = Math.round(deliverableP * 100) / 100;
   if (planSummary) console.log('[plan]', planSummary);
   const contentSummary = contentMap ? summarizeContent(contentMap, selection.spread && textToSend === selection.text) : null;
   if (contentSummary) console.log('[content]', contentSummary);
@@ -2457,7 +2473,7 @@ ${textToSend}`;
       rich: routeDecision.rich ?? null, lowSignal: routeDecision.lowSignal ?? null, csvRows: routeDecision.csvRows ?? null,
       target: activeTarget, template: effectiveTemplate, sizeClass: effectiveSizeClass,
       chain: modelList.map((m) => m.id), served, model: served === 'model' ? successfulModel : null,
-      gateId, ms: Date.now() - requestStartMs,
+      gateId, deliverableP: typeof deliverableP === 'number' ? deliverableP : null, ms: Date.now() - requestStartMs,
     };
     const run = async () => {
       await new Promise((resolve) => setImmediate(resolve)); // let the reply go out first
