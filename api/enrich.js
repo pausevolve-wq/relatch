@@ -972,7 +972,7 @@ REQUIRED SECTIONS (in this order):
 2-4 sentences from the source: what this document is, who reads it, and what decision or action it serves. Name the document the way the source names it.
 
 ## Intake
-Only the inputs the source itself names (data, owners, dates, prior versions, approvals), as bullets. Mark the ones Codex should ask the user for only when they are missing. Ask only about what changes the document (audience, scope, depth). SKIP ENTIRELY if the source names no inputs - never invent them.
+Only the inputs the source itself names (data, owners, dates, prior versions, approvals), as bullets. End each input the user must supply with "(ask the user if missing)"; inputs Codex can find itself need no marker. Ask only about what changes the document (audience, scope, depth). SKIP ENTIRELY if the source names no inputs - never invent them.
 
 ## Drafting Workflow   [REQUIRED]
 5-8 numbered steps Codex follows to produce the document: confirm the intake, gather the source material, draft each spine section in order, apply the evidence rules, run the QA list, then hand over the draft with its open items. Make every step specific to this document (name the sections, owners, tools, reviewers or deadlines the source gives). Carry the source's own logistics into the steps: schedules, meetings, attendee or participant lists, channels, checklists and hand-offs it describes.
