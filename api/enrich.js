@@ -562,7 +562,17 @@ module.exports = async function handler(req, res) {
   const allowedShapes = ['execute', 'expertise', 'specialist', 'deliverable'];
   const clientCodexShape = allowedShapes.includes(codexShape) ? codexShape : 'execute';
   // Jev may override the regex-derived shape on a confident answer (Codex target only).
-  const activeCodexShape = routeCodexShape(clientCodexShape, plan, activeTarget);
+  // 2026-10-25 (DELIVERABLE v3): the app sends deliverable only when the user explicitly picks it, so
+  // Jev may not override that choice (it moved 3 of 8 explicit requests to specialist in testing).
+  const activeCodexShape = clientCodexShape === 'deliverable' ? 'deliverable' : routeCodexShape(clientCodexShape, plan, activeTarget);
+  // 2026-10-25 (DELIVERABLE v3): this shape is built on the document's structure, so it reads the
+  // unfiltered source (page furniture removed, every line kept) up to the F-K ceiling
+  // (DOMAIN_CHAR_CAP: 20000 medium / 32000 large) instead of the signal-filtered 10000 / 16000.
+  if (activeTarget === 'codex' && activeCodexShape === 'deliverable') {
+    const dlvCap = Math.min(Number.isFinite(clientCharCap) && clientCharCap >= 1000 ? clientCharCap : SERVER_CHAR_CAP[effectiveSizeClass], DOMAIN_CHAR_CAP[effectiveSizeClass]);
+    selection = contentMap ? spreadSelect(sourceText, dlvCap) : { text: sourceText.slice(0, dlvCap), spread: false };
+    textToSend = selection.text;
+  }
   // Depth boost: x1.5 output tokens only when Jev is confident the source is dense.
   // Claude only - Codex prompts keep a deliberate word budget. No plan = exactly today's budgets.
   // 2026-09-26: both targets now. The token cap is only a ceiling - Codex's prompt word budget
@@ -665,10 +675,10 @@ module.exports = async function handler(req, res) {
         if (text.includes('## Review Workflow')) score += 1;
         if (text.includes('## Key Principles')) score += 1;
       } else if (activeCodexShape === 'deliverable') {
-        // 2026-10-25: DELIVERABLE rewards the spine and the QA list first, then goal + intake,
+        // 2026-10-25: DELIVERABLE rewards the spine and the QA list first, then goal + drafting workflow (v3: Intake is optional),
         // a spine with real items (3+ list entries), and Key Principles.
         if (text.includes('## Document Spine') && text.includes('## QA Before Delivering')) score += 2;
-        if (text.includes('## Goal') && text.includes('## Intake')) score += 1;
+        if (text.includes('## Goal') && text.includes('## Drafting Workflow')) score += 1;
         const spineBlock = (text.split('## Document Spine')[1] || '').split('\n## ')[0];
         if ((spineBlock.match(/^\s*(\d+[.)]|[-*])\s+\S/gm) || []).length >= 3) score += 1;
         if (text.includes('## Key Principles')) score += 1;
@@ -937,7 +947,7 @@ ${codexDescRule}
 - Do NOT wrap in code fences. Start your response with --- on line 1.
 - Do NOT add domain, origin, content_type, use_cases, or any other YAML field.
 
-CONTENT BUDGET: Target 900-1500 words. If approaching the upper range, prioritize completing all REQUIRED sections over depth in any single section.
+CONTENT BUDGET: Target 900-1500 words. Spend most of them on the Document Spine and the Drafting Workflow - that is where the source's detail belongs. If approaching the upper range, prioritize completing all REQUIRED sections over depth in any single section.
 ${codexSourceHint}
 ${codexBodyRule}
 
@@ -946,17 +956,17 @@ REQUIRED SECTIONS (in this order):
 ## Goal   [REQUIRED]
 2-4 sentences from the source: what this document is, who reads it, and what decision or action it serves. Name the document the way the source names it.
 
-## Intake   [REQUIRED]
-The inputs Codex must have before drafting (data, owners, dates, prior versions, approvals), as bullets. Mark the ones Codex should ask the user for only when they are missing. Ask only about what changes the document (audience, scope, depth); never ask about what the source already fixes.
+## Intake
+Only the inputs the source itself names (data, owners, dates, prior versions, approvals), as bullets. Mark the ones Codex should ask the user for only when they are missing. Ask only about what changes the document (audience, scope, depth). SKIP ENTIRELY if the source names no inputs - never invent them.
 
 ## Drafting Workflow   [REQUIRED]
-5-8 numbered steps Codex follows to produce the document: confirm the intake, gather the source material, draft each spine section in order, apply the evidence rules, run the QA list, then hand over the draft with its open items. Make every step specific to this document (name the sections, owners, tools, reviewers or deadlines the source gives).
+5-8 numbered steps Codex follows to produce the document: confirm the intake, gather the source material, draft each spine section in order, apply the evidence rules, run the QA list, then hand over the draft with its open items. Make every step specific to this document (name the sections, owners, tools, reviewers or deadlines the source gives). Carry the source's own logistics into the steps: schedules, meetings, attendee or participant lists, channels, checklists and hand-offs it describes.
 
 ## Document Spine   [REQUIRED]
-The document's sections in order, as a numbered list, using the source's own section names. Keep them INSIDE this list (sub-bullets for detail): do not add the document's sections as separate ## sections of this skill. For each: what goes in it, the required elements, and any length, format, owner or deadline the source states. If the source is a finished example rather than a template, derive the spine from its actual structure. If the source contains a fill-in template, end this section with its skeleton (headings and one-line guidance) in a fenced \`\`\`markdown block, keeping the source's placeholders.
+The document's sections in order, as a numbered list, using the source's own section names. Every item MUST be a section that actually appears in the source (a heading, a template field, or a part of the finished example); if the source shows fewer than 3, list the ones it shows and say the rest are not defined in the source - never invent a section. Keep them INSIDE this list (sub-bullets for detail): do not add the document's sections as separate ## sections of this skill. For each: what goes in it, the required elements, and any length, format, owner or deadline the source states. If the source is a finished example rather than a template, derive the spine from its actual structure. If the source contains a fill-in template, end this section with its skeleton (headings and one-line guidance) in a fenced \`\`\`markdown block, keeping the source's placeholders.
 
 ## Evidence Rules
-How facts, figures, dates and names must be sourced and labelled in this document. Codex never invents numbers, names, dates, quotes or results; anything missing is marked as an open item for its owner. Skip only if the source is silent and there is nothing document-specific to say.
+How facts, figures, dates and names must be sourced and labelled in this document, as the source states it. Codex never invents numbers, names, dates, quotes or results; anything missing is marked as an open item for its owner. SKIP ENTIRELY if the source says nothing about sources, data or evidence.
 
 ## Format & Delivery
 Only what the source states: file type or tool, where the template lives, naming, reviewers and approvals, audience, cadence and deadlines. SKIP ENTIRELY if the source states none of these.
@@ -1774,6 +1784,9 @@ ${textToSend}`;
         if (!text.includes('## Document Spine')) {
           text += '\n\n## Document Spine\n[Review source document and list the sections of the document in order.]';
         }
+        if (!text.includes('## Drafting Workflow')) {
+          text += '\n\n## Drafting Workflow\n[Review source document and define the numbered steps to produce the document.]';
+        }
         if (!text.includes('## QA Before Delivering')) {
           text += '\n\n## QA Before Delivering\n[Review source document and define the checks to run on the draft before delivering it.]';
         }
@@ -2571,8 +2584,8 @@ ${textToSend}`;
         '## Goal',
         `Produce the ${safeDomainLabel} document described in the source material, in its structure.`,
         '',
-        '## Intake',
-        '- Confirm the audience, scope and deadline before drafting.',
+        '## Drafting Workflow',
+        '1. Confirm the audience, scope and deadline.', '2. Draft each spine section in order from the source.', '3. Run the QA list, then hand over the draft with its open items.',
         '',
         '## Document Spine',
         ...spineItems.map((s, i) => `${i + 1}. ${s}`),
