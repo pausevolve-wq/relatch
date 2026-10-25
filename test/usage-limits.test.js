@@ -6,7 +6,7 @@ const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const net = require('node:net');
 const { spawn } = require('node:child_process');
-const { reserveRun, reserveDatalab, reserveAnonOcr, reserveAnonLlamaParse, reserveAnonDatalab, quotaReachedBody, periodKeys } = require('../lib/usage-limits');
+const { reserveRun, reserveDatalab, reserveAnonOcr, reserveAnonLlamaParse, reserveAnonDatalab, reserveSkillRequest, readUsage, markSessionComplete, isSessionComplete, quotaReachedBody, periodKeys } = require('../lib/usage-limits');
 
 const SERVER = process.env.REDIS_SERVER;
 const PORT = 6390 + Math.floor(Math.random() * 500);
@@ -53,6 +53,8 @@ const redis = {
   eval: (script, keys, args) => command('EVAL', script, keys.length, ...keys, ...args),
   incr: key => command('INCR', key),
   expire: (key, ttl) => command('EXPIRE', key, ttl),
+  get: key => command('GET', key),
+  set: (key, value, opts) => command('SET', key, value, 'EX', opts.ex),
 };
 
 const skip = !SERVER && 'REDIS_SERVER not set';
@@ -172,6 +174,63 @@ test('anonymous Datalab: its own site-wide budget of 50 calls per UTC day', { sk
   assert.equal(rows.filter(Boolean).length, 5);
   assert.equal(await command('GET', 'usage:v1:anon:datalab:2026-10-23'), '55'); // separate from LlamaParse's key
   assert.equal(await reserveAnonDatalab(redis, new Date('2026-10-24T00:00:01Z')), true);
+});
+
+test('skill history: 110 parallel requests, exactly 100 pass, per user per UTC day', { skip }, async () => {
+  const day = new Date('2026-10-23T12:00:00Z');
+  const rows = await Promise.all(Array.from({ length: 110 }, () => reserveSkillRequest(redis, 'u-sk', day)));
+  assert.equal(rows.filter(Boolean).length, 100);
+  assert.equal(await reserveSkillRequest(redis, 'u-sk-other', day), true); // per user
+  assert.equal(await reserveSkillRequest(redis, 'u-sk', new Date('2026-10-24T00:00:01Z')), true); // next day
+  const ttl = await command('TTL', 'usage:v1:u-sk:skills:2026-10-23');
+  assert.ok(ttl > 0 && ttl <= 172800);
+});
+
+test('usage: reads the day counter reserveRun writes, 0 on a fresh day, never above the limit', { skip }, async () => {
+  const u = 'usage-read';
+  assert.deepEqual(await readUsage(redis, u, NOW), { used: 0, limit: 5 });
+  await reserveRun(redis, { userId: u, sessionId: 'a', kind: 'gen' }, NOW);
+  await reserveRun(redis, { userId: u, sessionId: 'a', kind: 'ocr' }, NOW); // same batch, same credit
+  await reserveRun(redis, { userId: u, sessionId: 'b', kind: 'gen' }, NOW);
+  assert.deepEqual(await readUsage(redis, u, NOW), { used: 2, limit: 5 });
+  assert.deepEqual(await readUsage(redis, u, new Date('2026-10-24T00:00:01Z')), { used: 0, limit: 5 }); // next UTC day
+  await command('SET', `usage:v1:${u}:day:2026-10-23`, 9);
+  assert.deepEqual(await readUsage(redis, u, NOW), { used: 5, limit: 5 });
+  assert.equal(await command('GET', `usage:v1:${u}:day:2026-10-23`), '9'); // reading never writes
+});
+
+test('session complete: shuts only that user + session, for RUN_TTL', { skip }, async () => {
+  const a = { userId: 'done-a', sessionId: 'session_1_abc' };
+  assert.equal(await isSessionComplete(redis, a), false);
+  await markSessionComplete(redis, a);
+  assert.equal(await isSessionComplete(redis, a), true);
+  assert.equal(await isSessionComplete(redis, { ...a, sessionId: 'session_2_def' }), false); // the next skill
+  assert.equal(await isSessionComplete(redis, { ...a, userId: 'done-b' }), false); // same id, other person
+  assert.equal(await isSessionComplete(redis, { userId: 'done-a' }), false); // no sessionId = its own run
+  const ttl = await command('TTL', 'usage:v1:done-a:done:session_1_abc');
+  assert.ok(ttl > 1790 && ttl <= 1800, `ttl ${ttl}`);
+  await markSessionComplete(redis, a); // a repeat is harmless
+  assert.equal(await isSessionComplete(redis, a), true);
+});
+
+test('session complete, anonymous: per trial token, for the token life', { skip }, async () => {
+  assert.equal(await isSessionComplete(redis, { anonToken: 'tok-1' }), false);
+  await markSessionComplete(redis, { anonToken: 'tok-1', sessionId: 'session_9_xyz' });
+  assert.equal(await isSessionComplete(redis, { anonToken: 'tok-1' }), true);
+  assert.equal(await isSessionComplete(redis, { anonToken: 'tok-2' }), false);
+  const ttl = await command('TTL', 'anon:tok-1:done');
+  assert.ok(ttl > 590 && ttl <= 600, `ttl ${ttl}`);
+});
+
+test('usage + session reads/writes throw on store failure (callers decide open or closed)', async () => {
+  const down = { get: async () => { throw new Error('down'); }, set: async () => { throw new Error('down'); } };
+  await assert.rejects(readUsage(down, 'u'));
+  await assert.rejects(readUsage(null, 'u'));
+  await assert.rejects(readUsage({ get: async () => 'garbage' }, 'u'), /unexpected/);
+  await assert.rejects(markSessionComplete(down, { userId: 'u', sessionId: 's' }));
+  await assert.rejects(isSessionComplete(down, { userId: 'u', sessionId: 's' }));
+  await assert.rejects(isSessionComplete(null, { anonToken: 't' }));
+  assert.deepEqual(await readUsage({ get: async () => 3 }, 'u'), { used: 3, limit: 5 }); // Upstash JSON number
 });
 
 test('store failures throw (callers fail closed)', async () => {
