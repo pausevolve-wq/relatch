@@ -6,7 +6,7 @@ const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const net = require('node:net');
 const { spawn } = require('node:child_process');
-const { reserveRun, reserveDatalab, reserveAnonOcr, reserveAnonLlamaParse, reserveAnonDatalab, readUsage, markSessionComplete, isSessionComplete, quotaReachedBody, periodKeys } = require('../lib/usage-limits');
+const { reserveRun, reserveDatalab, reserveAnonOcr, reserveAnonLlamaParse, reserveAnonDatalab, reserveSkillRequest, readUsage, markSessionComplete, isSessionComplete, quotaReachedBody, periodKeys } = require('../lib/usage-limits');
 
 const SERVER = process.env.REDIS_SERVER;
 const PORT = 6390 + Math.floor(Math.random() * 500);
@@ -174,6 +174,16 @@ test('anonymous Datalab: its own site-wide budget of 50 calls per UTC day', { sk
   assert.equal(rows.filter(Boolean).length, 5);
   assert.equal(await command('GET', 'usage:v1:anon:datalab:2026-10-23'), '55'); // separate from LlamaParse's key
   assert.equal(await reserveAnonDatalab(redis, new Date('2026-10-24T00:00:01Z')), true);
+});
+
+test('skill history: 110 parallel requests, exactly 100 pass, per user per UTC day', { skip }, async () => {
+  const day = new Date('2026-10-23T12:00:00Z');
+  const rows = await Promise.all(Array.from({ length: 110 }, () => reserveSkillRequest(redis, 'u-sk', day)));
+  assert.equal(rows.filter(Boolean).length, 100);
+  assert.equal(await reserveSkillRequest(redis, 'u-sk-other', day), true); // per user
+  assert.equal(await reserveSkillRequest(redis, 'u-sk', new Date('2026-10-24T00:00:01Z')), true); // next day
+  const ttl = await command('TTL', 'usage:v1:u-sk:skills:2026-10-23');
+  assert.ok(ttl > 0 && ttl <= 172800);
 });
 
 test('usage: reads the day counter reserveRun writes, 0 on a fresh day, never above the limit', { skip }, async () => {

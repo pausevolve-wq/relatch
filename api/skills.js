@@ -19,7 +19,7 @@ const { verifyToken } = require('@clerk/backend');
 const { neon } = require('@neondatabase/serverless');
 const { Redis } = require('@upstash/redis');
 const { Axiom } = require('@axiomhq/js');
-const { reserveSkillSave } = require('../lib/usage-limits');
+const { reserveSkillSave, reserveSkillRequest } = require('../lib/usage-limits');
 
 // HTTP mode: one fetch per query, no connection pool to exhaust on serverless. Tagged templates
 // send every value as a bind parameter, so SQL injection is structurally impossible.
@@ -105,6 +105,15 @@ module.exports = async function handler(req, res) {
 
   const id = req.query?.id;
   if (id !== undefined && (typeof id !== 'string' || !SKILL_ID.test(id))) return fail(400, 'INVALID_ID');
+
+  // One daily budget per user for everything below, because every request can wake Neon (see
+  // reserveSkillRequest for why it is daily). Over it, V3 keeps its local copy until tomorrow.
+  // Fails OPEN like the save limiter: a Redis outage must not take history down with it.
+  try {
+    if (!(await reserveSkillRequest(redis, userId))) return fail(429, 'TOO_MANY_REQUESTS', 'skills_daily_budget');
+  } catch (err) {
+    console.log('[skills] request budget unavailable, allowing:', err?.message || 'unknown');
+  }
 
   try {
     if (req.method === 'GET' && id === undefined) {
