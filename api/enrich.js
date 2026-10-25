@@ -557,8 +557,9 @@ module.exports = async function handler(req, res) {
   // EXECUTE  = direct execution playbook (refactor guides, runbooks, migrations) — code-heavy
   // EXPERTISE = human-in-loop creative judgment (brand voice, design critique, copy) — prose + examples
   // SPECIALIST = constrained domain role (compliance, legal, ops) — flowcharts + decision matrices
+  // DELIVERABLE = produce a document again (report, memo, review, brief, meeting pack) from its template or example. 2026-10-25; only when the app asks for it.
   // Backward-compatible: defaults to 'execute' when not provided (the 70% bet).
-  const allowedShapes = ['execute', 'expertise', 'specialist'];
+  const allowedShapes = ['execute', 'expertise', 'specialist', 'deliverable'];
   const clientCodexShape = allowedShapes.includes(codexShape) ? codexShape : 'execute';
   // Jev may override the regex-derived shape on a confident answer (Codex target only).
   const activeCodexShape = routeCodexShape(clientCodexShape, plan, activeTarget);
@@ -662,6 +663,14 @@ module.exports = async function handler(req, res) {
         if (text.includes('## Judgment Framework') && text.includes('## When to Pause for Human')) score += 2;
         if (text.includes('## Quality Bar') && text.includes('## Example Pairs')) score += 1;
         if (text.includes('## Review Workflow')) score += 1;
+        if (text.includes('## Key Principles')) score += 1;
+      } else if (activeCodexShape === 'deliverable') {
+        // 2026-10-25: DELIVERABLE rewards the spine and the QA list first, then goal + intake,
+        // a spine with real items (3+ list entries), and Key Principles.
+        if (text.includes('## Document Spine') && text.includes('## QA Before Delivering')) score += 2;
+        if (text.includes('## Goal') && text.includes('## Intake')) score += 1;
+        const spineBlock = (text.split('## Document Spine')[1] || '').split('\n## ')[0];
+        if ((spineBlock.match(/^\s*(\d+[.)]|[-*])\s+\S/gm) || []).length >= 3) score += 1;
         if (text.includes('## Key Principles')) score += 1;
       } else {
         // SPECIALIST scoring: independent credit per section so partial compliance is visible
@@ -907,6 +916,61 @@ SKIP ENTIRELY unless you can identify at least one reusable, fill-in-the-blank s
 4-6 non-negotiable role rules extracted directly from the source. Each must be specific to this domain role — not generic professional advice. State what Codex will and will not do within this constrained role.
 
 FORBIDDEN: Long judgment-prose paragraphs (use the decision matrix instead), code anti-pattern pairs unless the source itself is code, generic professional advice.
+
+CONTENT:
+${textToSend}`;
+
+    } else if (activeCodexShape === 'deliverable') {
+      // -- CODEX-DELIVERABLE: produce a document again (2026-10-25, Codex V3 upgrade phase 2) --
+      // Built from OpenAI's own Codex role plugins (memo-builder, build-report, meeting-intelligence):
+      // a goal, a short intake, a fixed document spine, evidence rules, the output format and a QA
+      // list. Reachable only when the app sends codexShape: deliverable (not a Jev option, see planner.js).
+      prompt = `${documentContext}You are a Skill Architect for OpenAI Codex generating a DELIVERABLE skill. When this skill activates, Codex PRODUCES a finished document of the kind the source defines - a report, memo, review, brief, proposal, deck or meeting pack - in the same structure, to the same standard, for the same readers. Convert the source (a template, an outline, a standard or a finished example) into the instructions Codex needs to draft the next one well.
+Focus on: ${focus}
+Domain: ${safeDomainLabel}
+Role: ${safeDomainRole}
+
+CRITICAL FRONTMATTER RULES:
+- Frontmatter MUST contain ONLY two fields: name and description. No other YAML fields whatsoever.
+- The "name" field MUST be exactly: "${codexSlug}"
+${codexDescRule}
+- Do NOT wrap in code fences. Start your response with --- on line 1.
+- Do NOT add domain, origin, content_type, use_cases, or any other YAML field.
+
+CONTENT BUDGET: Target 900-1500 words. If approaching the upper range, prioritize completing all REQUIRED sections over depth in any single section.
+${codexSourceHint}
+${codexBodyRule}
+
+REQUIRED SECTIONS (in this order):
+
+## Goal   [REQUIRED]
+2-4 sentences from the source: what this document is, who reads it, and what decision or action it serves. Name the document the way the source names it.
+
+## Intake   [REQUIRED]
+The inputs Codex must have before drafting (data, owners, dates, prior versions, approvals), as bullets. Mark the ones Codex should ask the user for only when they are missing. Ask only about what changes the document (audience, scope, depth); never ask about what the source already fixes.
+
+## Drafting Workflow   [REQUIRED]
+5-8 numbered steps Codex follows to produce the document: confirm the intake, gather the source material, draft each spine section in order, apply the evidence rules, run the QA list, then hand over the draft with its open items. Make every step specific to this document (name the sections, owners, tools, reviewers or deadlines the source gives).
+
+## Document Spine   [REQUIRED]
+The document's sections in order, as a numbered list, using the source's own section names. Keep them INSIDE this list (sub-bullets for detail): do not add the document's sections as separate ## sections of this skill. For each: what goes in it, the required elements, and any length, format, owner or deadline the source states. If the source is a finished example rather than a template, derive the spine from its actual structure. If the source contains a fill-in template, end this section with its skeleton (headings and one-line guidance) in a fenced \`\`\`markdown block, keeping the source's placeholders.
+
+## Evidence Rules
+How facts, figures, dates and names must be sourced and labelled in this document. Codex never invents numbers, names, dates, quotes or results; anything missing is marked as an open item for its owner. Skip only if the source is silent and there is nothing document-specific to say.
+
+## Format & Delivery
+Only what the source states: file type or tool, where the template lives, naming, reviewers and approvals, audience, cadence and deadlines. SKIP ENTIRELY if the source states none of these.
+
+## QA Before Delivering   [REQUIRED]
+4-7 checks Codex runs on the draft before handing it over, each specific to this document (a required section present, a number reconciled, an approval named, a deadline met). No shell commands.
+
+## Variants
+SKIP ENTIRELY unless the source defines different versions (short or long, per audience, per region, per meeting type). If it does, state what changes in each.
+
+## Key Principles
+4-6 non-negotiable rules for this document lifted directly from the source.
+
+FORBIDDEN: shell commands and code blocks (except the markdown skeleton above, or code the document itself must contain), persona role-play, refusal or "Operating Mode" sections, generic writing advice.
 
 CONTENT:
 ${textToSend}`;
@@ -1610,7 +1674,7 @@ ${textToSend}`;
                 .filter(l => l.length > 5 && l.length < 90)
                 .slice(0, 3);
               if (triggers.length >= 2) {
-                const verbMap = { execute: 'Executes', expertise: 'Reviews', specialist: 'Applies' };
+                const verbMap = { execute: 'Executes', expertise: 'Reviews', specialist: 'Applies', deliverable: 'Produces' };
                 const verb = verbMap[activeCodexShape] || 'Applies';
                 const domain = safeDomainLabel || skillName.replace(/-/g, ' ');
                 const trigStr = triggers.slice(0, 2).map(t => t.toLowerCase()).join('; ');
@@ -1660,7 +1724,7 @@ ${textToSend}`;
               .filter(l => l.length > 5 && l.length < 90)
               .slice(0, 2);
             if (trig.length >= 2) {
-              const v = ({ execute: 'Executes', expertise: 'Reviews', specialist: 'Applies' })[activeCodexShape] || 'Applies';
+              const v = ({ execute: 'Executes', expertise: 'Reviews', specialist: 'Applies', deliverable: 'Produces' })[activeCodexShape] || 'Applies';
               emergencyDesc = `${v} ${safeDomainLabel || skillName.replace(/-/g, ' ')} tasks. Activates when: ${trig.map(t => t.toLowerCase()).join('; ')}. Does not apply to out-of-scope requests.`;
             }
           }
@@ -1705,6 +1769,13 @@ ${textToSend}`;
         }
         if (!text.includes('## Common Mistakes to Avoid')) {
           text += '\n\n## Common Mistakes to Avoid\n[Review source document and extract 4-6 domain-specific anti-patterns for this constrained role.]';
+        }
+      } else if (activeCodexShape === 'deliverable') {
+        if (!text.includes('## Document Spine')) {
+          text += '\n\n## Document Spine\n[Review source document and list the sections of the document in order.]';
+        }
+        if (!text.includes('## QA Before Delivering')) {
+          text += '\n\n## QA Before Delivering\n[Review source document and define the checks to run on the draft before delivering it.]';
         }
       }
 
@@ -2435,7 +2506,7 @@ ${textToSend}`;
       .slice(0, 4)
       .map(l => l.replace(/^[-•*\d.)]+\s*/, '').trim().split(/[.!?]/)[0].trim())
       .filter(l => l.length > 10 && l.length < 90);
-    const verbMap = { execute: 'Executes', expertise: 'Reviews', specialist: 'Applies' };
+    const verbMap = { execute: 'Executes', expertise: 'Reviews', specialist: 'Applies', deliverable: 'Produces' };
     const actionVerb = verbMap[activeCodexShape] || 'Applies';
     const triggerStr = triggerCandidates.length >= 2
       ? triggerCandidates.slice(0, 2).join('; ').toLowerCase()
@@ -2490,6 +2561,25 @@ ${textToSend}`;
         ...pauseItems.map(i => `- ${i}`),
       ].join('\n');
 
+    } else if (activeCodexShape === 'deliverable') {
+      // 2026-10-25: DELIVERABLE fallback - the source's ordered lines become the document spine.
+      const spineItems = buckets.workflow.length >= 3
+        ? buckets.workflow.slice(0, 8)
+        : fill([...buckets.workflow, ...buckets.other], 4, `${safeDomainLabel} document section`);
+      const qaItems = fill([...buckets.constraints], 4, `Check the draft against the ${safeDomainLabel} source`);
+      shapeBody = [
+        '## Goal',
+        `Produce the ${safeDomainLabel} document described in the source material, in its structure.`,
+        '',
+        '## Intake',
+        '- Confirm the audience, scope and deadline before drafting.',
+        '',
+        '## Document Spine',
+        ...spineItems.map((s, i) => `${i + 1}. ${s}`),
+        '',
+        '## QA Before Delivering',
+        ...qaItems.map(i => `- ${i}`),
+      ].join('\n');
     } else {
       // specialist
       const doesItems     = fill([...buckets.constraints, ...buckets.other], 4, `Perform ${safeDomainLabel} analysis`);
