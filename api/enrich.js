@@ -1360,6 +1360,15 @@ ${textToSend}`;
     // Voice & Language upgraded to structured table format.
     // Backward compatible: YAML schema (name, domain, content_type, use_cases) unchanged.
     // sanitize() anchor (## Identity & Role) unchanged.
+    // 2026-10-25: ENHANCED FORMAT RULES item 2 widened from "branching only" to any source whose
+    // shape carries meaning (decision path, 4+ stage flow or loop, hierarchy). The old rule fired
+    // 0 times in 203 cached Template A outputs. Still optional. No section was added or moved: the
+    // FORMAT block only gained one optional "Process:" line inside ## How to Create (without it the
+    // widened rule still never fired). Eval (jev-harness diagram-eval.js, prod models): 24/24
+    // section order kept; diagrams drawn from processes the source lays out, 1 of 12 runs on
+    // voice-only sources drew one. The diagram is confined to three mid-file sections because
+    // sanitize() and the app both strip a ``` fence at the very end of the output, which would
+    // leave a final diagram unclosed.
     prompt = `${documentContext}You are a Persona Intelligence Engine. Do not summarize this person. Reverse-engineer their operating system.
 
 Analyze the provided content and extract the author's decision-making frameworks, signature behavioral patterns, voice mechanics, and thinking architecture into a Claude Skill File. The goal is not to describe the person — it is to build an operational model of how they think, decide, communicate, and create.
@@ -1427,7 +1436,8 @@ Be specific: What does the author consider FIRST when approaching a problem? Wha
 Structure: What always comes first, second, last in their outputs?
 Length: What typical length or density signals are present?
 Vocabulary: Which specific domain terms, phrases, or words are used? Which are avoided?
-Format: Bullets vs prose, headers or not, numbered lists or flowing text — what does the source show?]
+Format: Bullets vs prose, headers or not, numbered lists or flowing text — what does the source show?
+Process: if the source describes a workflow of 4 or more stages or a loop that repeats, you MAY end this section with one ASCII diagram of it (rule 2 of ENHANCED FORMAT RULES below). Optional — skip it when the prose already makes the flow clear.]
 
 ## What to Always Do
 [5 specific behaviors. Start each with an action verb. Domain-specific — not generic professional advice. Every item must be recognizable as specific to this author, not transferable to any professional in this domain.]
@@ -1454,11 +1464,16 @@ Within any section above, you MAY use these additional formats ONLY when content
    Format: > **Example:** on one line, then the example on the next line.
    DO NOT use for general principles or rules.
 
-2. ASCII FLOWCHART IN CODEBLOCK — only if source describes a process with real branching decisions (if/then, yes/no outcomes that change the path).
-   Format: triple backtick block, plain ASCII: → ↓ ├── └──
-   DO NOT use for linear steps — use a numbered list instead.
+2. ASCII DIAGRAM IN CODEBLOCK — only if the source describes something whose SHAPE carries the meaning, so a reader would grasp it faster from a diagram than from sentences:
+   - a decision path (if/then, yes/no outcomes that change what happens next)
+   - a flow of 4 or more stages with handoffs, a loop that repeats, or inputs that turn into outputs
+   - a hierarchy or dependency (what feeds what, what sits under what)
+   Place it ONLY inside ## Decision Frameworks, ## How to Think or ## How to Create, after that section's text — an addition to the text, never a replacement for it.
+   Every step in the diagram must name something the source itself describes. Never invent steps to fill a diagram.
+   Format: triple backtick block, plain ASCII: → ↓ ├── └── — at most 15 lines, at most 70 characters wide, at most 2 diagrams in the whole skill file.
+   DO NOT use for 3 or fewer linear steps — use a numbered list instead. DO NOT use for voice, tone or opinion content, or when the diagram would only repeat the sentence next to it.
 
-DEFAULT: When in doubt use prose. A brand voice guide does NOT need an ASCII flowchart. A personal essay does NOT need a decision table. Never force a format onto content that does not naturally support it.
+DEFAULT: When in doubt use prose. Most skill files need no diagram. A brand voice guide does NOT need an ASCII flowchart. A personal essay does NOT need a decision table. Never force a format onto content that does not naturally support it.
 
 CONTENT:
 ${textToSend}`;
