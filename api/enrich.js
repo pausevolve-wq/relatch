@@ -11,7 +11,7 @@ const axiomClient = process.env.AXIOM_TOKEN
   : null;
 // Jev planning layer (2026-09-26): fail-open typed decisions about the document before
 // template routing. See lib/planner.js - every export is a no-op on a null plan.
-const { planDocument, routeTemplate, routeCodexShape, routeDomain, buildPlanDirectives, buildFacetModules, summarizePlan, mapContent, spreadSelect, SPREAD_NOTE, summarizeContent } = require('../lib/planner');
+const { planDocument, detectDeliverable, routeTemplate, routeCodexShape, routeDomain, buildPlanDirectives, buildFacetModules, summarizePlan, mapContent, spreadSelect, SPREAD_NOTE, summarizeContent } = require('../lib/planner');
 // Parachute Gating (2026-09-28): deterministic quality gate, SHADOW mode only for now (see the
 // PARACHUTE block before the model loop). Pure functions; lib/parachute.js has no I/O.
 // 2026-10-03: P3 (PARACHUTE_MODE=enforce) and P4 (=escalate) let it act on what is served.
@@ -51,6 +51,9 @@ async function logToAxiom(event) {
 const BODY_LIMITS = {
   rawText: 120000, fileName: 255, category: 40, domainLabel: 100, domainRole: 400, domainFrame: 400,
   template: 20, sizeClass: 20, target: 20, codexShape: 40, sessionId: 128,
+  // 2026-10-25: Codex only - the whole document (App.tsx: up to 20000 medium / a 32000 sample large),
+  // read by DELIVERABLE auto-detection and, when it fires, by the DELIVERABLE prompt.
+  fullText: 40000,
 };
 // The server's ceiling on how much source text one generation prompt may carry, per size class.
 // Equal to what App.tsx sends as charCap today; the input-cap study may raise them. The legacy
@@ -71,6 +74,11 @@ const SERVER_CHAR_CAP = { small: 3500, medium: 10000, large: 16000 };
 // template keeps SERVER_CHAR_CAP above. Server-owned fixed values: medium documents arrive whole,
 // large ones arrive already sampled by App.tsx, so this never reads more than the request sent.
 const DOMAIN_CHAR_CAP = { small: 3500, medium: 20000, large: 32000 };
+// 2026-10-25 (Codex DELIVERABLE auto-detection): route to DELIVERABLE when detectDeliverable() on the
+// full text is at least this sure. Measured on 48 labelled docs (2 runs, scores moved <= 0.04):
+// templates 0.94-0.96, highest non-deliverable 0.62, so 0.8 sits mid-gap - 4/10 recall, 0/38 false
+// positives. Precision first: a miss gets the normal Codex output, a false fire gets a worse one.
+const DELIVERABLE_AUTO_P = 0.8;
 
 // 2026-10-24 (F-K large documents): App.tsx samples a large document as start + middle + end, each
 // floor(cap / 3) chars, joined by LARGE_SAMPLE_SEP (sampleLargeDocument). A sample at cap 32000
@@ -246,7 +254,9 @@ module.exports = async function handler(req, res) {
   // Old fields remain exactly the same — backward compatible if frontend hasn't updated yet
   // richFormats: consumed by Claude prompt templates only. Codex path uses codexSourceHint
   // pre-scan (v2.2.1) for dynamic structure detection — intentionally unused on Codex path.
-  const { rawText: requestText, category, fileName, domainLabel, domainRole, domainFrame, template, richFormats, charCap, sizeClass, target = 'claude', codexShape = 'execute', sessionId } = req.body;
+  const { rawText: requestText, category, fileName, domainLabel, domainRole, domainFrame, template, richFormats, charCap, sizeClass, target = 'claude', codexShape = 'execute', sessionId, fullText: requestFullText } = req.body;
+  // 2026-10-25: the whole document, sent by the app for Codex only (see BODY_LIMITS.fullText).
+  const codexFullText = target === 'codex' && typeof requestFullText === 'string' && requestFullText.trim() ? requestFullText : null;
   // 2026-10-24 (F-K large documents, see shrinkLargeSample): a Claude large document sampled at
   // 32000 is reduced to the 16000 sample for everything except templates F-K. charCap 32000 is
   // then clamped to SERVER_CHAR_CAP.large (16000) below, exactly as the app's old 16000.
@@ -358,9 +368,11 @@ module.exports = async function handler(req, res) {
         : charCap >= 5000
           ? 'medium'
           : 'small';
-  const [plan, contentMap] = await Promise.all([
+  const [plan, contentMap, deliverableP] = await Promise.all([
     planDocument({ text: rawText, fileName, category, sizeClass: effectiveSizeClass, target: target === 'codex' ? 'codex' : 'claude' }),
     mapContent({ text: rawText, fileName, template }),
+    // 2026-10-25: DELIVERABLE auto-detection, its own Jev call on the full text (fail open: null).
+    codexFullText && codexShape !== 'deliverable' ? detectDeliverable({ text: codexFullText, fileName }) : Promise.resolve(null),
   ]);
   // Furniture removed (whole original lines, original order); rawText when no map.
   const sourceText = contentMap ? contentMap.text : rawText;
@@ -572,11 +584,25 @@ module.exports = async function handler(req, res) {
   // EXECUTE  = direct execution playbook (refactor guides, runbooks, migrations) — code-heavy
   // EXPERTISE = human-in-loop creative judgment (brand voice, design critique, copy) — prose + examples
   // SPECIALIST = constrained domain role (compliance, legal, ops) — flowcharts + decision matrices
+  // DELIVERABLE = produce a document again (report, memo, review, brief, meeting pack) from its template or example. 2026-10-25; only when the app asks for it.
   // Backward-compatible: defaults to 'execute' when not provided (the 70% bet).
-  const allowedShapes = ['execute', 'expertise', 'specialist'];
+  const allowedShapes = ['execute', 'expertise', 'specialist', 'deliverable'];
   const clientCodexShape = allowedShapes.includes(codexShape) ? codexShape : 'execute';
   // Jev may override the regex-derived shape on a confident answer (Codex target only).
-  const activeCodexShape = routeCodexShape(clientCodexShape, plan, activeTarget);
+  // 2026-10-25 (DELIVERABLE v3): the app sends deliverable only when the user explicitly picks it, so
+  // Jev may not override that choice (it moved 3 of 8 explicit requests to specialist in testing).
+  // 2026-10-25: ...and when the full text was sent, DELIVERABLE is auto-detected (DELIVERABLE_AUTO_P).
+  const deliverableAuto = activeTarget === 'codex' && typeof deliverableP === 'number' && deliverableP >= DELIVERABLE_AUTO_P;
+  const activeCodexShape = clientCodexShape === 'deliverable' || deliverableAuto ? 'deliverable' : routeCodexShape(clientCodexShape, plan, activeTarget);
+  // 2026-10-25 (DELIVERABLE v3): this shape is built on the document's structure, so it reads the
+  // unfiltered source (page furniture removed, every line kept) up to the F-K ceiling
+  // (DOMAIN_CHAR_CAP: 20000 medium / 32000 large) instead of the signal-filtered 10000 / 16000.
+  if (activeTarget === 'codex' && activeCodexShape === 'deliverable') {
+    const dlvCap = Math.min(Number.isFinite(clientCharCap) && clientCharCap >= 1000 ? clientCharCap : SERVER_CHAR_CAP[effectiveSizeClass], DOMAIN_CHAR_CAP[effectiveSizeClass]);
+    // 2026-10-25: the app's full text when sent (the distilled rawText lacks the structure).
+    selection = codexFullText ? spreadSelect(codexFullText, dlvCap) : contentMap ? spreadSelect(sourceText, dlvCap) : { text: sourceText.slice(0, dlvCap), spread: false };
+    textToSend = selection.text;
+  }
   // Depth boost: x1.5 output tokens only when Jev is confident the source is dense.
   // Claude only - Codex prompts keep a deliberate word budget. No plan = exactly today's budgets.
   // 2026-09-26: both targets now. The token cap is only a ceiling - Codex's prompt word budget
@@ -661,21 +687,30 @@ module.exports = async function handler(req, res) {
       if (text.includes('name:') && text.includes('description:')) score += 2;
       // +2 no placeholder bail-outs
       if (!text.includes('[Not extracted') && !text.includes('[review source') && !text.includes('to be added')) score += 2;
-      // +1 trigger sub-sections present (universal across all three shapes)
-      if (text.includes('### Must Use') && text.includes('### Recommended') && text.includes('### Skip')) score += 1;
+      // 2026-10-25: +1 the description carries the triggers ("Use when"), replacing the old
+      // +1 for ### Must Use / ### Recommended / ### Skip body sub-sections (see codexDescRule).
+      if (/^description:[^\n]*\bUse when\b/im.test(text)) score += 1;
 
       if (activeCodexShape === 'execute') {
         // EXECUTE rewards: workflow anchor + code blocks + anti-patterns + final checks.
-        if (text.includes('## When to Activate') && text.includes('## Implementation Workflow') && text.includes('## Key Principles')) score += 2;
+        if (text.includes('## Implementation Workflow') && text.includes('## Key Principles')) score += 2;
         const codeBlockCount = (text.match(/```[a-z]*\n/gi) || []).length;
         if (codeBlockCount >= 2) score += 1;
         if (text.includes('## Common Mistakes to Avoid')) score += 1;
         if (text.includes('## Final Checks')) score += 1;
       } else if (activeCodexShape === 'expertise') {
         // EXPERTISE rewards: review workflow + judgment anchor + quality criteria + human-pause.
-        if (text.includes('## When to Activate') && text.includes('## Judgment Framework') && text.includes('## When to Pause for Human')) score += 2;
+        if (text.includes('## Judgment Framework') && text.includes('## When to Pause for Human')) score += 2;
         if (text.includes('## Quality Bar') && text.includes('## Example Pairs')) score += 1;
         if (text.includes('## Review Workflow')) score += 1;
+        if (text.includes('## Key Principles')) score += 1;
+      } else if (activeCodexShape === 'deliverable') {
+        // 2026-10-25: DELIVERABLE rewards the spine and the QA list first, then goal + drafting workflow (v3: Intake is optional),
+        // a spine with real items (3+ list entries), and Key Principles.
+        if (text.includes('## Document Spine') && text.includes('## QA Before Delivering')) score += 2;
+        if (text.includes('## Goal') && text.includes('## Drafting Workflow')) score += 1;
+        const spineBlock = (text.split('## Document Spine')[1] || '').split('\n## ')[0];
+        if ((spineBlock.match(/^\s*(\d+[.)]|[-*])\s+\S/gm) || []).length >= 3) score += 1;
         if (text.includes('## Key Principles')) score += 1;
       } else {
         // SPECIALIST scoring: independent credit per section so partial compliance is visible
@@ -683,7 +718,8 @@ module.exports = async function handler(req, res) {
         // all 2 points when any one was missing — even for non-[REQUIRED] sections on linear
         // sources. Now each section earns its own +1.
         // Activation + Scope always injected by sanitize(); +1 confirms structural integrity.
-        if (text.includes('## When to Activate') && text.includes('## Scope Boundaries')) score += 1;
+        // (2026-10-25: Activation is no longer injected or scored - triggers live in the description.)
+        if (text.includes('## Scope Boundaries')) score += 1;
         // Workflow scored alone so omitting it on linear/conceptual sources doesn't cancel
         // adjacent section credit.
         if (text.includes('## Workflow')) score += 1;
@@ -809,6 +845,16 @@ module.exports = async function handler(req, res) {
     // 3 phrases that appear literally in the source — Codex's loader uses description-
     // to-user-intent matching to decide when to activate. Vague descriptions never trigger.
 
+    // 2026-10-25 (Codex V3 upgrade, phase 1): shared rules for every Codex shape.
+    // OpenAI's skill spec: Codex reads ONLY name + description to decide when to use a skill; the body
+    // loads after it triggers. So every trigger goes in the description, and the old body section
+    // "When to Activate / Must Use / Recommended / Skip" is gone. Measured 2026-10-25 against native
+    // Codex skill-creator (9 docs, 2 judges): native won 8/0/1; the judges and a heading diff named
+    // one fixed skeleton for every document, persona descriptions copied from codexRole, and a
+    // prompt example phrase leaking into a real description. Vault: Relatch Codex V3 Upgrade note.
+    const codexDescRule = `- Description: this is the ONLY text Codex reads to decide whether to use the skill (the body is loaded only after it triggers), so every trigger goes here. One or two plain sentences, at most 500 characters, third person. Start with an imperative verb that names the job and the source's own subject. Never start with "This skill", "Acts as", "Codex", or a role or persona. Then write "Use when" followed by 3-5 concrete requests or situations taken from the source's own topics and terms, including ones where the user would not name the skill. Optionally end with "Do not use for" and one real exclusion. Never copy example wording from these instructions.`;
+    const codexBodyRule = `BODY RULES: Do NOT write a "When to Activate", "Must Use", "Recommended" or "Skip" section - triggers live only in the description. The required sections below are the minimum, not the whole file: where the source is organised into its own phases, variants, cases, roles or per-region rules, keep that organisation by adding sections under the source's own headings, placed before ## Key Principles. Quote exact thresholds, names, figures and defined terms from the source instead of paraphrasing them.`;
+
     if (activeCodexShape === 'expertise') {
       // ── CODEX-EXPERTISE: human-in-loop creative judgment ──────────────────────
       prompt = `${documentContext}You are a Skill Architect for OpenAI Codex CLI generating an EXPERTISE skill. Codex is an autonomous coding agent — when this skill activates, Codex performs review, editing, or creative work and PAUSES for human approval at key decision points. Convert the source into instructions Codex can follow while reviewing, rewriting, or producing work. Prefer minimal-edit review guidance before full rewrites. Prefer concrete checks over abstract advice.
@@ -819,21 +865,15 @@ Role: ${safeDomainRole}
 CRITICAL FRONTMATTER RULES:
 - Frontmatter MUST contain ONLY two fields: name and description. No other YAML fields whatsoever.
 - The "name" field MUST be exactly: "${codexSlug}"
-- Description: 2-3 sentences. Sentence 1: what Codex should do when this skill is relevant. Sentence 2: trigger contexts — include 1-2 phrases that appear literally in the source AND 2-4 real user-intent phrases a Codex user would naturally type (e.g. "review landing page copy", "tighten this headline", "improve the CTA"). Sentence 3 (optional): explicit exclusions.
+${codexDescRule}
 - Do NOT wrap in code fences. Start your response with --- on line 1.
 - Do NOT add domain, origin, content_type, use_cases, or any other YAML field.
 
 CONTENT BUDGET: Target 500-900 words. If approaching the upper range, prioritize completing all REQUIRED sections over depth in any single section.
 ${codexSourceHint}
-REQUIRED SECTIONS (in this order):
+${codexBodyRule}
 
-## When to Activate
-### Must Use
-- 3-5 specific trigger contexts (mix of source phrases and real user-intent phrasing)
-### Recommended
-- 2-3 broader use cases
-### Skip
-- 2-3 explicit exclusions
+REQUIRED SECTIONS (in this order):
 
 ## Review Workflow
 4-7 numbered steps for how Codex should approach reviewing or rewriting work in this domain. Example order: clarify intent → identify weak claims → check proof/support → check CTA or conclusion → verify tone → suggest minimal diff first before full rewrite. Lift the actual review logic from the source.
@@ -845,7 +885,7 @@ Explain the explicit tradeoffs in this domain — clarity vs. cleverness, brevit
 4-6 concrete, testable criteria for "good" output specific to this domain. No generic phrases like "be professional" or "high quality."
 
 ## Example Pairs
-2-3 before/after pairs showing concrete text-level edits (5-20 word snippets from real landing pages, ad headlines, email subjects, CTA buttons, or value propositions). Each pair MUST show the actual words, not a description of the problem. Use the source's domain and vocabulary:
+2-3 before/after pairs showing concrete edits (5-20 word snippets) of the kind of work this source governs. Each pair MUST show the actual words, not a description of the problem. Use the source's domain and vocabulary:
 > **Weak:** "[exact weak phrasing]"
 > **Strong:** "[specific improved version]" — [1-sentence explanation anchored to the Judgment Framework above]
 Show the minimal diff first. Only escalate to a full rewrite if the weak version cannot be salvaged with small edits.
@@ -871,21 +911,15 @@ Role: ${safeDomainRole}
 CRITICAL FRONTMATTER RULES:
 - Frontmatter MUST contain ONLY two fields: name and description. No other YAML fields whatsoever.
 - The "name" field MUST be exactly: "${codexSlug}"
-- Description: 2-3 sentences. Sentence 1: what role this skill assumes. Sentence 2: trigger contexts — include 1-2 phrases that appear literally in the source AND 2-4 real user-intent phrases a Codex user would naturally type. Sentence 3 (optional): what this role does NOT cover.
+${codexDescRule}
 - Do NOT wrap in code fences. Start your response with --- on line 1.
 - Do NOT add domain, origin, content_type, use_cases, or any other YAML field.
 
 CONTENT BUDGET: Target 700-1100 words. Every section must be load-bearing. If approaching the upper range, prioritize completing all REQUIRED sections over depth in any single section.
 ${codexSourceHint}
-REQUIRED SECTIONS (in this order):
+${codexBodyRule}
 
-## When to Activate
-### Must Use
-- 3-5 specific trigger contexts (mix of source phrases and real user-intent phrasing)
-### Recommended
-- 2-3 broader use cases
-### Skip
-- 2-3 explicit exclusions
+REQUIRED SECTIONS (in this order):
 
 ## Scope Boundaries
 Two explicit sub-lists. The "does NOT" list defines when Codex refuses.
@@ -926,6 +960,61 @@ FORBIDDEN: Long judgment-prose paragraphs (use the decision matrix instead), cod
 CONTENT:
 ${textToSend}`;
 
+    } else if (activeCodexShape === 'deliverable') {
+      // -- CODEX-DELIVERABLE: produce a document again (2026-10-25, Codex V3 upgrade phase 2) --
+      // Built from OpenAI's own Codex role plugins (memo-builder, build-report, meeting-intelligence):
+      // a goal, a short intake, a fixed document spine, evidence rules, the output format and a QA
+      // list. Reachable only when the app sends codexShape: deliverable (not a Jev option, see planner.js).
+      prompt = `${documentContext}You are a Skill Architect for OpenAI Codex generating a DELIVERABLE skill. When this skill activates, Codex PRODUCES a finished document of the kind the source defines - a report, memo, review, brief, proposal, deck or meeting pack - in the same structure, to the same standard, for the same readers. Convert the source (a template, an outline, a standard or a finished example) into the instructions Codex needs to draft the next one well.
+Focus on: ${focus}
+Domain: ${safeDomainLabel}
+Role: ${safeDomainRole}
+
+CRITICAL FRONTMATTER RULES:
+- Frontmatter MUST contain ONLY two fields: name and description. No other YAML fields whatsoever.
+- The "name" field MUST be exactly: "${codexSlug}"
+${codexDescRule}
+- Do NOT wrap in code fences. Start your response with --- on line 1.
+- Do NOT add domain, origin, content_type, use_cases, or any other YAML field.
+
+CONTENT BUDGET: Target 900-1500 words. Spend most of them on the Document Spine and the Drafting Workflow - that is where the source's detail belongs. If approaching the upper range, prioritize completing all REQUIRED sections over depth in any single section.
+${codexSourceHint}
+${codexBodyRule}
+
+REQUIRED SECTIONS (in this order):
+
+## Goal   [REQUIRED]
+2-4 sentences from the source: what this document is, who reads it, and what decision or action it serves. Name the document the way the source names it.
+
+## Intake
+Only the inputs the source itself names (data, owners, dates, prior versions, approvals), as bullets. End each input the user must supply with "(ask the user if missing)"; inputs Codex can find itself need no marker. Ask only about what changes the document (audience, scope, depth). SKIP ENTIRELY if the source names no inputs - never invent them.
+
+## Drafting Workflow   [REQUIRED]
+5-8 numbered steps Codex follows to produce the document: confirm the intake, gather the source material, draft each spine section in order, apply the evidence rules, run the QA list, then hand over the draft with its open items. Make every step specific to this document (name the sections, owners, tools, reviewers or deadlines the source gives). Carry the source's own logistics into the steps: schedules, meetings, attendee or participant lists, channels, checklists and hand-offs it describes.
+
+## Document Spine   [REQUIRED]
+The document's sections in order, as a numbered list, using the source's own section names. Every item MUST be a section that actually appears in the source (a heading, a template field, or a part of the finished example); if the source shows fewer than 3, list the ones it shows and say the rest are not defined in the source - never invent a section. Keep them INSIDE this list (sub-bullets for detail): do not add the document's sections as separate ## sections of this skill. For each: what goes in it, the required elements, and any length, format, owner or deadline the source states. If the source is a finished example rather than a template, derive the spine from its actual structure. If the source contains a fill-in template, end this section with its skeleton (headings and one-line guidance) in a fenced \`\`\`markdown block, keeping the source's placeholders.
+
+## Evidence Rules
+How facts, figures, dates and names must be sourced and labelled in this document, as the source states it. Codex never invents numbers, names, dates, quotes or results; anything missing is marked as an open item for its owner. SKIP ENTIRELY if the source says nothing about sources, data or evidence.
+
+## Format & Delivery
+Only what the source states: file type or tool, where the template lives, naming, reviewers and approvals, audience, cadence and deadlines. SKIP ENTIRELY if the source states none of these.
+
+## QA Before Delivering   [REQUIRED]
+4-7 checks Codex runs on the draft before handing it over, each specific to this document (a required section present, a number reconciled, an approval named, a deadline met). No shell commands.
+
+## Variants
+SKIP ENTIRELY unless the source defines different versions (short or long, per audience, per region, per meeting type). If it does, state what changes in each.
+
+## Key Principles
+4-6 non-negotiable rules for this document lifted directly from the source.
+
+FORBIDDEN: shell commands and code blocks (except the markdown skeleton above, or code the document itself must contain), persona role-play, refusal or "Operating Mode" sections, generic writing advice.
+
+CONTENT:
+${textToSend}`;
+
     } else {
       // ── CODEX-EXECUTE: direct execution playbook (default shape) ──────────────
       prompt = `${documentContext}You are a Skill Architect for OpenAI Codex CLI generating an EXECUTION skill. Codex is an autonomous coding agent — when this skill activates, Codex reads it and STARTS WORKING immediately. Convert the source into a direct execution playbook Codex can follow: concrete steps, checks, and artifacts grounded in the source. NEVER invent tool names, CLI commands, or file paths not present in the source — if the source is conceptual, derive verifiable checklist actions from its actual domain content rather than fabricating specifics. Prefer concrete source-grounded checks over abstract advice.
@@ -936,21 +1025,15 @@ Role: ${safeDomainRole}
 CRITICAL FRONTMATTER RULES:
 - Frontmatter MUST contain ONLY two fields: name and description. No other YAML fields whatsoever.
 - The "name" field MUST be exactly: "${codexSlug}"
-- Description: 2-3 sentences. Sentence 1: what this skill executes (name the actual domain and action type from the source). Sentence 2: trigger contexts — include 1-2 phrases that appear LITERALLY in the source text AND 2-4 user-intent phrases a Codex user would type to invoke this exact skill — every phrase MUST be grounded in the actual source content, never generic placeholders. Sentence 3 (optional): explicit exclusions.
+${codexDescRule}
 - Do NOT wrap in code fences. Start your response with --- on line 1.
 - Do NOT add domain, origin, content_type, use_cases, or any other YAML field.
 
 CONTENT BUDGET: Target 600-1100 words. SKILL.md is loaded into Codex's context on every trigger — keep it tight and load-bearing. If approaching the upper range, prioritize completing all REQUIRED sections over depth in any single section.
 ${codexSourceHint}
-REQUIRED SECTIONS (in this order):
+${codexBodyRule}
 
-## When to Activate
-### Must Use
-- 3-5 specific trigger contexts (mix of source phrases and real user-intent phrasing)
-### Recommended
-- 2-3 broader use cases
-### Skip
-- 2-3 explicit exclusions
+REQUIRED SECTIONS (in this order):
 
 ## Implementation Workflow
 5-10 numbered steps. Each step MUST reference concrete actions grounded in the source — actual files, paths, commands, flags, or tools ONLY if they appear in the source; for non-code sources use domain-appropriate verifiable actions with descriptive placeholders like [config-file], [runbook-section], [ticket-id] — NEVER invent CLI tool names or file paths. Embed fenced \`\`\`lang code blocks where the source shows code patterns. Use language tags (\`\`\`typescript, \`\`\`bash, \`\`\`python, etc.). Do NOT use ASCII flowcharts here — use numbered steps.
@@ -962,7 +1045,7 @@ Fenced code blocks showing preferred patterns lifted from or grounded in the sou
 3-5 anti-pattern entries. When the source contains code, each entry is two fenced code blocks (// ✗ don't → // ✓ do this instead). When non-code, use "**Don't:** ... **Do:** ..." prose pairs. Each entry MUST include a one-line WHY — not just what is wrong but what breaks when you do it wrong. Make all entries source-specific, not generic advice.
 
 ## Final Checks   [REQUIRED]
-3-5 verification steps Codex should run before considering the task done. Format at least one as a runnable shell command (e.g. \`$ npm test\`, \`$ python -m pytest\`, \`$ grep -r "pattern" ./src\`) when the source is code-related. Always include at least one boundary check — a file, directory, interface, or architecture constraint to verify before shipping. Each check must be independently runnable and concrete, not a vague "ensure everything works."
+3-5 verification steps Codex should run before considering the task done. Format at least one as a runnable shell command (e.g. \`$ npm test\`, \`$ python -m pytest\`, \`$ grep -r "pattern" ./src\`) when the source is code-related. Always include at least one boundary check — a file, directory, interface, or architecture constraint to verify before shipping. Each check must be independently runnable and concrete, not a vague "ensure everything works." For non-code sources, every check names something concrete in the source (a threshold, owner, approval, document or deadline) and is never a shell command.
 
 ## Key Principles
 4-6 non-negotiable executable rules lifted directly from the source — domain-specific and verifiable. Not abstract values, not generic coding conventions.
@@ -1513,6 +1596,7 @@ ${textToSend}`;
   const planSummary = plan
     ? summarizePlan(plan, { clientTemplate: template || 'A', template: activeTemplate, clientShape: clientCodexShape, codexShape: activeCodexShape, target: activeTarget, domainChanged: routedDomain.changed, domainSource: routedDomain.source })
     : null;
+  if (planSummary && typeof deliverableP === 'number') planSummary.deliverable_p = Math.round(deliverableP * 100) / 100;
   if (planSummary) console.log('[plan]', planSummary);
   const contentSummary = contentMap ? summarizeContent(contentMap, selection.spread && textToSend === selection.text) : null;
   if (contentSummary) console.log('[content]', contentSummary);
@@ -1631,7 +1715,7 @@ ${textToSend}`;
                 .filter(l => l.length > 5 && l.length < 90)
                 .slice(0, 3);
               if (triggers.length >= 2) {
-                const verbMap = { execute: 'Executes', expertise: 'Reviews', specialist: 'Applies' };
+                const verbMap = { execute: 'Executes', expertise: 'Reviews', specialist: 'Applies', deliverable: 'Produces' };
                 const verb = verbMap[activeCodexShape] || 'Applies';
                 const domain = safeDomainLabel || skillName.replace(/-/g, ' ');
                 const trigStr = triggers.slice(0, 2).map(t => t.toLowerCase()).join('; ');
@@ -1639,6 +1723,14 @@ ${textToSend}`;
               }
             }
           } catch (_) {}
+          // 2026-10-25: the body no longer has ### Must Use, so when the model omits the
+          // description AND the trigger list, use the body's first prose sentence instead.
+          if (!resolvedDesc) {
+            const bodyLines = text.slice(fmMatchCodex[0].length).split('\n').map(l => l.trim());
+            const firstProse = bodyLines.find(l => l && !/^(#|[-*|>`]|\d+[.)])/.test(l));
+            const sentence = firstProse && firstProse.match(/^[^.!?\n]{20,240}[.!?]/);
+            if (sentence) resolvedDesc = `${sentence[0]} Use when working on ${safeDomainLabel || skillName.replace(/-/g, ' ')} tasks this skill covers.`;
+          }
           fm += `\ndescription: "${(resolvedDesc || `${skillName.replace(/-/g, ' ')} skill.`).replace(/"/g, '\\"')}"`;
         }
         // Normalize description to a single-line quoted string so downstream regex
@@ -1673,7 +1765,7 @@ ${textToSend}`;
               .filter(l => l.length > 5 && l.length < 90)
               .slice(0, 2);
             if (trig.length >= 2) {
-              const v = ({ execute: 'Executes', expertise: 'Reviews', specialist: 'Applies' })[activeCodexShape] || 'Applies';
+              const v = ({ execute: 'Executes', expertise: 'Reviews', specialist: 'Applies', deliverable: 'Produces' })[activeCodexShape] || 'Applies';
               emergencyDesc = `${v} ${safeDomainLabel || skillName.replace(/-/g, ' ')} tasks. Activates when: ${trig.map(t => t.toLowerCase()).join('; ')}. Does not apply to out-of-scope requests.`;
             }
           }
@@ -1682,9 +1774,8 @@ ${textToSend}`;
         text = `---\nname: ${skillName}\ndescription: "${emergencyDesc.replace(/"/g, '\\"')}"\n---\n\n${bodyOnly}`;
       }
 
-      if (!text.includes('## When to Activate')) {
-        text += '\n\n## When to Activate\n[Review source document and define activation contexts.]';
-      }
+      // 2026-10-25: no "## When to Activate" placeholder any more. Triggers live in the
+      // description (codexDescRule), and a placeholder section only cost score and context.
 
       // v2.2: Shape-aware required-section fallback. Closes over activeCodexShape from
       // handler scope. Appends a placeholder section only if the model omitted the
@@ -1719,6 +1810,16 @@ ${textToSend}`;
         }
         if (!text.includes('## Common Mistakes to Avoid')) {
           text += '\n\n## Common Mistakes to Avoid\n[Review source document and extract 4-6 domain-specific anti-patterns for this constrained role.]';
+        }
+      } else if (activeCodexShape === 'deliverable') {
+        if (!text.includes('## Document Spine')) {
+          text += '\n\n## Document Spine\n[Review source document and list the sections of the document in order.]';
+        }
+        if (!text.includes('## Drafting Workflow')) {
+          text += '\n\n## Drafting Workflow\n[Review source document and define the numbered steps to produce the document.]';
+        }
+        if (!text.includes('## QA Before Delivering')) {
+          text += '\n\n## QA Before Delivering\n[Review source document and define the checks to run on the draft before delivering it.]';
         }
       }
 
@@ -2387,7 +2488,7 @@ ${textToSend}`;
       rich: routeDecision.rich ?? null, lowSignal: routeDecision.lowSignal ?? null, csvRows: routeDecision.csvRows ?? null,
       target: activeTarget, template: effectiveTemplate, sizeClass: effectiveSizeClass,
       chain: modelList.map((m) => m.id), served, model: served === 'model' ? successfulModel : null,
-      gateId, ms: Date.now() - requestStartMs,
+      gateId, deliverableP: typeof deliverableP === 'number' ? deliverableP : null, ms: Date.now() - requestStartMs,
     };
     const run = async () => {
       await new Promise((resolve) => setImmediate(resolve)); // let the reply go out first
@@ -2449,22 +2550,14 @@ ${textToSend}`;
       .slice(0, 4)
       .map(l => l.replace(/^[-•*\d.)]+\s*/, '').trim().split(/[.!?]/)[0].trim())
       .filter(l => l.length > 10 && l.length < 90);
-    const verbMap = { execute: 'Executes', expertise: 'Reviews', specialist: 'Applies' };
+    const verbMap = { execute: 'Executes', expertise: 'Reviews', specialist: 'Applies', deliverable: 'Produces' };
     const actionVerb = verbMap[activeCodexShape] || 'Applies';
     const triggerStr = triggerCandidates.length >= 2
       ? triggerCandidates.slice(0, 2).join('; ').toLowerCase()
       : `${safeDomainLabel} ${activeCodexShape} operations`;
-    const safeDesc = `${actionVerb} ${safeDomainLabel} procedures from source material. Activates when: ${triggerStr}. Does not apply to out-of-scope or ambiguous requests.`;
+    const safeDesc = `${actionVerb} ${safeDomainLabel} procedures from source material. Use when: ${triggerStr}. Do not use for out-of-scope or ambiguous requests.`;
 
-    const activationSection = [
-      '## When to Activate',
-      '### Must Use',
-      ...fill([...buckets.constraints], 3, `${safeDomainLabel} ${activeCodexShape} task`).map(i => `- ${i}`),
-      '### Recommended',
-      ...fill([...buckets.other], 2, `General ${safeDomainLabel} work`).map(i => `- ${i}`),
-      '### Skip',
-      ...fill(buckets.refuse.length > 0 ? [...buckets.refuse] : [...buckets.antiPatterns], 2, 'Out-of-scope requests').map(i => `- ${i}`),
-    ].join('\n');
+    // 2026-10-25: no body activation section (triggers live in safeDesc, see codexDescRule).
 
     const principlesSection = [
       '## Key Principles',
@@ -2512,6 +2605,25 @@ ${textToSend}`;
         ...pauseItems.map(i => `- ${i}`),
       ].join('\n');
 
+    } else if (activeCodexShape === 'deliverable') {
+      // 2026-10-25: DELIVERABLE fallback - the source's ordered lines become the document spine.
+      const spineItems = buckets.workflow.length >= 3
+        ? buckets.workflow.slice(0, 8)
+        : fill([...buckets.workflow, ...buckets.other], 4, `${safeDomainLabel} document section`);
+      const qaItems = fill([...buckets.constraints], 4, `Check the draft against the ${safeDomainLabel} source`);
+      shapeBody = [
+        '## Goal',
+        `Produce the ${safeDomainLabel} document described in the source material, in its structure.`,
+        '',
+        '## Drafting Workflow',
+        '1. Confirm the audience, scope and deadline.', '2. Draft each spine section in order from the source.', '3. Run the QA list, then hand over the draft with its open items.',
+        '',
+        '## Document Spine',
+        ...spineItems.map((s, i) => `${i + 1}. ${s}`),
+        '',
+        '## QA Before Delivering',
+        ...qaItems.map(i => `- ${i}`),
+      ].join('\n');
     } else {
       // specialist
       const doesItems     = fill([...buckets.constraints, ...buckets.other], 4, `Perform ${safeDomainLabel} analysis`);
@@ -2582,8 +2694,6 @@ ${textToSend}`;
       `name: ${codexSlug}`,
       `description: "${safeDesc}"`,
       '---',
-      '',
-      activationSection,
       '',
       shapeBody,
       '',
