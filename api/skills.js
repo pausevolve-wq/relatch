@@ -58,7 +58,9 @@ function validateSkill(body) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return { status: 400, error: 'INVALID_BODY' };
   const name = typeof body.name === 'string' ? body.name.trim() : '';
   if (chars(name) < 1 || chars(name) > 120) return { status: 400, error: 'INVALID_NAME' };
-  if (body.target !== 'claude' && body.target !== 'codex') return { status: 400, error: 'INVALID_TARGET' };
+  // 2026-11-02: 'agents' too (the V3 Agents tab). Needs db/migrations/002_agents_target.sql applied first:
+  // until then the table's CHECK refuses the row (500) and the app keeps the skill in the browser.
+  if (body.target !== 'claude' && body.target !== 'codex' && body.target !== 'agents') return { status: 400, error: 'INVALID_TARGET' };
   if (!Array.isArray(body.files) || body.files.length < 1 || body.files.length > 3) return { status: 400, error: 'INVALID_FILES' };
   const files = [];
   for (const f of body.files) {
