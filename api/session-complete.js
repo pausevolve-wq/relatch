@@ -79,6 +79,10 @@ module.exports = async function handler(req, res) {
     if (!userId) {
       // Only a live trial token can shut its session; a dead or invented one is refused.
       if (!redis) throw new Error('usage store not configured');
+      // 2026-11-14: same shape check as enrich.js and ocr.js. The header goes into Redis key names, so
+      // only the exact shape anon-token.js mints (a lower-case v4 UUID) is ever looked up; a real
+      // token with a key suffix glued on ("<token>:session") must not pass as a live token.
+      if (typeof anonToken !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(anonToken)) return fail(401, 'ANON_TOKEN_INVALID', 'anon_token_malformed');
       if ((await withTimeout(redis.get(`anon:${anonToken}`))) === null) return fail(401, 'ANON_TOKEN_INVALID', 'anon_token_invalid');
     }
     await markSessionComplete(redis, userId ? { userId, sessionId } : { anonToken });

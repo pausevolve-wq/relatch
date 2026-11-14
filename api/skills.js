@@ -49,6 +49,12 @@ const MAX_FILES_BYTES = 262144; // 256 KB, same bound as the size_bytes CHECK in
 const SKILL_ID = /^[A-Za-z0-9_-]{1,64}$/;
 // Code points, not UTF-16 units: matches Postgres char_length() in the table's CHECKs.
 const chars = s => [...s].length;
+// 2026-11-14: Postgres refuses two things JavaScript strings may hold - a NUL character (in text
+// and in jsonb) and half of a surrogate pair (in jsonb; a length clip that lands inside an emoji
+// leaves one). Either made the INSERT throw, so the save answered 503 on every retry and the app
+// re-sent it on each open. Both are removed here: NUL dropped, a lone half replaced by U+FFFD.
+// Proven on a throwaway Neon branch (jev-harness/db-tests/phase1-test.js).
+const clean = s => s.replace(/\u0000/g, '').toWellFormed();
 
 // Section 11.4. Returns { value } or { error, status }.
 function validateSkill(body) {
@@ -56,7 +62,7 @@ function validateSkill(body) {
     try { body = JSON.parse(body); } catch { return { status: 400, error: 'INVALID_JSON' }; }
   }
   if (!body || typeof body !== 'object' || Array.isArray(body)) return { status: 400, error: 'INVALID_BODY' };
-  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  const name = typeof body.name === 'string' ? clean(body.name).trim() : '';
   if (chars(name) < 1 || chars(name) > 120) return { status: 400, error: 'INVALID_NAME' };
   // 2026-11-02: 'agents' too (the V3 Agents tab). Needs db/migrations/002_agents_target.sql applied first:
   // until then the table's CHECK refuses the row (500) and the app keeps the skill in the browser.
@@ -64,9 +70,9 @@ function validateSkill(body) {
   if (!Array.isArray(body.files) || body.files.length < 1 || body.files.length > 3) return { status: 400, error: 'INVALID_FILES' };
   const files = [];
   for (const f of body.files) {
-    const fileName = f && typeof f.name === 'string' ? f.name.trim() : '';
+    const fileName = f && typeof f.name === 'string' ? clean(f.name).trim() : '';
     if (chars(fileName) < 1 || chars(fileName) > 120 || typeof f.content !== 'string') return { status: 400, error: 'INVALID_FILES' };
-    files.push({ name: fileName, content: f.content, degraded: f.degraded === true }); // only these keys are stored
+    files.push({ name: fileName, content: clean(f.content), degraded: f.degraded === true }); // only these keys are stored
   }
   const filesJson = JSON.stringify(files);
   const sizeBytes = Buffer.byteLength(filesJson);
