@@ -6,7 +6,9 @@ const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const net = require('node:net');
 const { spawn } = require('node:child_process');
-const { reserveRun, reserveDatalab, reserveAnonOcr, reserveAnonLlamaParse, reserveAnonDatalab, reserveSkillRequest, readUsage, markSessionComplete, isSessionComplete, quotaReachedBody, periodKeys } = require('../lib/usage-limits');
+const { reserveRun, reserveDatalab, reserveAnonOcr, reserveAnonLlamaParse, reserveAnonDatalab, reserveSkillRequest, readUsage, markSessionComplete, isSessionComplete, quotaReachedBody, periodKeys, DAY_LIMIT, WEEK_LIMIT } = require('../lib/usage-limits');
+// 2026-11-14: the allowance is read from the module (it went 5/35 -> 3/21 that day and the numbers
+// written into these tests broke); only the per-batch call cap (5) is still spelled out below.
 
 const SERVER = process.env.REDIS_SERVER;
 const PORT = 6390 + Math.floor(Math.random() * 500);
@@ -71,11 +73,11 @@ after(() => { if (server) server.kill(); });
 
 const NOW = new Date('2026-10-23T12:00:00Z'); // a Friday
 
-test('40 parallel new batches: exactly 5 pass the daily limit', { skip }, async () => {
+test('40 parallel new batches: exactly the daily limit pass', { skip }, async () => {
   const rows = await Promise.all(Array.from({ length: 40 }, (_, i) =>
     reserveRun(redis, { userId: 'u-burst', sessionId: `s${i}`, kind: 'gen' }, NOW)));
-  assert.equal(rows.filter(r => r.allowed).length, 5);
-  assert.ok(rows.filter(r => !r.allowed).every(r => r.limitType === 'daily' && r.dailyCount === 5));
+  assert.equal(rows.filter(r => r.allowed).length, DAY_LIMIT);
+  assert.ok(rows.filter(r => !r.allowed).every(r => r.limitType === 'daily' && r.dailyCount === DAY_LIMIT));
 });
 
 test('one batch: 3 OCR + 3 generation calls in parallel cost ONE credit', { skip }, async () => {
@@ -104,8 +106,8 @@ test('a new credit restarts BOTH endpoint counters of the batch', { skip }, asyn
 test('replaying one sessionId forever is bounded by the daily limit', { skip }, async () => {
   const rows = [];
   for (let i = 0; i < 40; i++) rows.push(await reserveRun(redis, { userId: 'u-replay', sessionId: 'fixed', kind: 'gen' }, NOW));
-  assert.equal(rows.filter(r => r.allowed).length, 25); // 5 credits x 5 calls each
-  assert.equal(rows.at(-1).dailyCount, 5);
+  assert.equal(rows.filter(r => r.allowed).length, DAY_LIMIT * 5); // every credit x 5 calls each
+  assert.equal(rows.at(-1).dailyCount, DAY_LIMIT);
 });
 
 test('an expired batch is charged again', { skip }, async () => {
@@ -121,21 +123,21 @@ test('missing sessionId: every call is its own run', { skip }, async () => {
 });
 
 test('weekly limit, then the next week starts fresh', { skip }, async () => {
-  await command('SET', 'usage:v1:u-week:week:2026-10-19', 35);
+  await command('SET', 'usage:v1:u-week:week:2026-10-19', WEEK_LIMIT);
   const denied = await reserveRun(redis, { userId: 'u-week', sessionId: 'x', kind: 'gen' }, NOW);
   assert.equal(denied.allowed, false);
   assert.equal(denied.limitType, 'weekly');
-  assert.equal(quotaReachedBody(denied).limitValue, 35);
+  assert.equal(quotaReachedBody(denied).limitValue, WEEK_LIMIT);
   const nextMonday = await reserveRun(redis, { userId: 'u-week', sessionId: 'y', kind: 'gen' }, new Date('2026-10-26T00:00:01Z'));
   assert.equal(nextMonday.allowed, true);
   assert.equal(nextMonday.weeklyCount, 1);
 });
 
 test('a denied call charges nothing and does not touch the run', { skip }, async () => {
-  await command('SET', 'usage:v1:u-full:day:2026-10-23', 5);
+  await command('SET', 'usage:v1:u-full:day:2026-10-23', DAY_LIMIT);
   const r = await reserveRun(redis, { userId: 'u-full', sessionId: 'z', kind: 'gen' }, NOW);
   assert.equal(r.allowed, false);
-  assert.equal(await command('GET', 'usage:v1:u-full:day:2026-10-23'), '5');
+  assert.equal(await command('GET', 'usage:v1:u-full:day:2026-10-23'), String(DAY_LIMIT));
   assert.equal(await command('EXISTS', 'usage:v1:u-full:run:z'), 0);
 });
 
@@ -188,14 +190,14 @@ test('skill history: 110 parallel requests, exactly 100 pass, per user per UTC d
 
 test('usage: reads the day counter reserveRun writes, 0 on a fresh day, never above the limit', { skip }, async () => {
   const u = 'usage-read';
-  assert.deepEqual(await readUsage(redis, u, NOW), { used: 0, limit: 5 });
+  assert.deepEqual(await readUsage(redis, u, NOW), { used: 0, limit: DAY_LIMIT });
   await reserveRun(redis, { userId: u, sessionId: 'a', kind: 'gen' }, NOW);
   await reserveRun(redis, { userId: u, sessionId: 'a', kind: 'ocr' }, NOW); // same batch, same credit
   await reserveRun(redis, { userId: u, sessionId: 'b', kind: 'gen' }, NOW);
-  assert.deepEqual(await readUsage(redis, u, NOW), { used: 2, limit: 5 });
-  assert.deepEqual(await readUsage(redis, u, new Date('2026-10-24T00:00:01Z')), { used: 0, limit: 5 }); // next UTC day
+  assert.deepEqual(await readUsage(redis, u, NOW), { used: 2, limit: DAY_LIMIT });
+  assert.deepEqual(await readUsage(redis, u, new Date('2026-10-24T00:00:01Z')), { used: 0, limit: DAY_LIMIT }); // next UTC day
   await command('SET', `usage:v1:${u}:day:2026-10-23`, 9);
-  assert.deepEqual(await readUsage(redis, u, NOW), { used: 5, limit: 5 });
+  assert.deepEqual(await readUsage(redis, u, NOW), { used: DAY_LIMIT, limit: DAY_LIMIT });
   assert.equal(await command('GET', `usage:v1:${u}:day:2026-10-23`), '9'); // reading never writes
 });
 
@@ -230,7 +232,7 @@ test('usage + session reads/writes throw on store failure (callers decide open o
   await assert.rejects(markSessionComplete(down, { userId: 'u', sessionId: 's' }));
   await assert.rejects(isSessionComplete(down, { userId: 'u', sessionId: 's' }));
   await assert.rejects(isSessionComplete(null, { anonToken: 't' }));
-  assert.deepEqual(await readUsage({ get: async () => 3 }, 'u'), { used: 3, limit: 5 }); // Upstash JSON number
+  assert.deepEqual(await readUsage({ get: async () => 3 }, 'u'), { used: 3, limit: DAY_LIMIT }); // Upstash JSON number
 });
 
 test('store failures throw (callers fail closed)', async () => {
