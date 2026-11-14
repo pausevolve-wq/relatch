@@ -221,6 +221,23 @@ module.exports = async function handler(req, res) {
           return res.status(401).json({ error: 'ANON_TOKEN_INVALID' });
         }
         // else: claimed by OUR OWN sessionId — a legitimate second file in the same batch.
+      } else {
+        // 2026-11-14: this request just STARTED a trial run (it won the claim), so count it against
+        // one site-wide daily budget. A trial is one per token, and tokens are limited per IP, but
+        // nothing bounded all trials together: someone rotating IPs (a VPN, a proxy pool) could run
+        // paid models without end. Signed-in use is bounded per account; OCR already has site-wide
+        // anonymous budgets (lib/usage-limits.js). Past the budget the answer is the same 401 a
+        // spent trial gets, so the app shows its sign-up step. Counted inline, not through
+        // lib/usage-limits.js, like the :calls counter below (the jev-harness stubs that module).
+        // ANON_RUNS_DAILY_LIMIT overrides the default without a deploy of new code.
+        const anonRunsLimit = Number.parseInt(process.env.ANON_RUNS_DAILY_LIMIT, 10) > 0 ? Number.parseInt(process.env.ANON_RUNS_DAILY_LIMIT, 10) : 300;
+        const anonRunsKey = `usage:v1:anon:runs:${new Date().toISOString().slice(0, 10)}`;
+        const anonRunsToday = await redis.incr(anonRunsKey);
+        if (anonRunsToday === 1) await redis.expire(anonRunsKey, 2 * 86400);
+        if (anonRunsToday > anonRunsLimit) {
+          await logToAxiom({ endpoint: 'enrich', status: 401, reason: 'anon_runs_daily_budget', ip: req.headers['x-forwarded-for'] || null });
+          return res.status(401).json({ error: 'ANON_TOKEN_INVALID' });
+        }
       }
       // Bounds spend within one legitimate run (a multi-file batch calls this per file).
       const callCount = await redis.incr(`anon:${anonToken}:calls`);
