@@ -160,6 +160,17 @@ module.exports = async function handler(req, res) {
       await logToAxiom({ endpoint: 'enrich', status: 401, reason: 'anon_redis_unconfigured', ip: req.headers['x-forwarded-for'] || null });
       return res.status(401).json({ error: 'ANON_TOKEN_INVALID' });
     }
+    // 2026-11-14 security fix: the header is the caller's own string and goes straight into Redis
+    // key names (`anon:<token>`, `anon:<token>:session`, `anon:<token>:calls`, `anon:<token>:ocr`).
+    // Without a shape check, a caller holding ONE real token could send "<token>:session" or
+    // "<token>:calls" as its token: that key exists, so it passed as live, and it then claimed a
+    // fresh run and fresh counters of its own ("<token>:session:session", ...), over and over -
+    // unlimited trial runs from one minted token, past the mint rate limit. Only the exact shape
+    // anon-token.js mints (crypto.randomUUID(): lower-case v4) is ever looked up.
+    if (typeof anonToken !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(anonToken)) {
+      await logToAxiom({ endpoint: 'enrich', status: 401, reason: 'anon_token_malformed', ip: req.headers['x-forwarded-for'] || null });
+      return res.status(401).json({ error: 'ANON_TOKEN_INVALID' });
+    }
     // NOT single-use (GETDEL) — a real "run" is not one HTTP call: a multi-file batch
     // sends one /api/enrich per file (App.tsx's Promise.allSettled over allFiles, same
     // pattern the authenticated sessionId dedup below already exists to bundle), and any
