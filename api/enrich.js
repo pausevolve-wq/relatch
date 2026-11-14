@@ -109,6 +109,55 @@ const DOMAIN_TEMPLATE_BY_JEV = {
 const DOMAIN_TEMPLATE_LETTERS = ['F', 'G', 'H', 'I', 'J', 'K'];
 const DOMAIN_TEMPLATE_CONFIDENCE = 0.8;
 const VOICE_DOC_TYPES = ['persona_writing', 'style_samples', 'style_guide'];
+// 2026-11-02 (Agents target): the hybrid of the two template families. The document's Claude template
+// (A-K) is the base - it decides WHAT of the source survives - and the document's Codex shape adds ONE
+// agentic section - HOW the agent acts (checks, operating mode, pauses, a document spine). Eval on 10
+// docs, 2 blind judges (jev-harness agents-summary.js): this scored 8.25 / 7.80 overall vs the Claude
+// export 7.50 / 7.20 and Codex 4.95. A Codex-based hybrid (shape skeleton + A-K sections) scored ~6.0:
+// the skeleton's quotas ("3-5 escalation rules") made the model invent rules, so the section added
+// here has no minimum and is left out when the source gives nothing for it.
+const AGENTS_SHAPE_SECTION = {
+  execute: `## Final Checks
+[2 to 5 checks the agent runs before it calls the task done, each taken from a rule, threshold or required result in the source. Never invent commands, tools or file paths.]`,
+  specialist: `## Operating Mode
+**Do without asking:** [what the source lets someone in this role do on their own]
+**Ask first:** [what the source says needs approval, review or a named owner, and who that is]
+**Refuse:** [what the source prohibits]`,
+  expertise: `## When to Pause for a Human
+[The moments where the source says a judgment call, an approval or the author's own input is needed.]`,
+  deliverable: `## Document Spine
+[The sections of the document this source defines, in order, under the source's own names. Never invent a section.]
+
+## QA Before Delivering
+[2 to 6 checks on a finished draft, each taken from the source.]`,
+};
+const AGENTS_CLOSING = `## Other Source Rules & Details
+[Everything else the source states that a user could ask about and that did not fit above: named tools, channels, links, forms, owners, team- or region-specific rules, examples. Group under the source's own topic names, keep exact names and numbers, one bullet each. Skip only boilerplate.]
+
+## Verify This Skill Is Working
+[3 to 4 test requests a user might send, each followed by what a correct answer must contain: a specific rule, number or term from the source.]`;
+// The Claude prompt rewritten for any agent, only ABOVE the CONTENT marker so the source text is never
+// touched. F-K already end with the two closing sections; A-E get them here.
+function buildAgentsPrompt(claudePrompt, letter, shape) {
+  const cut = claudePrompt.lastIndexOf('\nCONTENT:\n');
+  if (cut < 0) return claudePrompt;
+  const head = claudePrompt.slice(0, cut)
+    .replace(/\bClaude Skill File\b/g, 'agent skill file')
+    .replace(/\bClaude's\b/g, "the agent's")
+    .replace(/\bClaude\b/g, 'the agent')
+    .replace(/(^|[.!?]\s+|\n\s*(?:[-*]\s+|\d+\.\s+)?)the agent/g, (m, pre) => `${pre}The agent`);
+  const hasClosing = DOMAIN_TEMPLATE_LETTERS.includes(letter);
+  const extra = `
+
+AGENT SKILL (2026-11-02, Agents export): this file is loaded by any AI agent that reads the open Agent Skills format (Claude, Codex, Cursor, Gemini CLI, OpenClaw, Hermes and others). Write "the agent", never a product name. Add this section ${hasClosing ? 'right before ## Other Source Rules & Details' : 'after the sections above'}, only with what the source states or directly implies; leave out any line, or the whole section, the source gives nothing for:
+
+${AGENTS_SHAPE_SECTION[shape] || AGENTS_SHAPE_SECTION.execute}${hasClosing ? '' : `
+
+Then end the file with these two sections:
+
+${AGENTS_CLOSING}`}`;
+  return head + extra + claudePrompt.slice(cut);
+}
 function routeDomainTemplate(tmpl, plan, target) {
   const on = (process.env.DOMAIN_TEMPLATES || '').split(',').map(x => x.trim()).filter(Boolean);
   if (target === 'codex' || !on.length || !plan || !plan.domain || !(plan.domain.confidence >= DOMAIN_TEMPLATE_CONFIDENCE)) return tmpl;
@@ -254,7 +303,13 @@ module.exports = async function handler(req, res) {
   // Old fields remain exactly the same — backward compatible if frontend hasn't updated yet
   // richFormats: consumed by Claude prompt templates only. Codex path uses codexSourceHint
   // pre-scan (v2.2.1) for dynamic structure detection — intentionally unused on Codex path.
-  const { rawText: requestText, category, fileName, domainLabel, domainRole, domainFrame, template, richFormats, charCap, sizeClass, target = 'claude', codexShape = 'execute', sessionId, fullText: requestFullText } = req.body;
+  const { rawText: requestText, category, fileName, domainLabel, domainRole, domainFrame, template, richFormats, charCap, sizeClass, target: requestTarget = 'claude', codexShape = 'execute', sessionId, fullText: requestFullText } = req.body;
+  // 2026-11-02 (Agents target): a third export for any agent that reads the open Agent Skills format
+  // (Claude, Codex, Cursor, Gemini CLI, OpenClaw, Hermes...). It is the Claude path - template A-K, text
+  // selection, gate - plus one section from the document's Codex shape; see buildAgentsPrompt.
+  // Gated by env AGENTS_TARGET=on; off = 'agents' is handled exactly as today.
+  const agentsTarget = requestTarget === 'agents' && process.env.AGENTS_TARGET === 'on';
+  const target = agentsTarget ? 'claude' : requestTarget;
   // 2026-10-25: the whole document, sent by the app for Codex only (see BODY_LIMITS.fullText).
   const codexFullText = target === 'codex' && typeof requestFullText === 'string' && requestFullText.trim() ? requestFullText : null;
   // 2026-10-24 (F-K large documents, see shrinkLargeSample): a Claude large document sampled at
@@ -594,6 +649,11 @@ module.exports = async function handler(req, res) {
   // 2026-10-25: ...and when the full text was sent, DELIVERABLE is auto-detected (DELIVERABLE_AUTO_P).
   const deliverableAuto = activeTarget === 'codex' && typeof deliverableP === 'number' && deliverableP >= DELIVERABLE_AUTO_P;
   const activeCodexShape = clientCodexShape === 'deliverable' || deliverableAuto ? 'deliverable' : routeCodexShape(clientCodexShape, plan, activeTarget);
+  // 2026-11-02 (Agents target): the shape whose section the Agents prompt adds - the app's choice, or
+  // Jev's on a confident answer, as on the Codex path (DELIVERABLE only when the app asks for it).
+  const agentsShape = !agentsTarget ? null : clientCodexShape === 'deliverable' ? 'deliverable' : routeCodexShape(clientCodexShape, plan, 'codex');
+  // The added sections need room: the F-K budgets, as measured in the 2026-11-02 eval.
+  if (agentsTarget) budgetForSize = DOMAIN_TOKEN_BUDGETS[effectiveSizeClass] || budgetForSize;
   // 2026-10-25 (DELIVERABLE v3): this shape is built on the document's structure, so it reads the
   // unfiltered source (page furniture removed, every line kept) up to the F-K ceiling
   // (DOMAIN_CHAR_CAP: 20000 medium / 32000 large) instead of the signal-filtered 10000 / 16000.
@@ -1587,6 +1647,7 @@ ${textToSend}`;
   //    bullet lists appended AFTER ## Key Principles. See MODULES in lib/planner.js.
   const facetModules = buildFacetModules(plan, activeTemplate, activeTarget, activeCodexShape);
   if (facetModules) prompt = prompt.replace('\nCONTENT:\n', () => `\n${facetModules}\nCONTENT:\n`);
+  if (agentsTarget) prompt = buildAgentsPrompt(prompt, activeTemplate, agentsShape);
   // 2. The plan block leads the prompt, ahead of documentContext.
   const planDirectives = buildPlanDirectives(plan, activeTarget, activeTemplate);
   // 3. Content fidelity (2026-09-26): say so when the source is a spread excerpt. Only when
@@ -2718,7 +2779,7 @@ ${textToSend}`;
     // now reserved before generation, in lib/usage-limits.js.)
 
     // `plan` only appears when Jev answered - the frontend ignores unknown fields.
-    return res.status(200).json({ enriched: enrichedOutput, model: successfulModel, sessionId, ...(planSummary ? { plan: planSummary } : {}), ...(contentSummary ? { content: contentSummary } : {}) });
+    return res.status(200).json({ enriched: enrichedOutput, model: successfulModel, sessionId, ...(agentsTarget ? { agents: { lens: activeTemplate, shape: agentsShape } } : {}), ...(planSummary ? { plan: planSummary } : {}), ...(contentSummary ? { content: contentSummary } : {}) });
   }
 
   // v2.4: Codex deterministic fallback — fires only when target === 'codex' AND all Gemini
