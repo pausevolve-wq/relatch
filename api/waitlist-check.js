@@ -1,4 +1,13 @@
 const { verifyToken } = require('@clerk/backend');
+const { Redis } = require('@upstash/redis');
+const redis = (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN)
+  ? new Redis({ url: process.env.UPSTASH_REDIS_REST_URL, token: process.env.UPSTASH_REDIS_REST_TOKEN })
+  : null;
+// 2026-11-14: any signed-in account could ask "is <any email> on the waitlist?" as often as it
+// liked: a way to test a list of addresses, and every check pages SplitForms up to 5 times. One
+// account now gets 10 checks an hour (a person checks once or twice). Over it the answer is the
+// same "not checked" a SplitForms hiccup gives, so sign-ups are never blocked. Fails open too.
+const CHECKS_PER_HOUR = 10;
 
 // The waitlist's own SplitForms form: its public access_key, the same one the app posts sign-ups with
 // (VITE_SPLITFORMS_ACCESS_KEY's fallback in the frontend; the only SplitForms key in the live bundle,
@@ -18,17 +27,28 @@ module.exports = async function handler(req, res) {
   if (!authHeader?.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
+  let userId;
   try {
-    await verifyToken(authHeader.slice(7), { secretKey: process.env.CLERK_SECRET_KEY });
+    userId = (await verifyToken(authHeader.slice(7), { secretKey: process.env.CLERK_SECRET_KEY })).sub;
   } catch {
     return res.status(401).json({ error: 'Invalid session' });
   }
 
-  const { email } = req.body;
+  // `|| {}`: a request with no JSON body used to throw here (a 500 instead of the 400 below).
+  const { email } = req.body || {};
   if (!email || typeof email !== 'string') {
     return res.status(400).json({ error: 'Missing required field: email' });
   }
   const normalizedEmail = email.trim().toLowerCase();
+
+  if (redis && userId) {
+    try {
+      const key = `waitlist-check:${userId}:${Math.floor(Date.now() / 3600000)}`;
+      const count = await redis.incr(key);
+      if (count === 1) await redis.expire(key, 3600);
+      if (count > CHECKS_PER_HOUR) return res.status(200).json({ alreadyJoined: false, checked: false });
+    } catch { /* limiter unavailable: allow, as before this limit existed */ }
+  }
 
   const readToken = process.env.SPLITFORMS_READ_TOKEN;
   if (!readToken) {
