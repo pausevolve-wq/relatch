@@ -22,6 +22,29 @@ const redis = (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_R
 const ANON_TOKEN_TTL_SECONDS = 600; // 10 minutes — matches the plan; long enough for one real run, short enough to bound abandoned tokens
 const ANON_TOKEN_RATE_LIMIT_WINDOW = 3600; // 1 hour window for rate limiting
 const ANON_TOKEN_RATE_LIMIT_MAX = 5; // Max 5 tokens per IP per hour
+// Cloudflare Turnstile on the mint (hybrid plan, 2026-11-15): stops scripts, which are the real cost risk now
+// that an anonymous run only returns a preview. Off until TURNSTILE_SECRET_KEY is set: the current production
+// frontend sends no Turnstile token, so set the key together with the V3 flip (V3 sends `turnstile` in the body).
+// If Cloudflare cannot be reached, the trial is not blocked: that network gets 1 token a day instead.
+const TURNSTILE_VERIFY_URL = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
+const TURNSTILE_TIMEOUT_MS = 3000;
+const FALLBACK_DAILY_MAX = 1;
+
+/** 'ok' | 'failed' | 'unreachable' - Cloudflare's verdict on the widget token */
+async function checkTurnstile(token, ip) {
+  try {
+    const form = new URLSearchParams({ secret: process.env.TURNSTILE_SECRET_KEY, response: token });
+    if (ip && ip !== 'unknown') form.set('remoteip', ip);
+    const r = await fetch(TURNSTILE_VERIFY_URL, { method: 'POST', body: form, signal: AbortSignal.timeout(TURNSTILE_TIMEOUT_MS) });
+    if (!r.ok) return 'unreachable';
+    const data = await r.json();
+    if (data.success) return 'ok';
+    // Cloudflare's own trouble is not the visitor's fault
+    return (data['error-codes'] || []).includes('internal-error') ? 'unreachable' : 'failed';
+  } catch {
+    return 'unreachable';
+  }
+}
 
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', 'https://app.relatch.online');
@@ -55,6 +78,32 @@ module.exports = async function handler(req, res) {
     console.error('[anon-token] IP rate limit check failed:', err?.message || err);
     // Fail closed - if we can't check rate limit, don't issue token
     return res.status(503).json({ error: 'ANON_TRIAL_UNAVAILABLE' });
+  }
+
+  if (process.env.TURNSTILE_SECRET_KEY) {
+    let body = req.body;
+    if (typeof body === 'string') { try { body = JSON.parse(body); } catch { body = null; } }
+    const widget = body && typeof body === 'object' && typeof body.turnstile === 'string' ? body.turnstile.slice(0, 4096) : '';
+    if (!widget) {
+      await logToAxiom({ endpoint: 'anon-token', status: 403, reason: 'turnstile_missing', ip });
+      return res.status(403).json({ error: 'TURNSTILE_REQUIRED' });
+    }
+    const verdict = await checkTurnstile(widget, ip);
+    if (verdict === 'failed') {
+      await logToAxiom({ endpoint: 'anon-token', status: 403, reason: 'turnstile_failed', ip });
+      return res.status(403).json({ error: 'TURNSTILE_FAILED' });
+    }
+    if (verdict === 'unreachable') {
+      try {
+        const fbKey = `ip:${ip}:anon-token:fallback:${new Date().toISOString().slice(0, 10)}`;
+        const n = await redis.incr(fbKey);
+        if (n === 1) await redis.expire(fbKey, 2 * 86400);
+        await logToAxiom({ endpoint: 'anon-token', status: n > FALLBACK_DAILY_MAX ? 429 : 200, reason: 'turnstile_unreachable_fallback', ip });
+        if (n > FALLBACK_DAILY_MAX) return res.status(429).json({ error: 'ANON_TOKEN_RATE_LIMITED' });
+      } catch {
+        return res.status(503).json({ error: 'ANON_TRIAL_UNAVAILABLE' });
+      }
+    }
   }
 
   // No auth required — this is the one deliberate new trust boundary. Nothing sensitive

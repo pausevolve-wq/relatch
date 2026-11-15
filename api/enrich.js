@@ -1,4 +1,6 @@
 const { verifyToken, createClerkClient } = require('@clerk/backend');
+// Hybrid plan (2026-11-15): an anonymous caller receives a preview, the full skill waits for /api/claim
+const { previewOn, anonBody } = require('../lib/anon-claim');
 const { reserveRun, quotaReachedBody, isSessionComplete } = require('../lib/usage-limits');
 const clerkClient = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
 const { Redis } = require('@upstash/redis');
@@ -2814,7 +2816,9 @@ ${textToSend}`;
     // now reserved before generation, in lib/usage-limits.js.)
 
     // `plan` only appears when Jev answered - the frontend ignores unknown fields.
-    return res.status(200).json({ enriched: enrichedOutput, model: successfulModel, sessionId, ...(agentsTarget ? { agents: { lens: activeTemplate, shape: agentsShape } } : {}), ...(planSummary ? { plan: planSummary } : {}), ...(contentSummary ? { content: contentSummary } : {}) });
+    const okBody = { enriched: enrichedOutput, model: successfulModel, sessionId, ...(agentsTarget ? { agents: { lens: activeTemplate, shape: agentsShape } } : {}), ...(planSummary ? { plan: planSummary } : {}), ...(contentSummary ? { content: contentSummary } : {}) };
+    // ANON_PREVIEW_ONLY=on: an anonymous caller never receives the full text (lib/anon-claim.js)
+    return res.status(200).json(isAnonymousRequest && previewOn() ? await anonBody(redis, anonToken, okBody, agentsTarget ? 'agents' : activeTarget) : okBody);
   }
 
   // v2.4: Codex deterministic fallback — fires only when target === 'codex' AND all Gemini
@@ -2825,14 +2829,15 @@ ${textToSend}`;
     if (gateCandidates) gateLog(null, 'protocol_fallback');
     routeLog('protocol_fallback');
     const fallbackRaw = buildCodexFallback();
-    return res.status(200).json({
+    const fallbackBody = {
       enriched: sanitize(fallbackRaw, codexSlug, 'CODEX'),
       model: 'deterministic-fallback',
       fallbackReason: lastGoogleError,
       sessionId,
       ...(planSummary ? { plan: planSummary } : {}),
       ...(contentSummary ? { content: contentSummary } : {}),
-    });
+    };
+    return res.status(200).json(isAnonymousRequest && previewOn() ? await anonBody(redis, anonToken, fallbackBody, activeTarget) : fallbackBody);
   }
 
   // Claude target or unknown — 503 unchanged
