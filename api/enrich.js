@@ -1726,8 +1726,9 @@ ${textToSend}`;
     if (!desc || /^What this skill does\b/i.test(desc) || /^\[.*\]$/.test(desc)) {
       const first = body.split('\n').map((l) => l.trim()).find((l) => l && !/^(#|\||-|\*|\d+[.)]|>|`|\[|---)/.test(l)) || '';
       const sentence = ((first.match(/^.*?[.!?](?=\s|$)/) || [first])[0]).replace(/^You (are|act as)\b/i, 'Acts as').slice(0, 400).trim();
-      const useCases = ((fm.match(/^use_cases:\s*\[(.*)\]\s*$/m) || [])[1] || '')
-        .split(',').map((x) => x.trim().replace(/^"|"$/g, '')).filter((x) => x && !/^case \d+$/i.test(x) && x !== 'general use').slice(0, 4);
+      // Items split on commas OUTSIDE quotes (2026-11-19: split(',') turned "a $1,820 refund" into "a $1" + "820 refund")
+      const useCases = (((fm.match(/^use_cases:\s*\[(.*)\]\s*$/m) || [])[1] || '').match(/\s*(?:"(?:[^"\\]|\\.)*"|'[^']*'|[^,]+)/g) || [])
+        .map((x) => x.trim().replace(/^"([\s\S]*)"$|^'([\s\S]*)'$/, '$1$2').replace(/\\"/g, '"')).filter((x) => x && !/^case \d+$/i.test(x) && x !== 'general use').slice(0, 4);
       desc = (sentence || 'Applies the rules and knowledge from the source document.') + (useCases.length ? ` Use for ${useCases.join(', ')}.` : '');
     }
     desc = desc.replace(/[<>]/g, '').replace(/\s+/g, ' ').trim();
