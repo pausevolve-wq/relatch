@@ -5,11 +5,14 @@
 //   anonconv:user:<clerkUserId>  hash, 90 days: claimedAt, mode, method, action, agent, claimId, skills
 //   anonconv:day:<YYYY-MM-DD>    counters, 400 days: claims, mode:<signup|login>, method:<...>
 // No email or document content is stored there (Clerk holds the email; the skill text expires with the claim).
-// A claim does not count against the daily/weekly allowance: the skill was already made.
+// 2026-11-19 (Manas): a claim COUNTS against the daily/weekly allowance - one run credit, charged once per claim
+// (a reload is free). Was: "A claim does not count against the daily/weekly allowance: the skill was already made."
+// At 3 of 3 the claim answers 429 QUOTA_REACHED (same body /api/enrich sends) and the skill stays held to unlock later.
 const { verifyToken, createClerkClient } = require('@clerk/backend');
 const { Redis } = require('@upstash/redis');
 const { Axiom } = require('@axiomhq/js');
 const { claim } = require('../lib/anon-claim');
+const { quotaReachedBody } = require('../lib/usage-limits');
 
 const axiomClient = process.env.AXIOM_TOKEN
   ? new Axiom({ token: process.env.AXIOM_TOKEN, edge: 'us-east-1.aws.edge.axiom.co' })
@@ -74,7 +77,7 @@ module.exports = async function handler(req, res) {
   try {
     const r = await claim(redis, { claimId: body.claimId, userId, mode, method: body.method, action: body.action });
     await logToAxiom({ endpoint: 'claim', status: r.status, reason: r.status === 200 ? 'claimed' : r.body.error, userId, ip, mode });
-    return res.status(r.status).json(r.body);
+    return res.status(r.status).json(r.quota ? quotaReachedBody(r.quota) : r.body);
   } catch (err) {
     console.error('[claim] failed:', err?.message || err);
     return fail(503, 'CLAIM_UNAVAILABLE', 'redis_error');
