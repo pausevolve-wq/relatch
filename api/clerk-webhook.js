@@ -1,6 +1,8 @@
 // 2026-10-24: Clerk -> Svix webhook. When a Relatch account is deleted, delete that person's
 // skill history (runbook Flow G; the privacy policy promises it). Safe to repeat: Svix retries
 // any non-2xx, and DELETE is idempotent.
+// 2026-11-19: also counts accounts in PostHog: account_created (user.created) and account_deleted (see
+// captureToPostHog below). test/clerk-webhook-posthog.test.js.
 //
 // Signature check: svix (the library Clerk's own verifyWebhook wraps) over the RAW request
 // bytes with CLERK_WEBHOOK_SIGNING_SECRET. The raw body matters: re-serialising a parsed JSON
@@ -30,6 +32,34 @@ async function logToAxiom(event) {
     console.log('[axiom] log failed:', err?.message || 'unknown');
   }
 }
+
+// 2026-11-19 (PostHog rebuild): account_created / account_deleted, sent from here so the count of sign-ups does
+// not depend on the browser (ad blockers stop the app's own PostHog calls for a good share of developers).
+// distinct_id = the Clerk user id, the same id the app's identify() uses, so these land on the same person.
+// The key is PostHog's public project key (the same one the app and landing page ship); it can only send
+// events. $geoip_disable: the request comes from Vercel, and its location must not overwrite the person's.
+// Never fails the webhook: PostHog being slow or down only loses the event.
+const POSTHOG_KEY = 'phc_nszMZqivMkCWhZRC5bq3XexX5iapQMXzj6u5YPr94B3k';
+const POSTHOG_CAPTURE_URL = 'https://us.i.posthog.com/i/v0/e/';
+
+async function captureToPostHog(event, distinctId, properties, timestamp) {
+  try {
+    await Promise.race([
+      fetch(POSTHOG_CAPTURE_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ api_key: POSTHOG_KEY, event, distinct_id: distinctId, timestamp, properties: { ...properties, $geoip_disable: true, $lib: 'relatch-backend' } }),
+      }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('posthog timeout')), 2000)),
+    ]);
+  } catch (err) {
+    console.log('[posthog] capture failed:', err?.message || 'unknown');
+  }
+}
+
+// Clerk sends 'oauth_google' / 'google'; no external account = email and password or an email code
+const methodOf = (user) => String(user?.external_accounts?.[0]?.provider || 'email').replace(/^oauth_/, '');
+const isoOf = (ms) => new Date(Number.isFinite(ms) ? ms : Date.now()).toISOString();
 
 const MAX_BODY_BYTES = 1024 * 1024; // Clerk user events are a few KB
 
@@ -72,6 +102,16 @@ module.exports = async function handler(req, res) {
     return fail(400, 'bad_signature');
   }
 
+  // 2026-11-19: a new account. Only counted (PostHog); nothing else to do, so always 200 (no Svix retries).
+  // Needs "user.created" ticked on this endpoint in the Clerk dashboard (Webhooks), as user.deleted is.
+  if (event?.type === 'user.created') {
+    const u = event.data;
+    if (typeof u?.id === 'string' && u.id) {
+      await captureToPostHog('account_created', u.id, { method: methodOf(u), $set_once: { account_created_at: isoOf(u.created_at) } }, isoOf(u.created_at));
+    }
+    return res.status(200).json({ counted: 'user.created' });
+  }
+
   if (event?.type !== 'user.deleted') return res.status(200).json({ ignored: event?.type || null });
   const userId = event.data?.id;
   if (typeof userId !== 'string' || !userId) return fail(400, 'missing_user_id');
@@ -80,6 +120,7 @@ module.exports = async function handler(req, res) {
   try {
     const deleted = await sql`DELETE FROM skills WHERE user_id = ${userId} RETURNING id`;
     await logToAxiom({ endpoint: 'clerk-webhook', status: 200, reason: 'user_deleted_history_removed', userId, rows: deleted.length, ip });
+    await captureToPostHog('account_deleted', userId, { skills_removed: deleted.length }, isoOf(event.timestamp));
     return res.status(200).json({ deleted: deleted.length });
   } catch (err) {
     console.error('[clerk-webhook] database error:', err?.code || err?.name || 'unknown');
