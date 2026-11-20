@@ -25,7 +25,7 @@
 <br />
 <br />
 
-**[Open the app](https://app.relatch.online)** &nbsp;·&nbsp; [relatch.online](https://relatch.online) &nbsp;·&nbsp; [Architecture](#architecture) &nbsp;·&nbsp; [API](#api-surface) &nbsp;·&nbsp; [Security](#security-model) &nbsp;·&nbsp; [Run it locally](#run-it-locally) &nbsp;·&nbsp; [Frontend](https://github.com/pausevolve-wq/Relatch-fe)
+**[Open the app](https://app.relatch.online)** &nbsp;·&nbsp; [relatch.online](https://relatch.online) &nbsp;·&nbsp; [Architecture](#architecture) &nbsp;·&nbsp; [API](#api-surface) &nbsp;·&nbsp; [Security](#security-model) &nbsp;·&nbsp; [Frontend](https://github.com/pausevolve-wq/Relatch-fe)
 
 </div>
 
@@ -169,16 +169,15 @@ vercel.json       per-function time limits, the /skills/:id rewrite, CORS header
 
 <br />
 
-## Run it locally
+## Deployment
 
-**Prerequisites:** Node.js 20+, the [Vercel CLI](https://vercel.com/docs/cli), and credentials for the services below.
+Merges to `main` deploy to Vercel. `main` is protected: every change goes through a pull request with an approving review. `vercel.json` gives the compiler a 300-second ceiling and OCR 60 seconds. Every other route runs on the default, short ceiling.
 
-```bash
-npm install
-vercel dev          # serves /api/* on http://localhost:3000
-```
+<br />
 
-Configuration is environment-only. Set these in `.env` locally and in the Vercel project for deployments:
+### Configuration
+
+Configuration lives only in the Vercel project's environment variables, grouped like this:
 
 | Group | What it needs |
 |---|---|
@@ -190,24 +189,11 @@ Configuration is environment-only. Set these in `.env` locally and in the Vercel
 | Telemetry | Axiom token and dataset (optional: without them telemetry is skipped) |
 | Modes | Feature switches for staged rollouts (each defaults to off) |
 
-The exact variable names are kept in the team's private runbook rather than here.
+The exact variable names are kept in the team's private runbook, not here.
 
 ### Tests
 
-```bash
-node --test test/
-
-# the usage-limit suite runs against a real redis-server, because the atomic script is the point
-REDIS_SERVER=/path/to/redis-server node --test test/usage-limits.test.js
-```
-
-The Redis suite skips itself when `REDIS_SERVER` is not set.
-
-<br />
-
-## Deployment
-
-Merges to `main` deploy to Vercel. `main` is protected: every change goes through a pull request with an approving review. `vercel.json` gives the compiler a 300-second ceiling and OCR 60 seconds. Every other route runs on the default, short ceiling.
+The suites in [`test/`](test) use `node:test`. The usage-limit suite runs against a real `redis-server`, because the atomic script is the thing being tested.
 
 <br />
 
